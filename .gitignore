@@ -1,0 +1,48 @@
+# ======== 绝对不要上传的敏感数据 ========
+# 核心数据目录（包含聊天记录、用户密码哈希、钱包、私钥等）
+files/
+# 日志文件
+*.log
+server.log
+crash.log
+
+# ======== 依赖包（太大，让别人自己 npm install） ========
+node_modules/
+
+# ======== 系统与编辑器自动生成的文件 ========
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ======== 本地环境配置 ========
+.env
+config.local.json
+
+# ======== 备份文件 ========
+*.zip
+*.rar
+*.bak
+
+# 排除 Node.js 运行时和包管理器（非常关键！）
+node.exe
+npm
+npm.cmd
+npm.ps1
+npx
+npx.cmd
+npx.ps1
+corepack
+corepack.cmd
+nodevars.bat
+pkg
+pkg.cmd
+pkg.ps1
+
+# 排除 cloudflared 等外部程序
+cloudflared.exe
+*.exe
+
+# 排除安装包
+node-v*.zip
+node-v*.tar.gz
