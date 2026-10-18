@@ -1673,7 +1673,19 @@ var USER_DATA_WHITELIST = {
   'bgType': 1,              /* 背景样式 */
   'bgImage': 1,             /* 背景图片 */
   'bgBlur': 1,              /* 背景模糊度 */
-  'bgOpacity': 1            /* 背景透明度 */
+  'bgOpacity': 1,           /* 背景透明度 */
+  /* ★ v0.28.0 新增 6 项 */
+  'set_showInteraction': 1, /* 显示互动标识（火花 / 龙王） */
+  'set_timeShowSeconds': 1, /* 消息时间精确到秒 */
+  'set_clearSendHistory': 1,/* 发送后清空输入历史 */
+  'set_biliQuality': 1,     /* B站默认清晰度 */
+  'set_biliDanmaku': 1,     /* B站默认开启弹幕 */
+  'set_biliAutoplay': 1,    /* B站自动播放 */
+  /* ★ v0.28.0 补充 */
+  'pc_sidebar_width': 1,    /* PC 侧栏宽度 */
+  'pc_gsp_width': 1,        /* PC 群侧栏宽度 */
+  'customFontName': 1,      /* 自定义字体名称（不含字体数据） */
+  'header_collapsed': 1     /* 顶栏收纳状态 */
 };
 
 var USER_DATA_MAX_KEY_BYTES = 5 * 1024 * 1024;    /* 单键 ≤ 5MB */
@@ -2844,14 +2856,17 @@ var MAX_HISTORY = 3000;
 var HISTORY_PAGE_SIZE = 50;
 
 
-var MAX_LEVEL = 100;
+var MAX_LEVEL = 1000;
 
-/* EXP_TABLE[lv] = 从 1 级升到 lv 级所需的累计经验 */
+/* EXP_TABLE[lv] = 从 1 级升到 lv 级所需的累计经验
+   ★ v0.28.0：等级上限扩展到 1000 级。
+     · 2 ~ 39 级：保持原值（兼容旧数据）
+     · 40 ~ 1000 级：每 10 级为一组，每级增量 +100
+       （40-49 组每级 +90；50-59 组每级 +190；…；1000 级单独 +9690） */
 var EXP_TABLE = (function () {
   var t = new Array(MAX_LEVEL + 1);
   t[0] = 0;
   t[1] = 0;
-  /* 2 ~ 39 级：用户指定的累计经验值 */
   var lv2to39 = [
     15, 30, 45, 90, 110, 130, 150, 200, 260, 300,
     370, 420, 490, 560, 630, 700, 780, 800, 840, 870,
@@ -2859,21 +2874,13 @@ var EXP_TABLE = (function () {
     2100, 2210, 2330, 2340, 2440, 2550, 2640, 2760, 2850
   ];
   for (var i = 0; i < lv2to39.length; i++) t[i + 2] = lv2to39[i];
-  /* 40 ~ 100 级：分段固定增量 */
   var last = 2850;
-  var ranges = [
-    [40, 50, 90],
-    [51, 60, 110],
-    [61, 70, 130],
-    [71, 80, 150],
-    [81, 90, 160],
-    [91, 100, 200]
-  ];
-  for (var r = 0; r < ranges.length; r++) {
-    for (var lv = ranges[r][0]; lv <= ranges[r][1]; lv++) {
-      last += ranges[r][2];
-      t[lv] = last;
-    }
+  var inc = 90;
+  for (var lv = 40; lv <= MAX_LEVEL; lv++) {
+    last += inc;
+    t[lv] = last;
+    /* 每满 10 级 → 下一组每级增量 +100 */
+    if ((lv - 39) % 10 === 0 && lv < MAX_LEVEL) inc += 100;
   }
   return t;
 })();
@@ -2974,7 +2981,6 @@ function pushExpResult(socket, expRes, reason) {
   }
 }
 
-
 /* ★ v0.27.13：系统账号的 profile 增加 patTemplate 字段，
    保证拍系统账号时也能显示合理文案 */
 var _DEFAULT_PAT_TEMPLATE = { pre: '拍', mid: '拍', suf: '' };
@@ -2982,7 +2988,7 @@ var _DEFAULT_PAT_TEMPLATE = { pre: '拍', mid: '拍', suf: '' };
 var SYSTEM_USERS = {
   wx_team: {
     id: 'wx_team', name: '微信团队',
-    level: 100, vip: true, isAdmin: false, muted: false,
+    level: 1000, vip: true, isAdmin: false, muted: false,
     verified: '微信团队 官方账号', presence: 'online', isSystem: true,
     profile: {
       signature: '微信团队 官方账号',
@@ -2993,7 +2999,7 @@ var SYSTEM_USERS = {
   },
   wx_pay: {
     id: 'wx_pay', name: '微信支付',
-    level: 100, vip: true, isAdmin: false, muted: false,
+    level: 1000, vip: true, isAdmin: false, muted: false,
     verified: '微信支付 官方账号', presence: 'online', isSystem: true,
     profile: {
       signature: '微信支付 官方账号',
@@ -3004,7 +3010,7 @@ var SYSTEM_USERS = {
   },
   SYSTEM: {
     id: 'SYSTEM', name: '系统',
-    level: 100, vip: true, isAdmin: false, muted: false,
+    level: 1000, vip: true, isAdmin: false, muted: false,
     verified: '系统通知 官方账号', presence: 'online', isSystem: true,
     profile: {
       signature: '系统通知 官方账号',
@@ -3014,7 +3020,6 @@ var SYSTEM_USERS = {
     }
   }
 };
-
 
 // 说明：本 IIFE 已在文件上方执行过一次，此处不再重复。
 // （重复执行会浪费启动时间，也可能因两次写入持久化文件
@@ -3191,6 +3196,124 @@ var announcementHistory = loadJSON(F_ANNOUNCEMENT_HISTORY, {});
 if (!announcementHistory || typeof announcementHistory !== 'object' || Array.isArray(announcementHistory)) announcementHistory = {};
 function saveAnnouncementHistory() { saveJSON(F_ANNOUNCEMENT_HISTORY, announcementHistory); }
 
+/* ============================================================
+   ★ v0.28.0：互动标识数据（类似 QQ 的火花 / 龙王）
+   ------------------------------------------------------------
+   数据结构（files/interactions.json）：
+   {
+     private: {
+       'private_<uidA>_<uidB>': {
+         days: Number,        // 连续聊天天数（按消息日期递增）
+         lastDate: 'YYYY-MM-DD',
+         lastMsgAt: Number
+       }
+     },
+     group: {
+       '<gid>': {
+         days: Number,
+         lastDate: 'YYYY-MM-DD',
+         lastMsgAt: Number,
+         dailyTop: { date: 'YYYY-MM-DD', counts: { uid: n }, uid, count }
+       }
+     }
+   }
+   ============================================================ */
+var F_INTERACTIONS = path.join(DATA_DIR, 'interactions.json');
+var interactions = loadJSON(F_INTERACTIONS, { private: {}, group: {} });
+if (!interactions || typeof interactions !== 'object') interactions = {};
+if (!interactions.private || typeof interactions.private !== 'object') interactions.private = {};
+if (!interactions.group || typeof interactions.group !== 'object') interactions.group = {};
+
+function saveInteractions() { saveJSON(F_INTERACTIONS, interactions); }
+
+function _yesterdayStr() {
+  var d = new Date();
+  d.setDate(d.getDate() - 1);
+  return d.getFullYear() + '-' +
+    ((d.getMonth() + 1) < 10 ? '0' : '') + (d.getMonth() + 1) + '-' +
+    (d.getDate() < 10 ? '0' : '') + d.getDate();
+}
+
+/* 更新私聊火花：返回 { days, lastDate } */
+function updatePrivateStreak(sessionKey) {
+  var today = todayStr();
+  if (!interactions.private[sessionKey]) {
+    interactions.private[sessionKey] = { days: 1, lastDate: today, lastMsgAt: Date.now() };
+    return interactions.private[sessionKey];
+  }
+  var rec = interactions.private[sessionKey];
+  if (rec.lastDate === today) {
+    /* 今天已有消息 → 只刷新时间 */
+  } else if (rec.lastDate === _yesterdayStr()) {
+    rec.days = (rec.days || 1) + 1;
+    rec.lastDate = today;
+  } else {
+    rec.days = 1;
+    rec.lastDate = today;
+  }
+  rec.lastMsgAt = Date.now();
+  return rec;
+}
+
+/* 更新群聊火花 + 当日龙王 */
+function updateGroupInteraction(gid, fromUid) {
+  var today = todayStr();
+  var store = interactions.group;
+  if (!store[gid]) {
+    store[gid] = { days: 1, lastDate: today, lastMsgAt: Date.now(), dailyTop: null };
+  }
+  var rec = store[gid];
+  if (rec.lastDate === today) {
+    /* 同一天 */
+  } else if (rec.lastDate === _yesterdayStr()) {
+    rec.days = (rec.days || 1) + 1;
+    rec.lastDate = today;
+  } else {
+    rec.days = 1;
+    rec.lastDate = today;
+  }
+  rec.lastMsgAt = Date.now();
+
+  /* ---- 龙王：当日消息计数 ---- */
+  if (!rec.dailyTop || rec.dailyTop.date !== today) {
+    rec.dailyTop = { date: today, counts: {}, uid: fromUid, count: 1 };
+  }
+  var counts = rec.dailyTop.counts;
+  counts[fromUid] = (counts[fromUid] || 0) + 1;
+  var maxUid = fromUid, maxCount = 0;
+  for (var k in counts) {
+    if (counts.hasOwnProperty(k) && counts[k] > maxCount) {
+      maxCount = counts[k];
+      maxUid = k;
+    }
+  }
+  rec.dailyTop.uid = maxUid;
+  rec.dailyTop.count = maxCount;
+  return rec;
+}
+
+/* 为单个用户构建互动数据视图（登录时下发 / 每次更新时推送） */
+function buildInteractionView(userId) {
+  var view = { private: {}, group: {} };
+  for (var key in interactions.private) {
+    if (!interactions.private.hasOwnProperty(key)) continue;
+    if (key.indexOf('private_') !== 0) continue;
+    var rest = key.substring(8);
+    var idx = rest.indexOf('_');
+    if (idx === -1) continue;
+    var a = rest.substring(0, idx);
+    var b = rest.substring(idx + 1);
+    if (a === userId) view.private[b] = interactions.private[key];
+    else if (b === userId) view.private[a] = interactions.private[key];
+  }
+  for (var gid in interactions.group) {
+    if (!interactions.group.hasOwnProperty(gid)) continue;
+    var g = groupMap.get(gid);
+    if (g && g.members.has(userId)) view.group[gid] = interactions.group[gid];
+  }
+  return view;
+}
+
 /* 关键词规则：keywordRules[userId] = { alerts: ['关键词'], highlight: ['关键词'] } */
 var F_KEYWORD_RULES = path.join(DATA_DIR, 'keyword_rules.json');
 var keywordRules = loadJSON(F_KEYWORD_RULES, {});
@@ -3214,7 +3337,90 @@ var netSamples = {};
 
 console.log('🏷️ 已加载扩展数据层（标签/设备/定时/自动回复/群动态/关键词/快捷键/时间段主题）');
 
-/* ==================== 定时消息调度器 ====================
+/* ============================================================
+   ★ v0.28.0：互动标识 —— 渲染与监听
+   ------------------------------------------------------------
+   · state.interactions.private[peerId] = { days, lastDate }
+   · state.interactions.group[gid]      = { days, lastDate, dailyTop }
+   · 私聊/群聊聊天头部：🔥 N天（今天有消息才显示）
+   · 群聊头部：🐲 龙王：xxx（当天最活跃成员）
+   ============================================================ */
+function _isInteractionActive(rec) {
+  return !!(rec && rec.lastDate === todayStr() && rec.days > 1);
+}
+
+function updateInteractionBadge() {
+  var badge = document.getElementById('chatInteractionBadge');
+  if (!badge) return;
+  badge.style.display = 'none';
+  badge.innerHTML = '';
+  /* ★ v0.28.0：设置中关闭「显示互动标识」后不再渲染 */
+  if (state.showInteraction === false) return;
+  if (!state.currentTarget || !state.currentType) return;
+  if (!state.interactions) state.interactions = { private: {}, group: {} };
+
+  if (state.currentType === 'private') {
+    var rec = state.interactions.private[state.currentTarget];
+    if (_isInteractionActive(rec)) {
+      badge.className = 'interaction-badge fire';
+      badge.innerHTML = '🔥 ' + rec.days + (state.lang === 'en' ? 'd' : '天');
+      badge.title = (state.lang === 'en')
+        ? ('Chat streak: ' + rec.days + ' days')
+        : ('连续聊天 ' + rec.days + ' 天');
+      badge.style.display = 'inline-flex';
+    }
+  } else if (state.currentType === 'group') {
+    var gRec = state.interactions.group[state.currentTarget];
+    if (!gRec) return;
+    var parts = [];
+    if (_isInteractionActive(gRec)) {
+      parts.push('<span class="interaction-badge fire">🔥 ' +
+        gRec.days + (state.lang === 'en' ? 'd' : '天') + '</span>');
+    }
+    if (gRec.dailyTop && gRec.dailyTop.uid) {
+      var dragonU = state.users[gRec.dailyTop.uid];
+      var dragonName = dragonU ? dragonU.name : gRec.dailyTop.uid;
+      parts.push('<span class="interaction-badge dragon">🐲 ' +
+        '<span class="ib-name">' + escapeHtml(dragonName) + '</span></span>');
+    }
+    if (parts.length) {
+      badge.className = '';
+      badge.innerHTML = parts.join(' ');
+      badge.style.display = 'inline-flex';
+      badge.title = (state.lang === 'en')
+        ? 'Group streak & daily dragon'
+        : '群聊连续火花 / 今日龙王';
+    }
+  }
+}
+
+/* socket 监听 interaction-update */
+function initInteractionListener(socket) {
+  socket.on('interaction-update', function (d) {
+    if (!d) return;
+    if (!state.interactions) state.interactions = { private: {}, group: {} };
+    if (d.kind === 'private' && d.peerId) {
+      state.interactions.private[d.peerId] = {
+        days: d.days, lastDate: d.lastDate
+      };
+      /* 若正在该会话，刷新聊天头 */
+      if (state.currentType === 'private' && state.currentTarget === d.peerId) {
+        updateInteractionBadge();
+      }
+      renderContacts();
+    } else if (d.kind === 'group' && d.groupId) {
+      state.interactions.group[d.groupId] = {
+        days: d.days, lastDate: d.lastDate, dailyTop: d.dailyTop
+      };
+      if (state.currentType === 'group' && state.currentTarget === d.groupId) {
+        updateInteractionBadge();
+        if (typeof renderGroupSidePanel === 'function') renderGroupSidePanel();
+      }
+    }
+  });
+}
+
+/* 定时消息调度器：每秒检查一次是否有到时间的消息需要发送
    每秒检查一次是否有到时间的消息需要发送 */
 var _scheduledTimer = setInterval(function () {
   try {
@@ -7315,6 +7521,85 @@ html.is-watch .burn-banner-text{
 .input-area .input-wrapper button:disabled{background:#b0b0b0;cursor:not-allowed}
 .empty-msg{color:var(--text-muted);text-align:center;padding:40px 0;font-size:16px}
 
+/* ============================================================
+   ★ v0.28.0：加载更早消息按钮
+   ------------------------------------------------------------
+   固定在消息列表顶部（第一条消息之前），用户上滑到顶部可见，
+   点击才加载更早的消息；不再自动触发。
+   ============================================================ */
+.history-loader{
+  display:block;
+  width:100%;
+  max-width:320px;
+  margin:4px auto 8px;
+  padding:9px 16px;
+  border:none;
+  border-radius:10px;
+  background:rgba(var(--accent-rgb),.08);
+  color:var(--accent);
+  font-size:13px;
+  font-weight:500;
+  font-family:inherit;
+  cursor:pointer;
+  text-align:center;
+  line-height:1.4;
+  flex-shrink:0;
+  transition:background .15s,transform .1s;
+  -webkit-tap-highlight-color:transparent;
+}
+.history-loader:hover{
+  background:rgba(var(--accent-rgb),.16);
+}
+.history-loader:active{
+  transform:scale(.98);
+}
+.history-loader.loading{
+  cursor:default;
+  pointer-events:none;
+  color:var(--text-muted);
+  background:rgba(0,0,0,.04);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+}
+.history-loader.no-more{
+  cursor:default;
+  pointer-events:none;
+  color:var(--text-muted);
+  background:transparent;
+  font-size:12px;
+  padding:6px 16px;
+  max-width:none;
+}
+.history-loader .hl-spin{
+  display:inline-block;
+  width:13px;height:13px;
+  border:2px solid rgba(var(--accent-rgb),.28);
+  border-top-color:var(--accent);
+  border-radius:50%;
+  animation:hlSpin .7s linear infinite;
+  flex-shrink:0;
+}
+@keyframes hlSpin{to{transform:rotate(360deg)}}
+[data-theme="dark"] .history-loader{
+  background:rgba(var(--accent-rgb),.12);
+}
+[data-theme="dark"] .history-loader:hover{
+  background:rgba(var(--accent-rgb),.24);
+}
+[data-theme="dark"] .history-loader.loading{
+  background:rgba(255,255,255,.06);
+}
+/* 移动端紧凑 */
+@media (max-width:768px){
+  .history-loader{
+    font-size:12.5px;
+    padding:8px 14px;
+    max-width:280px;
+  }
+}
+
 .emoji-picker{position:absolute;bottom:72px;left:12px;background:var(--bg-modal);
   border:1px solid var(--border-input);border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.15);
   padding:10px;display:none;grid-template-columns:repeat(8,1fr);gap:4px;max-width:300px;
@@ -7586,6 +7871,95 @@ html.is-watch .burn-banner-text{
 .bili-card-meta{
   font-size:11.5px;color:var(--text-muted);
   display:flex;gap:8px;flex-wrap:wrap;
+}
+
+/* ============================================================
+   ★ v0.28.0：互动标识样式（类似 QQ 的火花 / 龙王）
+   ============================================================ */
+.interaction-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11.5px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 10px;
+  line-height: 16px;
+  flex-shrink: 0;
+  white-space: nowrap;
+  letter-spacing: .2px;
+  margin-left: 6px;
+}
+.interaction-badge.fire {
+  background: linear-gradient(135deg, #ff7043, #e53935);
+  color: #fff;
+  box-shadow: 0 1px 4px rgba(229,57,53,.35);
+  animation: firePulse 2s ease-in-out infinite;
+}
+.interaction-badge.dragon {
+  background: linear-gradient(135deg, #ffd700, #ff9800);
+  color: #5a3d00;
+  box-shadow: 0 1px 4px rgba(255,183,0,.4);
+}
+.interaction-badge.dragon .ib-name {
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@keyframes firePulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50%      { transform: scale(1.06); opacity: .85; }
+}
+[data-theme="dark"] .interaction-badge.fire {
+  background: linear-gradient(135deg, #ff8a65, #ef5350);
+}
+[data-theme="dark"] .interaction-badge.dragon {
+  background: linear-gradient(135deg, #ffc107, #f57c00);
+  color: #3a2400;
+}
+/* 移动端紧凑 */
+@media (max-width:768px){
+  .interaction-badge {
+    font-size: 10.5px;
+    padding: 0 6px;
+    line-height: 14px;
+    margin-left: 4px;
+  }
+  .interaction-badge.dragon .ib-name { max-width: 60px; }
+}
+/* 联系人项里的火花小徽章 */
+.contact-fire-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 5px;
+  border-radius: 8px;
+  line-height: 14px;
+  background: linear-gradient(135deg, #ff7043, #e53935);
+  color: #fff;
+  flex-shrink: 0;
+  margin-left: 3px;
+  letter-spacing: .2px;
+}
+[data-theme="dark"] .contact-fire-badge {
+  background: linear-gradient(135deg, #ff8a65, #ef5350);
+}
+/* 群侧栏龙王徽章 */
+.gsp-dragon-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 8px;
+  line-height: 15px;
+  background: linear-gradient(135deg, #ffd700, #ff9800);
+  color: #5a3d00;
+  font-weight: 700;
+  flex-shrink: 0;
+  margin-left: 3px;
+  letter-spacing: .2px;
 }
 
 /* 右侧：播放器固定不滚动 + 详情独立滚动 */
@@ -24021,6 +24395,8 @@ button:not(:disabled):active {
                   title="返回联系人列表" aria-label="返回">←</button>
           <div class="chat-title-wrap">
             <span class="chat-title" id="chatTitle">请选择联系人</span>
+            <span class="interaction-badge" id="chatInteractionBadge"
+                  style="display:none;"></span>
             <button class="chat-title-edit" id="chatTitleEditBtn" type="button"
                     data-i18n-title="chatTitleEditTitle" title="重命名" style="display:none;">✏️</button>
           </div>
@@ -24552,6 +24928,10 @@ button:not(:disabled):active {
           <span class="settings-nav-icon">👤</span>
           <span class="settings-nav-text" data-i18n="settingsNavPersonal">个人</span>
         </div>
+        <div class="settings-nav-item" data-section="video">
+          <span class="settings-nav-icon">📺</span>
+          <span class="settings-nav-text" data-i18n="settingsNavVideo">看视频</span>
+        </div>
         <div class="settings-nav-item" data-section="storage">
           <span class="settings-nav-icon">⚙️</span>
           <span class="settings-nav-text" data-i18n="settingsNavStorage">存储与其它</span>
@@ -24793,6 +25173,14 @@ button:not(:disabled):active {
             <span>链接自动预览</span>
             <label class="switch"><input type="checkbox" id="setLinkPreview"><span class="slider"></span></label>
           </div>
+          <div class="setting-row">
+            <span>显示互动标识 <small style="color:var(--text-muted);font-weight:normal;">（火花 / 龙王）</small></span>
+            <label class="switch"><input type="checkbox" id="setShowInteraction" checked><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <span>消息时间精确到秒</span>
+            <label class="switch"><input type="checkbox" id="setTimeShowSeconds"><span class="slider"></span></label>
+          </div>
         </div>
 
         <!-- ---------- 窗口与背景 ---------- -->
@@ -24908,6 +25296,10 @@ button:not(:disabled):active {
               <option value="hold">按住说话，松开发送</option>
             </select>
           </div>
+          <div class="setting-row">
+            <span>发送后清空输入历史 <small style="color:var(--text-muted);font-weight:normal;">（上下键不再回忆已发送内容）</small></span>
+            <label class="switch"><input type="checkbox" id="setClearSendHistory"><span class="slider"></span></label>
+          </div>
         </div>
 
         <!-- ---------- 个人 ---------- -->
@@ -24954,6 +25346,27 @@ button:not(:disabled):active {
           </div>
           <div class="setting-row" style="font-size:12px;color:var(--text-muted);border-bottom:none;padding-top:0;">
             <span style="line-height:1.5;" data-i18n="setAutoLoginDesc">开启后本设备会保存登录令牌，下次打开页面无需重新输入密码；关闭后立即清除已保存的令牌。</span>
+          </div>
+        </div>
+
+        <!-- ---------- 看视频 ---------- -->
+        <div class="settings-section" data-section="video">
+          <div class="setting-row">
+            <span>默认清晰度</span>
+            <select id="setBiliQuality">
+              <option value="1">1080P</option>
+              <option value="0" selected>自动</option>
+              <option value="2">720P</option>
+              <option value="3">480P</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <span>默认开启弹幕</span>
+            <label class="switch"><input type="checkbox" id="setBiliDanmaku" checked><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <span>自动播放 <small style="color:var(--text-muted);font-weight:normal;">（部分浏览器会拦截自动播放）</small></span>
+            <label class="switch"><input type="checkbox" id="setBiliAutoplay"><span class="slider"></span></label>
           </div>
         </div>
 
@@ -25247,29 +25660,20 @@ button:not(:disabled):active {
           <li>头像右键 → 查看大头像；双击自己的头像 → 直接进入编辑。</li>
         </ul>
 
-        <h4>🎉 节日福利</h4>
-        <ul>
-          <li>在<b>法定节假日</b>（元旦 / 春节 / 清明 / 劳动节 / 端午 / 国庆）、<b>传统节日</b>（元宵 / 七夕 / 中秋 / 重阳 / 腊八 / 小年）、以及<b>每周六</b>当天：</li>
-          <li>· <b>收款 +0.1%</b>：转账 / 领红包时实际到手金额增加</li>
-          <li>· <b>付款 -0.1%</b>：转账 / 发红包时实际扣款减少</li>
-          <li>· <b>经验 +20%</b>：签到 / 发消息 / 发动态 / 上传音乐 等所有加经验入口均享受加成</li>
-          <li>进入应用后顶部会显示节日横幅；每笔交易会实时提示福利金额。</li>
-          <li><b>节日数据来源</b>（按优先级）：</li>
-          <li>· <b>管理员手动设置</b>：命令行 <code>holiday on [名称]</code> 立即将今天标记为福利日</li>
-          <li>· <b>本地节日库</b>（<code>chinese-days</code> npm 包）：内置国务院调休数据，完全离线，无网络依赖</li>
-          <li>· <b>本地农历表</b>：预计算 2025 ~ 2030 年的传统节日</li>
-          <li>· <b>本地公历表</b>：元旦 / 劳动节 / 国庆 / 儿童节 等</li>
-          <li>· <b>每周六</b>：自动判定为福利日</li>
-          <li>网络失败时自动回退本地表 —— 功能永远可用。</li>
-          <li><b>日期一律按服务端时区计算</b>，横幅会显示服务端日期，客户端时钟不影响判定。</li>
-          <li>相关命令：<code>holiday</code> 查看状态 · <code>holiday on</code> 手动设置 · <code>holiday fetch</code> 立即拉取 · <code>holiday date YYYY-MM-DD</code> 查询指定日期</li>
-        </ul>
-
         <h4>📅 签到与经验</h4>
         <ul>
           <li>每日点击顶栏 <b>📅 签到</b> 获得 <b>+10 经验</b>；发消息 +5、发动态 +20、上传音乐 +15。</li>
-          <li>经验累积自动升级（上限 LV100）；升级时播放全屏庆祝动画；自己名片里显示经验进度条。</li>
+          <li>经验累积自动升级（上限 <b>LV1000</b>）；升级时播放全屏庆祝动画；自己名片里显示经验进度条。</li>
           <li>已签到后按钮变为「✅ 已签到 · 连续 N 天」，点击打开 <b>签到日历</b>：月历视图、连续 / 本月 / 累计三项统计、支持自由切换月份。</li>
+        </ul>
+
+        <h4>🔥 互动标识</h4>
+        <ul>
+          <li>与联系人连续聊天 ≥2 天（当天有消息）→ 聊天头部与联系人列表显示 <b>🔥 N天</b> 火花徽章。</li>
+          <li>群聊内连续 ≥2 天有消息 → 群聊头部显示 <b>🔥 N天</b> 群火花。</li>
+          <li>群聊每日最活跃成员 → 聊天头部与群侧栏成员名旁显示 <b>🐲 龙王</b> 徽章。</li>
+          <li>火花中断一天后从 1 重新开始计算；龙王每天 0 点自动重置。</li>
+          <li>可在「设置 → 消息显示 → 显示互动标识」中关闭。</li>
         </ul>
 
         <h4 data-i18n-html="aboutSysAccountsTitle">👥 系统内置账号</h4>
@@ -25277,7 +25681,7 @@ button:not(:disabled):active {
           <li><b>微信团队</b>、<b>微信支付</b>、<b>SYSTEM</b> 均为内置官方账号，且行为完全一致：</li>
           <li>· 打开会话时<b>禁用输入框与全部工具栏</b>（表情 / 文件 / 通话 / 红包等一律不可用）；</li>
           <li>· 不接受私聊消息、红包、转账；在转账目标列表中也不出现；</li>
-          <li>· 统一规格：官方标 + 蓝色认证 + 金色 👑LV100 + 蓝色双环头像。</li>
+          <li>· 统一规格：官方标 + 蓝色认证 + 金色 👑LV1000 + 蓝色双环头像。</li>
           <li>红包播报、群通话系统消息、通话记录、对方离线提示、Web 终端消息等均由 <b>SYSTEM</b> 账号发出；点头像可查看官方名片。</li>
         </ul>
 
@@ -25376,6 +25780,25 @@ button:not(:disabled):active {
 
       <!-- ─── 进阶 ─── -->
       <div class="about-panel" data-panel="advanced">
+        <h4>📈 等级与经验</h4>
+        <ul>
+          <li>等级上限 <b>1000 级</b>，从 40 级起每 10 级所需经验递增 100。</li>
+          <li>经验来源：签到 +10、发消息 +5、发动态 +20、上传音乐 +15。</li>
+          <li>升级时播放全屏庆祝动画；名片展示经验进度条与升级所需经验。</li>
+          <li>系统内置账号（微信团队 / 微信支付 / SYSTEM）固定 <b>LV1000</b>。</li>
+        </ul>
+
+        <h4>📺 看视频</h4>
+        <ul>
+          <li>点击聊天头部「⋯」→ <b>📺</b> 打开全屏视频面板。</li>
+          <li>支持 <b>推荐 / 热门 / 排行榜</b> 三个 Tab；顶部搜索框可直接搜索关键词或 BV 号。</li>
+          <li>左侧卡片列表点击 → 右侧立即播放；下方显示标题 / UP主 / 播放量 / 简介 / 相关推荐。</li>
+          <li>推荐 Tab 使用 B 站泛化推荐算法（非个性化）；推荐接口不可用时自动降级到热门。</li>
+          <li>播放历史保存在本机 localStorage（最多 30 条）。</li>
+          <li>视频播放需要外网访问 B 站 CDN，完全离线的局域网环境不可用。</li>
+          <li>可在「设置 → 看视频」中调整默认清晰度、弹幕开关、自动播放。</li>
+        </ul>
+
         <h4>🧧 红包</h4>
         <ul>
           <li><b>拼手气红包</b>：采用「微信两倍均值 × 完全随机」混合算法 —— 前段戏剧性、后段公平，金额上限已取消，仅保留最小 ¥0.01。</li>
@@ -28709,8 +29132,15 @@ var I18N = {
     settingsNavTypography: '排版',
     settingsNavInput: '输入与语音',
     settingsNavPersonal: '个人',
+    settingsNavVideo: '看视频',
     settingsNavStorage: '存储与其它',
     settingsNavData: '数据与帮助',
+    setShowInteraction: '显示互动标识',
+    setTimeShowSeconds: '消息时间精确到秒',
+    setClearSendHistory: '发送后清空输入历史',
+    setBiliQuality: '默认清晰度',
+    setBiliDanmaku: '默认开启弹幕',
+    setBiliAutoplay: '自动播放',
     settingsSidebarTitle: '设置',
 
     /* ---- 外观与显示 ---- */
@@ -29137,7 +29567,7 @@ var I18N = {
       '<li><b>微信团队</b>、<b>微信支付</b>、<b>SYSTEM</b> 均为内置官方账号，且行为完全一致：</li>' +
       '<li>· 打开会话时<b>禁用输入框与全部工具栏</b>（表情 / 文件 / 通话 / 红包等一律不可用）；</li>' +
       '<li>· 不接受私聊消息、红包、转账；在转账目标列表中也不出现；</li>' +
-      '<li>· 统一规格：官方标 + 蓝色认证 + 金色 👑LV100 + 蓝色双环头像。</li>' +
+      '<li>· 统一规格：官方标 + 蓝色认证 + 金色 👑LV1000 + 蓝色双环头像。</li>' +
       '<li>红包播报、群通话系统消息、通话记录、对方离线提示、Web 终端消息等均由 <b>SYSTEM</b> 账号发出；点头像可查看官方名片。</li>',
 
     aboutNetStatusTitle: '📡 网络状态',
@@ -29600,7 +30030,7 @@ var I18N = {
     toastGroupOnly: '仅在群聊中使用',
     toastNotAdmin: '您不是管理员',
     toastUserOffline: '用户不在线',
-    toastLevelRange: '等级须 1-100',
+    toastLevelRange: '等级须 1-1000',
     dailySigninLabel: '每日签到',
     signinBtnTitle: '每日签到 +10 经验（已签到后点击查看日历）',
     signinCalendarTitle: '📅 签到日历',
@@ -30163,8 +30593,15 @@ var I18N = {
     settingsNavTypography: 'Typography',
     settingsNavInput: 'Input & Voice',
     settingsNavPersonal: 'Personal',
+    settingsNavVideo: 'Videos',
     settingsNavStorage: 'Storage & Other',
     settingsNavData: 'Data & Help',
+    setShowInteraction: 'Show interaction badges',
+    setTimeShowSeconds: 'Time to seconds',
+    setClearSendHistory: 'Clear input history after send',
+    setBiliQuality: 'Default quality',
+    setBiliDanmaku: 'Danmaku on by default',
+    setBiliAutoplay: 'Autoplay',
     settingsSidebarTitle: 'Settings',
     setShowNetworkStatus: 'Show network status',
     setFontFamily: 'UI font',
@@ -30575,7 +31012,7 @@ var I18N = {
       '<li><b>WeChat Team</b>, <b>WeChat Pay</b> and <b>SYSTEM</b> are all built-in official accounts and behave identically:</li>' +
       '<li>· When their chat is open, <b>the input box and the entire toolbar are disabled</b> (emoji / files / calls / red packets, etc.);</li>' +
       '<li>· They do not accept direct messages, red packets or transfers, and they do not appear in the transfer target list;</li>' +
-      '<li>· Unified look: official badge + blue verification + golden 👑 LV100 + blue double-ring avatar.</li>' +
+      '<li>· Unified look: official badge + blue verification + golden 👑 LV1000 + blue double-ring avatar.</li>' +
       '<li>Red packet broadcasts, group-call system messages, call logs, offline notices and Web terminal messages are all sent from the <b>SYSTEM</b> account; click the avatar to open the official profile.</li>',
 
     aboutNetStatusTitle: '📡 Network status',
@@ -33837,9 +34274,17 @@ function formatClock(ts) {
   var d = new Date(ts);
   var h = d.getHours();
   var m = pad2(d.getMinutes());
+  var s = pad2(d.getSeconds());
+  if (state.timeShowSeconds) {
+    if (state.hour12) {
+      var hh = h % 12 || 12;
+      return hh + ':' + m + ':' + s + ' ' + (h < 12 ? 'AM' : 'PM');
+    }
+    return pad2(h) + ':' + m + ':' + s;
+  }
   if (state.hour12) {
-    var hh = h % 12 || 12;
-    return hh + ':' + m + ' ' + (h < 12 ? 'AM' : 'PM');
+    var hh2 = h % 12 || 12;
+    return hh2 + ':' + m + ' ' + (h < 12 ? 'AM' : 'PM');
   }
   return pad2(h) + ':' + m;
 }
@@ -33962,8 +34407,9 @@ function generateMsgId() {
   return Date.now().toString(36) + Math.random().toString(36).substring(2, 8);
 }
 
-/* 等级与经验（客户端镜像，与服务端 EXP_TABLE 保持一致） */
-var MAX_LEVEL = 100;
+/* 等级与经验（客户端镜像，与服务端 EXP_TABLE 保持一致）
+   ★ v0.28.0：等级上限 1000，40 级起每 10 级每级增量 +100 */
+var MAX_LEVEL = 1000;
 var EXP_TABLE = (function () {
   var t = new Array(MAX_LEVEL + 1);
   t[0] = 0; t[1] = 0;
@@ -33975,12 +34421,11 @@ var EXP_TABLE = (function () {
   ];
   for (var i = 0; i < lv2to39.length; i++) t[i + 2] = lv2to39[i];
   var last = 2850;
-  var ranges = [[40,50,90],[51,60,110],[61,70,130],[71,80,150],[81,90,160],[91,100,200]];
-  for (var r = 0; r < ranges.length; r++) {
-    for (var lv = ranges[r][0]; lv <= ranges[r][1]; lv++) {
-      last += ranges[r][2];
-      t[lv] = last;
-    }
+  var inc = 90;
+  for (var lv = 40; lv <= MAX_LEVEL; lv++) {
+    last += inc;
+    t[lv] = last;
+    if ((lv - 39) % 10 === 0 && lv < MAX_LEVEL) inc += 100;
   }
   return t;
 })();
@@ -39133,6 +39578,21 @@ function renderContacts() {
           }
         }
       } catch (eB) {}
+      /* ★ v0.28.0：私聊火花小徽章（仅连续 ≥2 天且今天有消息时显示） */
+      var _fireBadge = '';
+      try {
+        var _pi = state.showInteraction !== false &&
+          state.interactions && state.interactions.private
+          ? state.interactions.private[uid] : null;
+        if (_pi && _pi.lastDate === todayStr() && _pi.days > 1) {
+          _fireBadge = '<span class="contact-fire-badge" title="' +
+            (state.lang === 'en'
+              ? 'Chat streak: ' + _pi.days + ' days'
+              : '连续聊天 ' + _pi.days + ' 天') +
+            '">🔥' + _pi.days + '</span>';
+        }
+      } catch (eFB) { }
+
       privHtml += '<div class="contact-item' + (isActive ? ' active' : '') +
         (_hasBurn ? ' has-burn' : '') +
         (isMuted ? ' muted' : '') +
@@ -39163,7 +39623,8 @@ function renderContacts() {
             : '') +
           '><span class="contact-name-text">' + escapeHtml(_showName) + '</span>' +
           (_showName !== _displayName ? '<span class="remark-hint">(' + escapeHtml(_displayName) + ')</span>' : '') +
-          systemBadge + lvHtml + verifyHtml + moodBadge + mentionTag + _tagBadges +
+          systemBadge + lvHtml + verifyHtml + moodBadge + mentionTag +
+          _tagBadges + _fireBadge +
           '</div>' +
         _statusLine + '</div>' +
         _metaRightP +
@@ -39565,6 +40026,8 @@ function selectContact(id, type) {
   if (typeof updateChatTitleEditBtn === 'function') updateChatTitleEditBtn();
   /* ★ 切换会话后按新会话重新渲染 typing 指示器 */
   if (typeof renderTypingIndicator === 'function') renderTypingIndicator();
+  /* ★ v0.28.0：刷新互动标识（火花 / 龙王） */
+  if (typeof updateInteractionBadge === 'function') updateInteractionBadge();
   /* ★ v0.25.9：刷新阅后即焚横幅（系统账号会话不显示） */
   if (typeof updateBurnBtnUI === 'function') updateBurnBtnUI();
   /* ★ 群聊右侧面板：切换会话时重置为「展开」，按新会话重新渲染 */
@@ -39759,6 +40222,25 @@ function renderMessages() {
     return;
   }
   var html = '';
+
+  /* ★ v0.28.0：加载更早消息按钮（置于所有消息与日期分隔线之前） */
+  var _hlKey = (type === 'private' ? 'private_' : 'group_') + id;
+  var _hlHasMore = state.historyHasMore[_hlKey];
+  var _hlLoading = !!state.historyLoading[_hlKey];
+  if (_hlHasMore === false) {
+    /* 明确知道没有更多 → 显示结束提示 */
+    html += '<div class="history-loader no-more" id="historyLoader">' +
+      '— 没有更早的消息了 —</div>';
+  } else if (_hlLoading) {
+    /* 正在加载 */
+    html += '<div class="history-loader loading" id="historyLoader">' +
+      '<span class="hl-spin"></span>加载中…</div>';
+  } else {
+    /* 默认：可点击按钮（含首次进入、undefined 状态） */
+    html += '<button class="history-loader" id="historyLoader" type="button">' +
+      '↑ 加载更早的消息</button>';
+  }
+
   var lastDay = '';
   var lastDividerIdx = -1;
   var DIVIDER_EVERY = 10;
@@ -40862,24 +41344,31 @@ function checkUserScrollUp() {
 }
 dom.messageList.addEventListener('scroll', function () {
   checkUserScrollUp();
-  /* ★ 按需加载：滚动到顶部附近时拉取更早的消息 */
-  checkLoadMoreHistory();
 });
 
-/* 按需加载：滚动到顶部附近时请求更早消息 */
-function checkLoadMoreHistory() {
-  var list = dom.messageList;
-  if (!state.currentTarget) return;
-  /* 距离顶部超过 150px → 用户还在看较新的消息，不加载 */
-  if (list.scrollTop > 150) return;
-  /* 内容尚未溢出（用户不可能向上滚动）→ 不加载 */
-  if (list.scrollHeight <= list.clientHeight + 30) return;
-
-  var key = (state.currentType === 'private' ? 'private_' : 'group_') +
-    state.currentTarget;
-  if (state.historyHasMore[key] === false) return;
-  if (state.historyLoading[key]) return;
+/* ★ v0.28.0：加载更早消息 —— 改为手动点击按钮
+   ------------------------------------------------------------
+   用捕获阶段 + closest 做事件委托，避免每次 renderMessages
+   重建 DOM 都要重新绑定事件。 */
+dom.messageList.addEventListener('click', function (e) {
+  var btn = e.target && e.target.closest
+    ? e.target.closest('#historyLoader')
+    : null;
+  if (!btn) return;
+  if (btn.tagName !== 'BUTTON') return;
+  if (btn.classList.contains('loading') ||
+      btn.classList.contains('no-more')) return;
+  e.preventDefault();
+  e.stopPropagation();
   loadMoreHistory();
+}, true);
+
+/* ★ v0.28.0：自动加载已改为手动点击「加载更早的消息」按钮
+   ------------------------------------------------------------
+   保留空函数防止残留引用；真正加载逻辑见 loadMoreHistory()
+   与 #historyLoader 按钮事件委托。 */
+function checkLoadMoreHistory() {
+  /* no-op */
 }
 
 function loadMoreHistory() {
@@ -40901,6 +41390,17 @@ function loadMoreHistory() {
   if (!oldestId) return;
 
   state.historyLoading[key] = true;
+
+  /* ★ v0.28.0：立即更新按钮为「加载中」，给用户明确反馈
+     （不必等到 renderMessages 重建 DOM） */
+  (function _setLoaderLoading() {
+    var btn = document.getElementById('historyLoader');
+    if (!btn) return;
+    btn.className = 'history-loader loading';
+    btn.innerHTML = '<span class="hl-spin"></span>加载中…';
+    if (btn.tagName === 'BUTTON') btn.disabled = true;
+  })();
+
   if (state.socket && state.socket.connected) {
     state.socket.emit('history-load-more', {
       targetId: targetId,
@@ -40910,6 +41410,13 @@ function loadMoreHistory() {
     });
   } else {
     state.historyLoading[key] = false;
+    /* 断线 → 恢复按钮为可点击 */
+    var btn2 = document.getElementById('historyLoader');
+    if (btn2) {
+      btn2.className = 'history-loader';
+      btn2.innerHTML = '↑ 加载更早的消息';
+      if (btn2.tagName === 'BUTTON') btn2.disabled = false;
+    }
   }
 }
 function updateScrollBtns() {
@@ -41187,13 +41694,18 @@ function sendMessage() {
   dom.msgInput.focus();
   markMessageSent(targetId, type, msgId);
 
-  /* ★ 记录发送历史（最多保留 20 条） */
-  if (!state._sendHistory) state._sendHistory = [];
-  if (state._sendHistory[0] !== content) {
-    state._sendHistory.unshift(content);
-    if (state._sendHistory.length > 20) state._sendHistory.length = 20;
+  /* ★ 记录发送历史（最多保留 20 条）；关闭「发送后清空输入历史」时不再记录 */
+  if (state.clearSendHistory) {
+    state._sendHistory = [];
+    state._historyIndex = -1;
+  } else {
+    if (!state._sendHistory) state._sendHistory = [];
+    if (state._sendHistory[0] !== content) {
+      state._sendHistory.unshift(content);
+      if (state._sendHistory.length > 20) state._sendHistory.length = 20;
+    }
+    state._historyIndex = -1;
   }
-  state._historyIndex = -1;
   
   /* 发送后平滑滚动到底部 */
   try {
@@ -41993,6 +42505,12 @@ function doLogin() {
     state.mySigninHistory = Array.isArray(data.signinHistory)
       ? data.signinHistory.slice()
       : [];
+    /* ★ v0.28.0：互动标识（连续聊天火花 / 群聊龙王） */
+    state.interactions = (data.interactions && typeof data.interactions === 'object')
+      ? data.interactions
+      : { private: {}, group: {} };
+    if (!state.interactions.private) state.interactions.private = {};
+    if (!state.interactions.group) state.interactions.group = {};
     /* 同步设置面板下拉（若已缓存 DOM） */
     if (dom.setPresence) dom.setPresence.value = state.myPresence;
     /* 从服务端同步拉黑列表 */
@@ -42948,6 +43466,9 @@ window.addEventListener('focus', function () {
 
 /* Socket 事件 */
 function setupSocketEvents(socket) {
+  /* ★ v0.28.0：互动标识（连续聊天火花 / 群聊龙王） */
+  try { initInteractionListener(socket); } catch (e) { }
+
   /* ★ v0.25.0：风控告警（仅管理员会收到） */
   socket.on('risk-alert', function (d) {
     if (!d) return;
@@ -43162,6 +43683,32 @@ function setupSocketEvents(socket) {
       showToast('☁️ 已恢复 ' + count + ' 项设置' +
         (skipped ? '（跳过 ' + skipped + ' 项）' : '') +
         '，2 秒后自动刷新');
+
+      /* ★ v0.28.0：reload 前先同步 state，防止 reload 被阻止时
+         面板状态与功能错位 */
+      try {
+        var _stateMap = [
+          ['set_autoLogin', 'autoLoginEnabled', 'bool'],
+          ['set_showInteraction', 'showInteraction', 'bool'],
+          ['set_timeShowSeconds', 'timeShowSeconds', 'bool'],
+          ['set_clearSendHistory', 'clearSendHistory', 'bool'],
+          ['set_biliDanmaku', 'biliDanmaku', 'bool'],
+          ['set_biliAutoplay', 'biliAutoplay', 'bool'],
+          ['set_biliQuality', 'biliQuality', 'string'],
+          ['set_motionLevel', 'motionLevel', 'string'],
+          ['set_fontFamily', 'fontFamily', 'string']
+        ];
+        for (var _i = 0; _i < _stateMap.length; _i++) {
+          var _src = _stateMap[_i][0];
+          var _dst = _stateMap[_i][1];
+          var _ty  = _stateMap[_i][2];
+          var _v = localStorage.getItem(_src);
+          if (_v === null) continue;
+          if (_ty === 'bool') state[_dst] = (_v === 'true' || _v === '1');
+          else state[_dst] = _v;
+        }
+      } catch (eSync) {}
+
       setTimeout(function () {
         try { location.reload(); }
         catch (e) { try { location.href = location.href; } catch (e2) {} }
@@ -45950,7 +46497,22 @@ dom.inviteMembersBtn.addEventListener('click', function () {
 /* ==================== 管理员面板 ==================== */
 dom.adminBtn.addEventListener('click', function () {
   if (!state.isAdmin) { showToast(t('toastNotAdmin')); return; }
-  renderAdminPanel();
+  try {
+    renderAdminPanel();
+  } catch (err) {
+    /* ★ v0.28.0：渲染抛错时至少让面板打开，并提示用户刷新重试，
+       避免出现「点击管理按钮毫无反应」。 */
+    console.error('renderAdminPanel 异常:', err && err.stack);
+    if (dom.adminUserList) {
+      dom.adminUserList.innerHTML =
+        '<div style="color:#c62828;padding:12px;font-size:13px;">' +
+        '⚠️ 面板渲染出错：' +
+        String(err && err.message ? err.message : err).replace(/</g, '&lt;') +
+        '<br>请尝试刷新页面后重试</div>';
+    }
+    dom.adminModal.classList.add('open');
+    return;
+  }
   dom.adminModal.classList.add('open');
 });
 dom.closeAdminModal.addEventListener('click', function () { dom.adminModal.classList.remove('open'); });
@@ -46161,9 +46723,14 @@ function renderAdminPanel() {
       (u.muted ? ' ' + t('tagMutedShort') : '') + '</span>' +
       '</div>';
 
-    /* ★ 新增：显示注册时间并允许修改 */
-    var _cAt = persistentUsers[u.name] ? persistentUsers[u.name].createdAt : 0;
-    var _cDate = _cAt > 0 ? new Date(_cAt).toLocaleDateString('zh-CN') : '未知';
+    /* ★ v0.28.0 修复：客户端不存在 persistentUsers，
+       必须直接用 user-updated / user-list 下发的 u.createdAt，
+       否则此处会抛 ReferenceError 导致整个管理员面板打不开。 */
+    var _cAt = (u && typeof u.createdAt === 'number' && u.createdAt > 0)
+      ? u.createdAt : 0;
+    var _cDate = _cAt > 0
+      ? new Date(_cAt).toLocaleDateString('zh-CN')
+      : '未知';
     var timeRow = '<div class="admin-actions" style="width:100%;margin-top:4px;align-items:center;">' +
       '<span style="font-size:12px;color:var(--text-secondary);flex-shrink:0;">📅 注册：' +
         escapeHtml(_cDate) +
@@ -46174,7 +46741,7 @@ function renderAdminPanel() {
     /* --- 常规操作按钮 --- */
     var actions = '<div class="admin-actions" style="width:100%;margin-top:4px;">' +
       '<input type="number" class="admin-level-input" id="lv_' + uid +
-        '" value="' + (u.level || 1) + '" min="1" max="100">' +
+        '" value="' + (u.level || 1) + '" min="1" max="1000">' +
       '<button class="btn-setlevel" data-uid="' + uid + '" data-action="setlevel">LV</button>' +
       '<button class="btn-setvip" data-uid="' + uid + '" data-action="setvip">' +
         (u.vip ? t('btnUnsetSVIP') : t('btnSetSVIP')) + '</button>' +
@@ -47229,85 +47796,240 @@ document.addEventListener('keydown', function (e) {
 function applyFontSize(px) {
   try { document.documentElement.style.setProperty('--msg-font-size', px + 'px'); } catch (e) {}
 }
+/* ============================================================
+   ★ v0.28.0：设置面板全量回填（重写）
+   ------------------------------------------------------------
+   规则：
+   · 以 localStorage 为权威来源；localStorage 缺失时回退到 state
+   · 每一项独立 try/catch，单点失败不影响其它
+   · 覆盖面板里的全部 50+ 项，避免「关闭后重新打开显示旧状态」
+   ============================================================ */
 function syncSettingsUI() {
-  dom.setTimeMode.value = state.timeMode || 'both';
-  dom.setFontSize.value = state.fontSize || 15;
-  dom.setFontSizeVal.textContent = (state.fontSize || 15) + 'px';
-  dom.setNotify.checked = !!state.notifyEnabled;
-  dom.setSound.checked = !!state.soundEnabled;
-  dom.setAutoScroll.checked = !!state.autoScroll;
-  dom.setTitleFlash.checked = !!state.titleFlashEnabled;
-  dom.setShowAvatar.checked = state.showAvatar !== false;
-  dom.setMergeMessages.checked = state.mergeMessages !== false;
-  dom.setFlatStyle.checked = !!state.flatStyle;
-  dom.setHour12.checked = !!state.hour12;
-  var lh = parseInt(localStorage.getItem('set_lineHeightPx') || '15', 10);
-  dom.setLineHeight.value = lh;
-  dom.setLineHeightVal.textContent = String(lh);
-  var bw = parseInt(localStorage.getItem('set_bubbleWidthPct') || '85', 10);
-  dom.setBubbleWidth.value = bw;
-  dom.setBubbleWidthVal.textContent = bw + '%';
-  dom.setSendKey.value = localStorage.getItem('set_sendKey') || 'enter';
-  dom.setSoundType.value = localStorage.getItem('set_soundType') || 'beep';
-  if (dom.setVoiceMaxDuration) {
-    dom.setVoiceMaxDuration.value = String(state.voiceMaxDuration || 60);
-    dom.setVoiceSpeed.value = String(state.voicePlaybackSpeed || 1);
-    dom.setVoiceAutoSend.checked = !!state.voiceAutoSend;
+  function _el(id) { return document.getElementById(id); }
+  function _safe(fn) {
+    try { fn(); } catch (e) {
+      console.warn('[syncSettingsUI]', e && e.message);
+    }
   }
-  if (dom.setLanguage) dom.setLanguage.value = state.lang;
-  /* ★ v0.24.46：语言提示文案随语言变化而更新 */
-  (function _refreshLangWarning() {
+  function _ls(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  }
+  function _lsBool(key, def) {
+    var v = _ls(key);
+    if (v === null || v === undefined) return def;
+    return v === 'true' || v === '1';
+  }
+  function _lsNum(key, def) {
+    var v = parseInt(_ls(key), 10);
+    return isNaN(v) ? def : v;
+  }
+  function _val(id, v) { var e = _el(id); if (e) e.value = v; }
+  function _chk(id, v) { var e = _el(id); if (e) e.checked = !!v; }
+  function _txt(id, v) { var e = _el(id); if (e) e.textContent = v; }
+
+  /* ---------------- 外观与显示 ---------------- */
+  _safe(function () { _val('setTimeMode', _ls('timeMode') || state.timeMode || 'both'); });
+  _safe(function () {
+    var fs = _lsNum('set_fontSize', state.fontSize || 15);
+    _val('setFontSize', fs);
+    _txt('setFontSizeVal', fs + 'px');
+  });
+  _safe(function () { _val('setThemeMode', _ls('themeMode') || state.themeMode || 'light'); });
+  _safe(function () { _chk('setShowNetworkStatus', _lsBool('set_showNetworkStatus', !!state.showNetworkStatus)); });
+  _safe(function () { _val('setMotionLevel', _ls('set_motionLevel') || 'full'); });
+  _safe(function () { _chk('setCompactSidebar', _lsBool('set_compactSidebar', false)); });
+  _safe(function () { _chk('setHideSystemUsers', _lsBool('set_hideSystemUsers', !!state.hideSystemUsers)); });
+  _safe(function () { _val('setFontFamily', _ls('fontFamily') || 'system'); });
+  _safe(function () {
+    var cur = _ls('fontFamily') || 'system';
+    var row = _el('customFontRow');
+    if (row) row.style.display = (cur === 'custom') ? '' : 'none';
+    var nameEl = _el('setCustomFontName');
+    if (nameEl) {
+      var nm = _ls('customFontName') || '';
+      nameEl.textContent = nm || '未选择';
+      nameEl.classList.toggle('has-file', !!nm);
+    }
+  });
+  /* PC 侧栏宽度 */
+  _safe(function () {
+    var w = parseInt(_ls('pc_sidebar_width') || '0', 10);
+    if (isNaN(w) || w < 180 || w > 400) w = 0;
+    var slider = _el('setPcSidebarWidth');
+    var valEl  = _el('setPcSidebarWidthVal');
+    if (slider) slider.value = String(w > 0 ? w : 240);
+    if (valEl) {
+      valEl.textContent = w > 0 ? (w + 'px') : '默认';
+      valEl.style.color = w > 0 ? 'var(--accent)' : 'var(--text-secondary)';
+    }
+  });
+  _safe(function () {
+    var w = parseInt(_ls('pc_gsp_width') || '0', 10);
+    if (isNaN(w) || w < 240 || w > 520) w = 0;
+    var slider = _el('setPcGspWidth');
+    var valEl  = _el('setPcGspWidthVal');
+    if (slider) slider.value = String(w > 0 ? w : 280);
+    if (valEl) {
+      valEl.textContent = w > 0 ? (w + 'px') : '默认';
+      valEl.style.color = w > 0 ? 'var(--accent)' : 'var(--text-secondary)';
+    }
+  });
+
+  /* ---------------- 通知与提醒 ---------------- */
+  _safe(function () { _chk('setNotify', _lsBool('set_notify', !!state.notifyEnabled)); });
+  _safe(function () { _chk('setSound', _lsBool('set_sound', state.soundEnabled !== false)); });
+  _safe(function () { _chk('setTitleFlash', _lsBool('set_titleFlash', state.titleFlashEnabled !== false)); });
+  _safe(function () { _chk('setDndAllowMention', _lsBool('set_dndAllowMention', state.dndAllowMention !== false)); });
+  _safe(function () { _chk('setNotifyPrivacy', _lsBool('set_notifyPrivacy', !!state.notifyPrivacy)); });
+  _safe(function () { _val('setSoundType', _ls('set_soundType') || state.soundType || 'beep'); });
+  _safe(function () { _chk('setDoNotDisturb', _lsBool('set_doNotDisturb', !!state.doNotDisturb)); });
+  _safe(function () { _chk('setQuietEnabled', _lsBool('set_quietEnabled', !!state.quietEnabled)); });
+  _safe(function () {
+    var s = parseInt(_ls('quietStart'), 10);
+    if (isNaN(s)) s = 1320;
+    _val('setQuietStart', pad2(Math.floor(s / 60)) + ':' + pad2(s % 60));
+    var e = parseInt(_ls('quietEnd'), 10);
+    if (isNaN(e)) e = 420;
+    _val('setQuietEnd', pad2(Math.floor(e / 60)) + ':' + pad2(e % 60));
+  });
+
+  /* ---------------- 消息显示 ---------------- */
+  _safe(function () { _chk('setShowAvatar', _lsBool('set_showAvatar', state.showAvatar !== false)); });
+  _safe(function () { _chk('setMergeMessages', _lsBool('set_mergeMessages', state.mergeMessages !== false)); });
+  _safe(function () { _chk('setFlatStyle', _lsBool('set_flatStyle', !!state.flatStyle)); });
+  _safe(function () { _chk('setHour12', _lsBool('set_hour12', !!state.hour12)); });
+  _safe(function () { _chk('setAutoScroll', _lsBool('set_autoScroll', state.autoScroll !== false)); });
+  _safe(function () { _chk('setShowReadReceipt', _lsBool('set_showReadReceipt', state.showReadReceipt !== false)); });
+  _safe(function () { _chk('setLinkPreview', _lsBool('set_linkPreview', state.linkPreview !== false)); });
+  _safe(function () { _chk('setShowInteraction', _lsBool('set_showInteraction', state.showInteraction !== false)); });
+  _safe(function () { _chk('setTimeShowSeconds', _lsBool('set_timeShowSeconds', !!state.timeShowSeconds)); });
+
+  /* ---------------- 窗口与背景 ---------------- */
+  _safe(function () { _chk('setAcrylic', _lsBool('set_acrylic', !!state.acrylic)); });
+  _safe(function () { _chk('setAcrylicSecondary', _lsBool('set_acrylicSecondary', !!state.acrylicSecondary)); });
+  _safe(function () {
+    var a = _lsNum('acrylicSecondaryAlpha', state.acrylicSecondaryAlpha || 72);
+    if (a < 20 || a > 100) a = 72;
+    _val('setAcrylicSecondaryAlpha', a);
+    _txt('setAcrylicSecondaryAlphaVal', a + '%');
+  });
+  _safe(function () {
+    var row = _el('acrylicSecondaryAlphaRow');
+    if (row) {
+      var on = _lsBool('set_acrylicSecondary', !!state.acrylicSecondary);
+      row.style.opacity = on ? '1' : '0.45';
+      row.style.pointerEvents = on ? '' : 'none';
+    }
+  });
+  _safe(function () { _val('setBackgroundType', _ls('bgType') || state.bgType || 'default'); });
+  _safe(function () {
+    var urlRow = _el('bgUrlRow');
+    if (urlRow) urlRow.style.display = (_ls('bgType') === 'image') ? '' : 'none';
+    var nameEl = _el('setBackgroundFileName');
+    if (nameEl) nameEl.textContent = _ls('bgImage') ? '已设置' : '未选择';
+  });
+  _safe(function () {
+    var b = _lsNum('bgBlur', state.bgBlur || 0);
+    if (b < 0 || b > 30) b = 0;
+    _val('setBackgroundBlur', b);
+    _txt('setBackgroundBlurVal', b === 0 ? '不模糊' : (b + 'px'));
+  });
+  _safe(function () {
+    var o = _lsNum('bgOpacity', state.bgOpacity || 100);
+    if (o < 10 || o > 100) o = 100;
+    _val('setBackgroundOpacity', o);
+    _txt('setBackgroundOpacityVal', o + '%');
+  });
+
+  /* ---------------- 排版 ---------------- */
+  _safe(function () {
+    var lh = _lsNum('set_lineHeightPx', 15);
+    if (lh < 12 || lh > 22) lh = 15;
+    _val('setLineHeight', lh);
+    _txt('setLineHeightVal', String(lh));
+  });
+  _safe(function () {
+    var bw = _lsNum('set_bubbleWidthPct', 85);
+    if (bw < 40 || bw > 95) bw = 85;
+    _val('setBubbleWidth', bw);
+    _txt('setBubbleWidthVal', bw + '%');
+  });
+
+  /* ---------------- 输入与语音 ---------------- */
+  _safe(function () { _val('setSendKey', _ls('set_sendKey') || state.sendKey || 'enter'); });
+  _safe(function () { _val('setVoiceMaxDuration', _ls('set_voiceMaxDuration') || String(state.voiceMaxDuration || 60)); });
+  _safe(function () { _val('setVoiceSpeed', _ls('set_voiceSpeed') || String(state.voicePlaybackSpeed || 1)); });
+  _safe(function () { _chk('setVoiceAutoSend', _lsBool('set_voiceAutoSend', !!state.voiceAutoSend)); });
+  _safe(function () { _val('setVoiceMode', _ls('set_voiceMode') || state.voiceMode || 'click'); });
+  _safe(function () { _chk('setClearSendHistory', _lsBool('set_clearSendHistory', !!state.clearSendHistory)); });
+
+  /* ---------------- 个人 ---------------- */
+  _safe(function () { _chk('setAutoAway', _lsBool('set_autoAway', !!state.autoAway)); });
+  _safe(function () { _val('setPresence', state.myPresence || 'online'); });
+  _safe(function () { _val('setLanguage', state.lang || 'zh'); });
+  _safe(function () { _chk('setAutoLogin', _lsBool('set_autoLogin', state.autoLoginEnabled !== false)); });
+
+  /* ---------------- 看视频 ---------------- */
+  _safe(function () { _val('setBiliQuality', _ls('set_biliQuality') || state.biliQuality || '0'); });
+  _safe(function () { _chk('setBiliDanmaku', _lsBool('set_biliDanmaku', state.biliDanmaku !== false)); });
+  _safe(function () { _chk('setBiliAutoplay', _lsBool('set_biliAutoplay', !!state.biliAutoplay)); });
+
+  /* ---------------- 数据与帮助 ---------------- */
+  _safe(function () { _chk('setDebugMode', _ls('debugMode') === '1'); });
+
+  /* ---------------- 视觉风格（已废弃，兼容旧 DOM） ---------------- */
+  _safe(function () {
+    var s = _el('setVisualStyle');
+    if (s) s.value = state.appleStyle ? 'apple' : 'classic';
+  });
+
+  /* ---------------- 主题色高亮 ---------------- */
+  _safe(function () {
+    var c = _ls('themeColor') || state.themeColor || '#07c160';
+    if (typeof syncAccentSwatches === 'function') syncAccentSwatches(c);
+  });
+
+  /* ---------------- 语言提示文案 ---------------- */
+  _safe(function () {
     var warnEl = document.querySelector('[data-i18n="langWarning"]');
     if (warnEl) warnEl.textContent = t('langWarning');
-  })();
-  /* ★ v0.24.39：同步自动登录开关 */
-  var _autoLoginChk = $id('setAutoLogin');
-  if (_autoLoginChk) _autoLoginChk.checked = state.autoLoginEnabled !== false;
-  /* 打开设置面板时回填当前状态 */
-  if (dom.setDoNotDisturb) dom.setDoNotDisturb.checked = !!state.doNotDisturb;
-  if (dom.setPresence) dom.setPresence.value = state.myPresence || 'online';
-  if (dom.setThemeMode) dom.setThemeMode.value = state.themeMode || 'light';
+  });
 
-  /* ============================================================
-     ★ v0.24.44：补齐设置面板所有开关的回填
-     ------------------------------------------------------------
-     打开设置面板时，每一项都必须按"当前实际状态"回填，
-     否则用户会看到与实际不符的开关状态，
-     从而误操作（例如把已开启的开关又点了一次 → 关闭）。
-     ============================================================ */
-  /* 显示网络状态 */
-  var _chkShowNet = document.getElementById('setShowNetworkStatus');
-  if (_chkShowNet) _chkShowNet.checked = !!state.showNetworkStatus;
-  /* 窗口亚克力 */
-  var _chkAcrylic = document.getElementById('setAcrylic');
-  if (_chkAcrylic) _chkAcrylic.checked = !!state.acrylic;
-  /* 二级窗口亚克力 */
-  var _chkAcrylic2 = document.getElementById('setAcrylicSecondary');
-  if (_chkAcrylic2) _chkAcrylic2.checked = !!state.acrylicSecondary;
-  /* 二级亚克力透明度 */
-  var _sliderAc2 = document.getElementById('setAcrylicSecondaryAlpha');
-  var _labelAc2 = document.getElementById('setAcrylicSecondaryAlphaVal');
-  if (_sliderAc2 && typeof state.acrylicSecondaryAlpha === 'number') {
-    _sliderAc2.value = String(state.acrylicSecondaryAlpha);
-    if (_labelAc2) _labelAc2.textContent = state.acrylicSecondaryAlpha + '%';
-  }
-  /* 自动登录 */
-  var _chkAutoLogin = document.getElementById('setAutoLogin');
-  if (_chkAutoLogin) _chkAutoLogin.checked = state.autoLoginEnabled !== false;
-  /* 视觉风格 */
-  var _selVisual = document.getElementById('setVisualStyle');
-  if (_selVisual) _selVisual.value = state.appleStyle ? 'apple' : 'classic';
-  /* ★ v0.27.1：PC 侧栏宽度滑块回填 */
+  /* ---------------- 新增设置项二次绑定 ---------------- */
   try {
-    if (typeof applyPcPanelWidths === 'function') applyPcPanelWidths();
-  } catch (eW) {}
-  /* 字体大小滑块（同步数值） */
-  if (dom.setFontSize) dom.setFontSize.value = state.fontSize || 15;
-  if (dom.setFontSizeVal) dom.setFontSizeVal.textContent = (state.fontSize || 15) + 'px';
+    if (typeof window.__bindNewSettings === 'function') {
+      window.__bindNewSettings();
+    }
+  } catch (e) {
+    console.error('__bindNewSettings 出错:', e);
+  }
+  /* ★ v0.28.0 修复：全局绑定兜底（幂等，不依赖 initExtraPrefs） */
+  try {
+    if (typeof window.__bindV028Settings === 'function') {
+      window.__bindV028Settings();
+    }
+  } catch (e2) {
+    console.error('__bindV028Settings 出错:', e2);
+  }
 }
+
+/* ★ v0.28.0 修复：v0.24.44 补齐逻辑、字体大小滑块、二次绑定
+   均已合并进上方新写的 syncSettingsUI() 函数内；
+   此处原有的孤儿代码块及多余的 } 已删除，修复
+   "Unexpected identifier 'dom'" 语法错误。 */
+
 dom.settingsBtn.addEventListener('click', function () {
-  syncSettingsUI();
-  dom.settingsModal.classList.add('open');
+  /* ★ v0.28.0：即使 syncSettingsUI 抛错，也必须把面板打开 */
+  try {
+    syncSettingsUI();
+  } catch (e) {
+    console.error('[settings] syncSettingsUI 异常:', e && e.stack);
+  }
+  try {
+    dom.settingsModal.classList.add('open');
+  } catch (e2) {
+    console.error('[settings] 面板打开失败:', e2);
+  }
 });
 dom.closeSettingsModal.addEventListener('click', function () {
   dom.settingsModal.classList.remove('open');
@@ -48277,6 +48999,106 @@ dom.shortcutsModal.addEventListener('click', function (e) {
     });
   }
 
+  /* ★ v0.28.0：新增设置项绑定独立成函数，用 setTimeout 延迟执行
+     —— 与 initExtraPrefs 完全解耦：即使前者任何一句抛错，
+        这里依然会执行；DOM 已就绪也不会丢事件。 */
+  window.__bindNewSettings = function () {
+    var _chk, _sel;
+    try {
+      _chk = document.getElementById('setShowInteraction');
+      if (_chk) {
+        _chk.checked = state.showInteraction !== false;
+        if (!_chk._bound) {
+          _chk._bound = true;
+          _chk.addEventListener('change', function () {
+            state.showInteraction = _chk.checked;
+            try { localStorage.setItem('set_showInteraction',
+              JSON.stringify(_chk.checked)); } catch (e) {}
+            if (typeof updateInteractionBadge === 'function') updateInteractionBadge();
+            if (typeof renderContacts === 'function') renderContacts();
+          });
+        }
+      }
+    } catch (e1) { console.error('bind setShowInteraction:', e1); }
+
+    try {
+      _chk = document.getElementById('setTimeShowSeconds');
+      if (_chk) {
+        _chk.checked = !!state.timeShowSeconds;
+        if (!_chk._bound) {
+          _chk._bound = true;
+          _chk.addEventListener('change', function () {
+            state.timeShowSeconds = _chk.checked;
+            try { localStorage.setItem('set_timeShowSeconds',
+              JSON.stringify(_chk.checked)); } catch (e) {}
+            if (state.currentTarget) renderMessages();
+          });
+        }
+      }
+    } catch (e2) { console.error('bind setTimeShowSeconds:', e2); }
+
+    try {
+      _chk = document.getElementById('setClearSendHistory');
+      if (_chk) {
+        _chk.checked = !!state.clearSendHistory;
+        if (!_chk._bound) {
+          _chk._bound = true;
+          _chk.addEventListener('change', function () {
+            state.clearSendHistory = _chk.checked;
+            try { localStorage.setItem('set_clearSendHistory',
+              JSON.stringify(_chk.checked)); } catch (e) {}
+            if (_chk.checked) state._sendHistory = [];
+          });
+        }
+      }
+    } catch (e3) { console.error('bind setClearSendHistory:', e3); }
+
+    try {
+      _sel = document.getElementById('setBiliQuality');
+      if (_sel) {
+        _sel.value = String(state.biliQuality || '0');
+        if (!_sel._bound) {
+          _sel._bound = true;
+          _sel.addEventListener('change', function () {
+            state.biliQuality = String(_sel.value || '0');
+            try { localStorage.setItem('set_biliQuality', state.biliQuality); } catch (e) {}
+          });
+        }
+      }
+    } catch (e4) { console.error('bind setBiliQuality:', e4); }
+
+    try {
+      _chk = document.getElementById('setBiliDanmaku');
+      if (_chk) {
+        _chk.checked = state.biliDanmaku !== false;
+        if (!_chk._bound) {
+          _chk._bound = true;
+          _chk.addEventListener('change', function () {
+            state.biliDanmaku = _chk.checked;
+            try { localStorage.setItem('set_biliDanmaku',
+              JSON.stringify(_chk.checked)); } catch (e) {}
+          });
+        }
+      }
+    } catch (e5) { console.error('bind setBiliDanmaku:', e5); }
+
+    try {
+      _chk = document.getElementById('setBiliAutoplay');
+      if (_chk) {
+        _chk.checked = !!state.biliAutoplay;
+        if (!_chk._bound) {
+          _chk._bound = true;
+          _chk.addEventListener('change', function () {
+            state.biliAutoplay = _chk.checked;
+            try { localStorage.setItem('set_biliAutoplay',
+              JSON.stringify(_chk.checked)); } catch (e) {}
+          });
+        }
+      }
+    } catch (e6) { console.error('bind setBiliAutoplay:', e6); }
+  };
+  setTimeout(window.__bindNewSettings, 300);
+
   /* 9. 离开自动切换状态 */
   state.autoAway = getBool('set_autoAway', false);
   var _idleTimer = null;
@@ -48330,6 +49152,25 @@ dom.shortcutsModal.addEventListener('click', function (e) {
 (function initExtraSettings() {
   state._origTitle = t('appTitle');
   document.title = state._origTitle;
+
+  /* ★ v0.28.0：新增设置项初始化 */
+  try { var _si = JSON.parse(localStorage.getItem('set_showInteraction')); if (typeof _si === 'boolean') state.showInteraction = _si; } catch (e) {}
+  if (typeof state.showInteraction !== 'boolean') state.showInteraction = true;
+
+  try { var _ts = JSON.parse(localStorage.getItem('set_timeShowSeconds')); if (typeof _ts === 'boolean') state.timeShowSeconds = _ts; } catch (e) {}
+  if (typeof state.timeShowSeconds !== 'boolean') state.timeShowSeconds = false;
+
+  try { var _cs = JSON.parse(localStorage.getItem('set_clearSendHistory')); if (typeof _cs === 'boolean') state.clearSendHistory = _cs; } catch (e) {}
+  if (typeof state.clearSendHistory !== 'boolean') state.clearSendHistory = false;
+
+  try { var _bq = localStorage.getItem('set_biliQuality'); if (typeof _bq === 'string') state.biliQuality = _bq; } catch (e) {}
+  if (typeof state.biliQuality !== 'string') state.biliQuality = '0';
+
+  try { var _bd = JSON.parse(localStorage.getItem('set_biliDanmaku')); if (typeof _bd === 'boolean') state.biliDanmaku = _bd; } catch (e) {}
+  if (typeof state.biliDanmaku !== 'boolean') state.biliDanmaku = true;
+
+  try { var _ba = JSON.parse(localStorage.getItem('set_biliAutoplay')); if (typeof _ba === 'boolean') state.biliAutoplay = _ba; } catch (e) {}
+  if (typeof state.biliAutoplay !== 'boolean') state.biliAutoplay = false;
   /* ★ 反馈中心令牌：尝试从 localStorage 恢复（刷新页面后仍可用） */
   try {
     var _ft = localStorage.getItem('feedback_token');
@@ -50073,7 +50914,12 @@ function debugCopyLogs() {
     'set_notify', 'set_sound', 'set_autoScroll', 'set_titleFlash',
     'set_doNotDisturb', 'set_quietEnabled', 'quietStart', 'quietEnd',
     'set_acrylic', 'set_acrylicSecondary', 'acrylicSecondaryAlpha',
-    'bgType', 'bgImage', 'bgBlur', 'bgOpacity'
+    'bgType', 'bgImage', 'bgBlur', 'bgOpacity',
+    /* ★ v0.28.0 新增 6 项 */
+    'set_showInteraction', 'set_timeShowSeconds', 'set_clearSendHistory',
+    'set_biliQuality', 'set_biliDanmaku', 'set_biliAutoplay',
+    /* ★ v0.28.0 补充 */
+    'pc_sidebar_width', 'pc_gsp_width', 'customFontName', 'header_collapsed'
   ];
 
   function collectLocalStore() {
@@ -57556,14 +58402,18 @@ function musicUploadFiles(files) {
     playerWrap.classList.add('has-video');
 
     var doPlay = function (cid) {
+      /* ★ v0.28.0：从设置中读取默认清晰度 / 弹幕 / 自动播放 */
+      var _q  = state.biliQuality != null ? String(state.biliQuality) : '0';
+      var _dm = state.biliDanmaku !== false ? 1 : 0;
+      var _ap = state.biliAutoplay === true ? 1 : 0;
       var url = '//player.bilibili.com/player.html'
         + '?bvid=' + encodeURIComponent(item.bvid)
         + '&cid=' + encodeURIComponent(cid || 0)
         + '&page=1'
         + '&isOutside=true'
-        + '&high_quality=1'
-        + '&danmaku=1'
-        + '&autoplay=0';
+        + '&high_quality=' + _q
+        + '&danmaku=' + _dm
+        + '&autoplay=' + _ap;
       /* ★ 直接赋值新 src，不先设 about:blank（少一次导航） */
       try { frame.src = url; } catch (e) {}
       loadDetail(item.bvid);
@@ -57608,8 +58458,20 @@ function musicUploadFiles(files) {
         if (d.stat && d.stat.like) {
           html += '<span>👍 ' + fmtView(d.stat.like) + '</span>';
         }
+        /* ★ v0.28.0：投币 / 收藏 / 分享 */
+        if (d.stat && d.stat.coin) {
+          html += '<span>🪙 ' + fmtView(d.stat.coin) + ' 投币</span>';
+        }
+        if (d.stat && d.stat.favorite) {
+          html += '<span>⭐ ' + fmtView(d.stat.favorite) + ' 收藏</span>';
+        }
         if (d.duration) {
           html += '<span>⏱ ' + fmtDur(d.duration) + '</span>';
+        }
+        /* ★ v0.28.0：发布时间（YYYY-MM-DD HH:mm） */
+        if (d.pubdate) {
+          html += '<span>📅 ' +
+            escapeHtml(fmtPubDate(d.pubdate)) + ' 发布</span>';
         }
         html += '</div>';
         if (d.desc) {
@@ -57688,6 +58550,20 @@ function musicUploadFiles(files) {
     var m = Math.floor(sec / 60);
     var s = sec % 60;
     return m + ':' + (s < 10 ? '0' : '') + s;
+  }
+  /* ★ v0.28.0：秒级时间戳 → YYYY-MM-DD HH:mm（本地时区） */
+  function fmtPubDate(ts) {
+    var n = Number(ts) || 0;
+    if (!n) return '';
+    try {
+      var d = new Date(n * 1000);
+      var yy = d.getFullYear();
+      var mm = String(d.getMonth() + 1).padStart(2, '0');
+      var dd = String(d.getDate()).padStart(2, '0');
+      var hh = String(d.getHours()).padStart(2, '0');
+      var mi = String(d.getMinutes()).padStart(2, '0');
+      return yy + '-' + mm + '-' + dd + ' ' + hh + ':' + mi;
+    } catch (e) { return ''; }
   }
 
   /* ---- 搜索 ---- */
@@ -58420,6 +59296,18 @@ function renderGroupSidePanel() {
         '" title="' + escapeHtml(verifiedM) + '">✓</span>'
       : '';
 
+    /* ★ v0.28.0：今日龙王徽章 */
+    var _dragonBadge = '';
+    try {
+      var _gI = state.interactions && state.interactions.group
+        ? state.interactions.group[g.id] : null;
+      if (_gI && _gI.dailyTop && _gI.dailyTop.date === todayStr() &&
+          _gI.dailyTop.uid === uid) {
+        _dragonBadge = '<span class="gsp-dragon-badge" title="今日龙王（' +
+          _gI.dailyTop.count + ' 条消息）">🐲</span>';
+      }
+    } catch (eDB) { }
+
     membersHtml +=
       '<div class="gsp-member' + (offlineM ? ' gsp-offline' : '') +
         '" data-uid="' + escapeHtml(uid) + '">' +
@@ -58429,6 +59317,7 @@ function renderGroupSidePanel() {
             escapeHtml(name) +
             verifyMiniHtml +
             roleHtml +
+            _dragonBadge +
           '</div>' +
         '</div>' +
       '</div>';
@@ -61960,2313 +62849,334 @@ renderPlaceholder();
   }
 })();
 
+/* ============================================================
+   ★ v0.28.0 修复：新设置项独立全局绑定
+   ------------------------------------------------------------
+   不依赖 initExtraPrefs 是否成功执行。文件末尾立即执行，
+   幂等（用 _bound 标记），并在 DOM 就绪后再兜底一次。
+   覆盖 6 个新增设置项，确保它们一定能切换并写入 localStorage：
+     · 显示互动标识（火花 / 龙王）
+     · 消息时间精确到秒
+     · 发送后清空输入历史
+     · B站默认清晰度 / 默认开启弹幕 / 自动播放
+   ============================================================ */
+(function _bindV028Global() {
+  function _lsSet(key, val) {
+    try { localStorage.setItem(key, val); } catch (e) {}
+  }
+  function _bindCheck(id, onChange) {
+    var el = document.getElementById(id);
+    if (!el) return false;
+    if (el._bound) return true;
+    el._bound = true;
+    el.addEventListener('change', function () {
+      var v = !!el.checked;
+      try { onChange(v, el); }
+      catch (e) { console.error('[bindV028] ' + id + ' onChange:', e); }
+    });
+    return true;
+  }
+  function _bindSelect(id, onChange) {
+    var el = document.getElementById(id);
+    if (!el) return false;
+    if (el._bound) return true;
+    el._bound = true;
+    el.addEventListener('change', function () {
+      var v = String(el.value || '');
+      try { onChange(v, el); }
+      catch (e) { console.error('[bindV028] ' + id + ' onChange:', e); }
+    });
+    return true;
+  }
+
+  function bindAll() {
+    /* ---- 显示互动标识 ---- */
+    _bindCheck('setShowInteraction', function (v) {
+      state.showInteraction = v;
+      _lsSet('set_showInteraction', JSON.stringify(v));
+      if (typeof updateInteractionBadge === 'function') {
+        try { updateInteractionBadge(); } catch (e) {}
+      }
+      if (typeof renderContacts === 'function') {
+        try { renderContacts(); } catch (e) {}
+      }
+    });
+
+    /* ---- 消息时间精确到秒 ---- */
+    _bindCheck('setTimeShowSeconds', function (v) {
+      state.timeShowSeconds = v;
+      _lsSet('set_timeShowSeconds', JSON.stringify(v));
+      if (state.currentTarget && typeof renderMessages === 'function') {
+        try { renderMessages(); } catch (e) {}
+      }
+    });
+
+    /* ---- 发送后清空输入历史 ---- */
+    _bindCheck('setClearSendHistory', function (v) {
+      state.clearSendHistory = v;
+      _lsSet('set_clearSendHistory', JSON.stringify(v));
+      if (v) state._sendHistory = [];
+    });
+
+    /* ---- B站默认清晰度 ---- */
+    _bindSelect('setBiliQuality', function (v) {
+      state.biliQuality = v;
+      _lsSet('set_biliQuality', v);
+    });
+
+    /* ---- B站默认开启弹幕 ---- */
+    _bindCheck('setBiliDanmaku', function (v) {
+      state.biliDanmaku = v;
+      _lsSet('set_biliDanmaku', JSON.stringify(v));
+    });
+
+    /* ---- B站自动播放 ---- */
+    _bindCheck('setBiliAutoplay', function (v) {
+      state.biliAutoplay = v;
+      _lsSet('set_biliAutoplay', JSON.stringify(v));
+    });
+  }
+
+  /* 立即绑定（脚本位于 </body> 前，DOM 已就绪） */
+  bindAll();
+  /* 兜底：DOMContentLoaded / 延迟 120ms / 500ms 各再试一次，幂等 */
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bindAll);
+  } else {
+    setTimeout(bindAll, 120);
+  }
+  setTimeout(bindAll, 500);
+
+  /* 暴露给 syncSettingsUI / 设置按钮点击时调用 */
+  window.__bindV028Settings = bindAll;
+})();
+
 console.log('🚀 客户端已加载，等待登录');
 </script>
 </body>
 </html>`;
 
-/* 更新日志数据：按需 GET /api/changelog 下发，t 为标题，s 为分类数组 */
-var CL_TRANS = '过渡构建';
-var CL_KNOWN = '解决了一些已知问题';
-var CL_FEW = '添加了少量功能';
-function CLT(v, d) {
-  return { v: v, d: d, t: CL_TRANS, s: { Fixed: [CL_KNOWN] } };
-}
-
+/* 更新日志数据：按需 GET /api/changelog 下发，t 为标题，s 为分类数组
+   ★ v0.28.0：版本格式改为大版本号，历史小更新全部合并，
+     每条版本只保留极简描述；CLT / CL_TRANS / CL_KNOWN / CL_FEW
+     等过渡构建辅助函数已不再使用，一并删除。 */
 var CHANGELOG_DATA = [
   {
-    v: '0.27.17',
-    d: '2026-10-16',
-    t: '多设备登录 · 设置同步',
+    v: '0.28.0',
+    d: '2026-10-18',
+    t: '看视频 · 1000 级 · 互动标识',
     s: {
       Added: [
-        '电脑和手机现在可以同时登录同一个账号',
-        '电脑与手机同时在线时，双方会在页面顶部互相看到提示横幅',
-        '点击横幅的「详情」按钮，可查看对方设备的完整信息（类型 / 名称 / 系统 / 浏览器 / IP / 登录时间）',
-        '设置面板新增「本地设置与服务器同步」：一键把本机设置推送到服务器、或从服务器恢复到本机',
-        '新增「IP + 用户代理」信任通道：cloudflared 换域名后无需重新输入密码'
+        'B站看视频面板（推荐 / 热门 / 排行榜 / 搜索 / 相关推荐 / 播放历史）',
+        '等级上限扩展到 1000 级，40 级起每 10 级所需经验递增 100',
+        '私聊 / 群聊互动标识（🔥 连续聊天火花 / 🐲 每日龙王）',
+        '新增 6 项设置：互动标识 / 时间秒级 / 清空输入历史 / B站清晰度 / 弹幕 / 自动播放',
+        '视频详情显示发布时间、投币、收藏数'
       ],
       Changed: [
-        '同类型设备（电脑 + 电脑 / 手机 + 手机）登录时，仍会踢掉旧设备并提示「该账号已在另一台电脑 / 手机上登录」',
-        '多设备同时在线时，消息会同时推送到所有在线设备',
-        '「本地设置」的推送范围：标签 / 备注 / 归档 / 提示音 / 快捷键 / 时间段主题 / 关键词规则 / 自动回复 / 定时消息'
+        '系统内置账号等级统一为 LV1000',
+        '关于面板补充等级 / 互动标识 / 看视频章节',
+        '最后活跃时间在登录和完全离线时都会刷新'
       ],
       Fixed: [
-        '修复 cloudflared 换域名后需重新输入密码的问题',
-        '修复多设备登录时部分设备找不到自己用户对象的问题'
-      ]
-    }
-  },
-  {
-    v: '0.27.12',
-    d: '2026-10-12',
-    t: '名片修复',
-    s: {
-      Fixed: [
-        '修复电脑端名片显示错位（头像与文字重叠、按钮竖排）',
-        '修复手机端名片按钮过大，占用太多屏幕空间',
-        '修复名片顶部的"个人名片"标签在电脑端重复显示'
-      ],
-      Changed: [
-        '手机端名片按钮高度调整为 46 像素，字号 14.5',
-        '手机端名片头像缩小到 72 像素，与微信 App 一致',
-        '电脑端名片恢复三栏布局，头像从顶部渐变区左下角浮出'
-      ]
-    }
-  },
-  {
-    v: '0.27.11',
-    d: '2026-10-12',
-    t: '12 项实用功能',
-    s: {
-      Added: [
-        '手机端下拉刷新消息列表',
-        '手机端联系人左右滑动可静音、归档、置顶',
-        '手机端新增拍照按钮，一键拍照发送',
-        '手表端新增常用短语面板，快速回复',
-        '动态评论可 @ 好友，对方会收到提醒',
-        '发布动态可选择可见范围（公开 / 好友 / 仅自己）',
-        '收藏消息支持分类（重要 / 稍后看 / 参考）',
-        '跨会话全局搜索，一键定位历史消息（Ctrl+Shift+F）',
-        '消息可导出为聊天截图分享',
-        '管理员可在审核告警中一键将违规词加入过滤列表',
-        '拍一拍支持自定义后缀（如"拍了拍我的奶茶"）',
-        '全面优化手机底部安全区，按钮不再被系统小横条遮挡'
-      ],
-      Changed: [
-        '手机端所有悬浮按钮、输入框、通知都自动避让底部安全区',
-        '审核告警弹窗改为可一键学习'
-      ]
-    }
-  },
-  {
-    v: '0.27.10',
-    d: '2026-10-12',
-    t: '按设备分发 · 设置与名片全新重做',
-    s: {
-      Added: [
-        '服务器会按访问设备只下发需要的代码，手机打开更快、更省流量',
-        'PC 端不再下载移动端的底部导航和「发现 / 我」页面',
-        '移动端不再下载 PC 端专用的群侧栏和桌面布局样式',
-        '设置界面完全采用微信风格：卡片分组、灰字小标题、触摸友好',
-        '个人名片重新设计：顶部大头像、信息卡片、底部操作卡',
-        '手机号码 / 微信号 / 个性签名分行显示，阅读更清晰'
-      ],
-      Changed: [
-        '名片顶部渐变背景，头像居中显示，与微信名片一致',
-        '设置项的开关 / 下拉 / 滑块在移动端加大触摸区域',
-        '危险操作（如退出登录）改为白底红字样式',
-        'PC 微信端与移动微信端视觉高度统一'
-      ]
-    }
-  },
-  {
-    v: '0.27.9',
-    d: '2026-10-12',
-    t: '移动端二级界面全面微信化',
-    s: {
-      Added: [
-        '设置、钱包、红包、个人名片等二级界面统一采用微信风格',
-        '所有二级界面顶部使用统一导航栏，左侧返回按钮',
-        '钱包界面采用「余额卡 + 快捷宫格 + 交易记录」三段式布局',
-        '个人名片采用「渐变头像区 + 名片卡 + 操作列表」结构',
-        '发红包界面的类型选择改为两个大卡片，更易点按',
-        '交易记录按日期分组显示为圆角卡片，层次更清晰'
-      ],
-      Changed: [
-        '所有二级界面的关闭按钮统一改为左上角返回箭头「‹」',
-        '危险操作（如退出登录）改为红字居中显示',
-        '所有列表项高度加大到 54 像素，触摸更舒适',
-        '发红包 / 领红包 / 钱包等界面的按钮触摸区加大'
-      ]
-    }
-  },
-  {
-    v: '0.27.8',
-    d: '2026-10-12',
-    t: '移动端设置界面重构',
-    s: {
-      Added: [
-        '移动端设置界面全面翻新，采用胶囊式顶部导航',
-        '设置项按功能分组显示为圆角卡片，层次更清晰',
-        '切换分类时内容淡入，选中的分类自动滚到可视区',
-        '所有可点击元素触摸区域加大到 52 像素以上'
-      ],
-      Changed: [
-        '开关、下拉、滑块等控件在移动端明显放大，更易操作',
-        '横向导航两侧加了渐隐提示，更容易发现可以滑动',
-        '关闭按钮改为圆形加大按钮，右上角固定位置'
-      ]
-    }
-  },
-  {
-    v: '0.27.7',
-    d: '2026-10-12',
-    t: '界面分段传输 · 加载更快',
-    s: {
-      Added: [
-        '界面采用分段传输，边接收边渲染，打开速度明显加快',
-        '首次打开看到界面的时间大幅缩短'
-      ],
-      Changed: [
-        '首次访问后会自动记住并启用更快的加载方式',
-        '旧浏览器自动回退到原有加载方式，不受影响'
-      ]
-    }
-  },
-  {
-    v: '0.27.6',
-    d: '2026-10-12',
-    t: '撤回时限可配置 · 搜索历史',
-    s: {
-      Added: [
-        '撤回和编辑时限可配置（默认从 2 分钟延长到 5 分钟）',
-        '搜索框新增历史记录，自动保留最近 10 条搜索词',
-        '命令行新增 recall 命令，可随时调整时限',
-        '移动端「我」页面新增快捷键帮助入口'
-      ],
-      Changed: [
-        '撤回 / 编辑时限调整后所有在线用户立即生效，无需刷新',
-        '更新日志描述更简洁易懂，去掉了技术细节'
-      ]
-    }
-  },
-  {
-    v: '0.27.5',
-    d: '2026-10-12',
-    t: '旧浏览器兼容 · 手表端全面适配',
-    s: {
-      Added: [
-        '手表端全面适配：触摸目标统一放大到 40px+，消息/输入区/侧边栏全面精简',
-        '圆形表盘：内容内缩 14px，避免被表盘边缘裁切',
-        'OLED 手表：深色主题下使用纯黑背景（#000）省电',
-        '移动端 TabBar 增加 iOS 安全区适配（避免被底部小黑条遮挡）',
-        'iOS 输入框自动放大抑制（font-size ≥ 16px）',
-        '新增大量旧浏览器 polyfill：Array.find / findIndex、Object.entries / values、String.repeat、Element.append / prepend、NodeList.forEach、Array.flat、String.at / Array.at、CSS.supports',
-        '新增 v0.27.4 及更早全部更新日志条目',
-        '横屏矮屏手机输入框字体加大到 16px，避免 iOS 自动放大'
-      ],
-      Fixed: [
-        '修复服务端 level 命令等级上限错误（原 1-10，实为 1-100）',
-        '修复 level 命令只能作用于在线用户、无法修改离线用户等级',
-        '修复 getUserHistory 只过滤小写 "system"，导致大写 "SYSTEM" 被误当作真实用户加入 peers，客户端偶现空昵称联系人',
-        '修复客户端 senderName 对系统账号的显示逻辑 —— 统一覆盖 wx_team / wx_pay / SYSTEM 及其大小写变体',
-        '修复手表端 TabBar 触摸区域过小（Apple Watch / Wear OS 上难以点击）',
-        '修复手表端消息相对时间与时钟重复显示（仅保留时钟）'
-      ],
-      Changed: [
-        'level 命令用法更新为 level <用户名> <1-100>（支持用户名含空格）',
-        '系统消息发送者名本地化：微信支付 / 微信团队 / 系统均按当前语言显示',
-        '移动端 TabBar 图标放大到 24px，标签放大到 11.5px'
-      ],
-      Security: [
-        '旧浏览器 polyfill 全部为 ES5 语法，无任何 eval / new Function 调用',
-        'iOS 输入框防放大仅作用于移动端，桌面端不受影响'
-      ]
-    }
-  },
-  {
-    v: '0.27.4',
-    d: '2026-10-11',
-    t: '节日福利更稳定',
-    s: {
-      Changed: [
-        '节日判定完全本地化，不再依赖网络',
-        '法定节假日与调休安排识别更准确',
-        '每天自动跨天更新'
-      ]
-    }
-  },
-  {
-    v: '0.27.3',
-    d: '2026-10-11',
-    t: '节日福利增强',
-    s: {
-      Added: [
-        '节日判定更准确，能识别法定节假日与调休安排',
-        '管理员可手动将某天设为福利日',
-        '节日横幅显示服务器日期'
-      ],
-      Changed: [
-        '日期以服务器为准，不受客户端时钟影响'
-      ]
-    }
-  },
-  {
-    v: '0.27.2',
-    d: '2026-10-11',
-    t: '节日福利',
-    s: {
-      Added: [
-        '法定节假日、传统节日、每周六自动开启福利',
-        '收款更多、付款更少、经验加成 20%',
-        '顶部显示节日横幅，交易时提示福利金额'
-      ]
-    }
-  },
-  {
-    v: '0.27.1',
-    d: '2026-10-11',
-    t: '界面动效与布局调整',
-    s: {
-      Added: [
-        '全站动画与悬停效果优化，操作反馈更顺滑',
-        'PC 端联系人栏和群聊侧栏宽度可自由调整',
-        '所有动画自动适配系统的「减少动效」偏好'
-      ],
-      Changed: [
-        '统一动效节奏，切换主题时过渡更自然'
+        '修复无法从服务器恢复设置',
+        '修复管理员面板无法打开',
+        '修复部分设置项点击无反应',
+        '新设置项未加入同步白名单',
+        '播放器关闭后仍占用资源'
       ]
     }
   },
   {
     v: '0.27.0',
     d: '2026-10-10',
-    t: '拍一拍 · 消息翻译 · 会话背景',
+    t: '拍一拍 · 翻译 · 会话背景',
     s: {
       Added: [
-        '双击好友头像即可「拍一拍」对方',
-        '右键消息可翻译（中英互译）',
-        '群侧栏显示在线 / 离线人数',
-        'Alt+J 输入序号快速跳转到指定消息',
-        '搜索栏新增「全部收藏」按钮',
-        '每个会话可单独设置背景图',
-        '免打扰新增 1 小时 / 2 小时快捷开关',
-        '自动登录前显示 3 秒倒计时，可随时取消'
+        '拍一拍、消息翻译、会话独立背景、免打扰快捷开关',
+        '自动登录倒计时、Alt+J 消息跳转'
       ],
       Changed: [
-        '右键菜单更智能，不再溢出屏幕'
+        '内置账号资料升级、右键菜单自适应屏幕'
       ],
       Fixed: [
-        '修复老用户首次设置密码可能失败',
-        '修复密码登录时重复生成设备令牌',
-        '修复反馈列表在部分情况下加载异常'
+        '老用户首次设置密码失败等一批问题'
       ]
     }
   },
   {
     v: '0.26.0',
     d: '2026-10-06',
-    t: '源码保护 · 阅后即焚',
+    t: '阅后即焚 · 源码保护',
     s: {
-      Added: [
-        '源码保护：拦截调试快捷键；非管理员打开开发者工具时 5 秒强制刷新',
-        '管理员与 ?dev=1 完全豁免',
-        '阅后即焚：🔥 选择销毁时长，对方查看后倒计时，支持私聊与群聊',
-        '阅后消息红色标记、🔥 角标、输入区横幅、到期显示「此消息无法查看」',
-        '新增 burn 命令（on / off / status）',
-        'PC 顶栏收纳：一键收起不常用按钮'
-      ],
-      Changed: [
-        '阅后即焚记住上次选择',
-        '手表端输入区、气泡、弹窗触控区域加大',
-        '更新日志仅提供中文，其它语言显示切换提示'
-      ],
-      Fixed: [
-        '开发者工具豁免改为需管理员登录密码验证（5 分钟有效）',
-        '修复管理员按 F12 仍被拦截' ,
-        '修复对方正在查看会话时消息不销毁',
-        '修复顶栏收纳误触发界面保护',
-        '修复阅后即焚消息在接收方无标记',
-        '修复 PC 端特定窗口宽度下名片错位',
-        '阅后即焚稳定性增强：时钟校准、重复上报保护、客户端兜底上报、转发脱敏'
-      ]
-    }
-  },
-  {
-    v: '0.25.2',
-    d: '2026-10-05',
-    t: '源码保护',
-    s: {
-      Added: [
-        '源码保护增强：新增拦截 Ctrl+P',
-        '检测到开发者工具打开时显示全屏警告',
-        '管理员自动放行',
-        '管理员身份变更时实时同步限制状态',
-        '输入框保留原生右键菜单'
-      ],
-      Changed: [
-        '退出登录时立即恢复源码保护'
-      ],
-      Security: [
-        '前端代码无法真正隐藏，本保护仅提高窥探门槛'
-      ]
-    }
-  },
-  {
-    v: '0.25.1',
-    d: '2026-10-05',
-    t: '风控系统 · 源码保护',
-    s: {
-      Added: [
-        '新增风控系统：自动识别滥用行为',
-        '6 条检测规则：刷屏 / 重连 / 建群 / 改名 / 登录失败 / 超长消息',
-        '5 档处置动作：记录 / 限流 / 禁言 / 临时封禁 / 踢出',
-        '风控分数自动衰减',
-        '风控告警实时推送管理员',
-        '新增 4 条风控命令',
-        '源码保护：拦截右键与调试快捷键',
-        '检测到开发者工具时显示红色横幅',
-        '支持 ?dev=1 临时关闭源码保护'
-      ],
-      Security: [
-        '前端代码无法真正加密，本保护仅提高逆向成本',
-        '风控分数为内存态，重启清空',
-        '自动处置带标记，便于审计'
-      ],
-      Fixed: [
-        '修复右键拦截与自定义菜单冲突'
-      ]
+      Added: ['阅后即焚消息、源码保护、顶栏收纳'],
+      Fixed: ['管理员 F12 被拦截、阅后消息不销毁等']
     }
   },
   {
     v: '0.25.0',
     d: '2026-10-05',
-    t: '安全加固 · 内容审核',
+    t: '风控 · 审核 · 安全加固',
+    s: {
+      Added: ['风控评分系统、内容审核、?dev=1 管理员调试通道'],
+      Security: ['修复 CSRF、IDOR、消息与文件长度无上限']
+    }
+  },
+  {
+    v: '0.24.0',
+    d: '2026-09-28',
+    t: '界面保护 · 多设备登录 · 设置云同步',
     s: {
       Added: [
-        '新增内容审核：敏感词过滤，支持标记与拦截两种模式',
-        '命中敏感词时推送告警给管理员',
-        '新增 8 条审核命令',
-        '昵称白名单校验'
+        '界面保护、多设备登录、设置云同步',
+        '官网 / 版本日志 / 下载中心 / 反馈中心 / Web 终端'
       ],
-      Fixed: [
-        '修复消息内容长度无上限',
-        '修复文件数据长度无上限',
-        '修复 CSRF 漏洞',
-        '修复 IDOR 越权访问',
-        '修复余额与转账金额无上限',
-        '修复登录后不会自动检测网络延迟',
-        '修复只在打开网络详情面板时才采样延迟'
+      Changed: ['弹窗动画与右键菜单重构']
+    }
+  },
+  {
+    v: '0.23.0',
+    d: '2026-09-27',
+    t: '命令行 TUI · 限时封禁 · 设备管理',
+    s: {
+      Added: ['命令行 TUI、限时封禁、登录设备管理、多语言官网、Web 终端'],
+      Changed: ['撤回消息仅保留文案，名字可点击']
+    }
+  },
+  {
+    v: '0.22.0',
+    d: '2026-09-26',
+    t: '全部用户 · 自带对话框 · SYSTEM 账号',
+    s: {
+      Added: ['全部用户弹窗、自带对话框、SYSTEM 内置账号'],
+      Changed: ['主布局改为 grid 通栏、聊天头部 QQ 风格']
+    }
+  },
+  {
+    v: '0.21.0',
+    d: '2026-09-22',
+    t: '等级与经验 · 签到日历',
+    s: {
+      Added: ['等级与经验系统、签到日历、通话记录'],
+      Fixed: ['无法自动登录']
+    }
+  },
+  {
+    v: '0.20.0',
+    d: '2026-09-21',
+    t: '注册密码 · 音乐库 · 通话优化',
+    s: {
+      Added: [
+        '独立注册 / 密码 / 密保 / 找回密码、客户端预哈希、设备令牌免密',
+        '音乐库、通话质量指示器'
       ],
-      Security: [
-        '昵称仅允许中文 / 字母 / 数字 / 下划线 / 连字符 / 空格',
-        '跨站请求一律拒绝',
-        '所有写接口校验来源'
-      ]
+      Fixed: ['老用户密码未保存、微信团队消息按钮无法点击']
     }
   },
   {
-    v: '0.24.68',
-    d: '2026-10-04',
-    t: '在线关于页',
+    v: '0.19.0',
+    d: '2026-09-19',
+    t: '断线遮罩 · 微信支付 · 离线用户',
+    s: {
+      Added: ['全屏断线遮罩、微信支付 / 微信团队服务号、离线用户全量显示'],
+      Changed: ['系统账号禁用输入与工具栏']
+    }
+  },
+  {
+    v: '0.18.0',
+    d: '2026-09-18',
+    t: '群侧栏 · 存储空间 · 横屏适配',
+    s: {
+      Added: ['群聊右侧信息栏、存储空间管理、消息免打扰、横屏适配、大屏三栏弹窗'],
+      Changed: ['用户 ID 改为 10 位纯数字，新增改名功能']
+    }
+  },
+  {
+    v: '0.17.0',
+    d: '2026-09-18',
+    t: 'CSS 回归主样式块',
+    s: {
+      Changed: ['撤销 CSS 懒加载，修复窄屏布局崩塌']
+    }
+  },
+  {
+    v: '0.16.0',
+    d: '2026-09-15',
+    t: 'HTTPS · 群通话 · 红包算法 · 关于面板',
     s: {
       Added: [
-        '新增 /gy 在线关于页（5 个 Tab，4 种语言）',
-        '客户端关于面板新增 /gy 入口',
-        '官网新增关于入口'
+        'HTTPS 支持、群语音 / 视频通话、个人名片编辑',
+        '关于面板与更新日志、红包混合算法'
       ],
-      Changed: [
-        '官网联系卡片改为自适应布局'
-      ],
-      Fixed: [
-        '修复关于 / 更新日志面板滚动卡顿'
-      ]
-    }
-  },
-  {
-    v: '0.24.67',
-    d: '2026-10-04',
-    t: '解锁动画 · 稳定性优化',
-  s: {
-    Added: [
-      '登录界面新增解锁动画',
-      '右下角提示改为竖向堆叠',
-      '移动端联系人列表新增标题栏与新建群聊按钮'
-    ],
-    Changed: [
-      '撤回消息仅保留文案，名字可点击',
-      '移动端联系人列表恢复完整标签'
-    ],
-    Fixed: [
-      '修复客户端脚本语法错误导致交互失灵',
-      '清理历史遗留的系统认证文本错配',
-      '退出登录后不再自动登录',
-      '缩放 / 拖动窗口 / 横竖屏切换不再误触发界面保护',
-      'PC 端无提示时提示容器不再遮挡底部'
-    ]
-  }
-},
-  { v:'0.24.66', d:'2026-10-01',
-    t: '撤回消息精简',
-    s: {
-      Added: [
-        '撤回消息里的名字可点击打开名片'
-      ],
-      Changed: [
-        '撤回消息仅保留文案，不再显示头衔 / 群昵称 / LV 徽章'
-      ]
-    }
-  },
-  { v:'0.24.65', d:'2026-10-01',
-    t: 'PC 端提示容器彻底退出布局',
-    s: {
-      Fixed: [
-        'PC 端无提示时右下角 toast 容器完全 display:none —— 不再占用空间、不拦截事件、不参与 z-index 竞争'
-      ]
-    }
-  },
-  { v:'0.24.64', d:'2026-10-01',
-    t: '提示通知优化',
-    s: {
-      Added: [
-        '每条提示自带 ✕ 关闭按钮，点击提示任意位置也可提前关闭'
-      ],
-      Changed: [
-        '提示样式升级：毛玻璃背景 + 左侧主题色强调条 + 更柔和的淡入淡出',
-        '同一文本 1 秒内不重复弹出（防抖），超长文本自动截断到 200 字'
-      ]
-    }
-  },
-  { v:'0.24.63', d:'2026-10-01',
-    t: '移除未读跳转按钮 · 提示右下角堆叠',
-    s: {
-      Removed: [
-        '移除右下角 🔔 未读跳转浮动按钮（Alt+N 快捷键仍可跳转下一个未读）'
-      ],
-      Changed: [
-        '多条提示同时在右下角竖直堆叠，各自独立计时、互不遮挡',
-        '提示容器自动避开右下角消息弹窗与移动端 TabBar'
-      ]
-    }
-  },
-  { v:'0.24.62', d:'2026-10-01',
-    t: '移动端系统账号状态行优化',
-    s: {
-      Fixed: [
-        '移动端系统账号（微信团队 / 微信支付 / 系统）无消息时不再显示「xx 官方账号」占位文本，改为显示在线状态'
-      ]
-    }
-  },
-  { v:'0.24.61', d:'2026-10-01',
-    t: '移动端联系人列表恢复完整标签 · 顶部标题栏',
-    s: {
-      Added: [
-        '移动端「微信」联系人列表上方新增标题栏「微信 · 局域网」，右侧放置「＋ 新建群聊」按钮'
-      ],
-      Changed: [
-        '移动端联系人列表项恢复与桌面端一致的完整标签：LV 徽章、官方徽章、认证勾、心情 emoji'
-      ],
-      Fixed: [
-        '补回 netStatusEl 声明，修复「Uncaught ReferenceError: netStatusEl is not defined」',
-        '补回 stopFlashTitle 函数，修复「Uncaught ReferenceError: stopFlashTitle is not defined」'
-      ]
-    }
-  },
-  { v:'0.24.60', d:'2026-10-01',
-    t: '退出登录不自动登录 · 认证文本错配清理',
-    s: {
-      Fixed: [
-        '点击「退出登录」后不再自动登录 —— 本次会话需手动输入密码，关闭标签页后恢复正常自动登录',
-        '清理历史遗留的「系统认证文本错配」：普通用户身上残留的「系统通知 官方账号」等文本现在会在服务端启动时自动清除'
-      ]
-    }
-  },
-  { v:'0.24.59', d:'2026-10-01',
-    t: '修复客户端内联脚本语法错误',
-    s: {
-      Fixed: [
-        '清理 renderNetworkStatus 函数后残留的孤儿代码块 —— 此前会导致整个客户端 <script> 解析失败、所有交互失灵',
-        '清理签到日历重复定义 —— 此前会因引用未定义的 SC_WEEKDAY_ZH_SHORT 导致日历无法打开',
-        '合并重复的 FEEDBACK_STATUS / FEEDBACK_CATEGORY 定义、删除重复的 /kf/api/vote 路由',
-        '删除死代码（jumpToMessage 重复定义、kfRenderPage V1 等）'
-      ]
-    }
-  },
-  { v:'0.24.58', d:'2026-10-01',
-    t: '服务端崩溃日志 + 端口占用不再退出',
-    s: {
-      Added: [
-        '任何未捕获异常或服务器错误现在都会打印完整堆栈，并写入 files/crash.log，进程保持存活',
-        '新增 retry 命令 —— 端口被占用 / 权限不足时释放端口后无需重启即可重新监听'
-      ]
-    }
-  },
-  { v:'0.24.57', d:'2026-09-30',
-    t: '修复关闭「显示网络状态」后入口仍在',
-    s: {
-      Fixed: [
-        '关闭「显示网络状态」后，顶栏徽章与移动端「我」页面的网络详情入口现在会同步隐藏'
-      ]
-    }
-  },
-      { v:'0.24.56', d:'2026-09-30',
-    t: '点击编号查看反馈详情',
-    s: {
-      Added: [
-        '点击反馈编号可打开详情弹窗，展示完整内容、信息、管理员备注与官方回复'
-      ]
-    }
-  },
-      { v:'0.24.55', d:'2026-09-30',
-    t: '修复提交反馈导致服务器崩溃',
-    s: {
-      Fixed: [
-        '修复提交反馈时旧分类值（other / ux / perf）找不到新表键导致 undefined.zh 崩溃'
-      ]
-    }
-  },
-      { v:'0.24.54', d:'2026-09-30',
-    t: '反馈中心对齐 Mojang Bug Tracker',
-    s: {
-      Added: [
-        '状态扩展为 8 种；新增投票；列表改为紧凑行布局'
-      ]
-    }
-  },
-    { v:'0.24.53', d:'2026-09-30',
-    t: '反馈中心改版 —— 对齐 Mojang Bug Tracker',
-    s: {
-      Added: [
-        '状态体系扩展为 8 种（待处理 / 处理中 / 已解决 / 已修复 / 无法复现 / 重复 / 无效 / 不予处理），配色对齐 Mojang Bug Tracker',
-        '新增投票功能：每条反馈可投票（一人一票，重复点击取消）',
-        '列表改为紧凑行布局：ID / 标题 / 类型 / 状态 / 投票 / 时间 / 删除'
-      ],
-      Changed: [
-        '提交类型改为 4 种（缺陷 / 特性 / 建议 / 提问），旧数据自动映射'
-      ]
-    }
-  },
-  { v:'0.24.52', d:'2026-09-30',
-    t: '反馈功能增强',
-    s: {
-      Added: [
-        '反馈卡片现在显示管理员回复（此前仅管理员可见）',
-        '每条反馈编号旁新增「📋 复制」按钮，一键复制编号',
-        '管理员回复反馈时，主应用会弹窗提醒（右下角消息条 + Toast）'
-      ]
-    }
-  },
-  { v:'0.24.51', d:'2026-09-30',
-    t: '反馈中心新增删除功能',
-    s: {
-      Added: [
-        '反馈卡片新增「🗑️ 删除」按钮：本人可删自己的，管理员可删任何；点击弹确认框后原生表单提交'
-      ]
-    }
-  },
-  { v:'0.24.50', d:'2026-09-30',
-    t: '反馈列表改为服务端预渲染',
-    s: {
-      Fixed: [
-        '修复反馈列表不显示已提交的反馈 —— 页面 JS 有语法错误时列表永久空白，让人误以为"提交后没保存"'
-      ],
-      Changed: [
-        '反馈列表改为服务端预渲染；JS 加载后覆盖为带筛选/排序功能的版本'
-      ]
-    }
-  },
-  { v:'0.24.49', d:'2026-09-30',
-    t: '反馈中心改为原生表单 + JS 增强双保险',
-    s: {
-      Changed: [
-        '反馈提交改为 HTML 表单 + JS 增强：即使页面 JS 完全失效，原生表单提交仍然可用'
-      ]
-    }
-  },
-  { v:'0.24.48', d:'2026-09-30',
-    t: '修复反馈提交按钮无反应',
-    s: {
-      Fixed: [
-        '修复反馈中心页面 JS 崩溃导致输入不计数、提交按钮无反应 —— 撤回 v0.24.47 覆盖 window.fetch 的做法，改为在请求 URL 里显式拼接 token'
-      ]
-    }
-  },
-  { v:'0.24.47', d:'2026-09-30',
-    t: '修复反馈无法提交',
-    s: {
-      Fixed: [
-        '修复反馈中心在无 cookie 环境（隐私模式 / 严格拦截）或服务端重启后无法提交 —— URL token 现作为 cookie 的后备凭证',
-        '修复 /kf 进入时立即 302 清掉 URL token，导致 cookie 失效后无法恢复'
-      ],
-      Changed: [
-        '主应用点「📮 反馈」时通过 socket 请求最新 token，避免服务端重启后使用过期的本地缓存'
-      ]
-    }
-  },
-  { v:'0.24.46', d:'2026-09-30',
-    t: '多语言完善 + 翻译提示',
-    s: {
-      Added: [
-        '设置面板语言选择下方新增提示：除中文外其它语言翻译并不完善'
-      ],
-      Changed: [
-        '补齐 v0.24.x 新增功能的英文 / 繁體 / 文言文翻译：界面保护 / 群动态 / 自动回复 / 定时消息 / 关键词规则 / 自定义快捷键 / 时间段主题 / 网络详情 / 存储空间 / 登录设备 / 反馈回复 / 标签选择器 / 备注名 / 右键菜单 / 通用按钮等'
-      ]
-    }
-  },
-  { v:'0.24.45', d:'2026-09-30',
-    t: '移动端页面多语言适配',
-    s: {
-      Added: [
-        '移动端「发现」/「我」/ 底部 TabBar / 设置新增项 / 登录页提示 / 封禁倒计时 全部支持四种语言'
-      ],
-      Changed: [
-        '所有移动端静态文案改用 data-i18n；JS 动态文案改用 t()，切换语言后立即生效'
-      ]
-    }
-  },
-  { v:'0.24.44', d:'2026-09-30',
-    t: '设置面板断点统一 · 开关状态回填',
-    s: {
-      Fixed: [
-        '修复设置面板在 641~768px 区间（平板 / 分屏）显示错乱 —— 断点从 640px 统一到 768px，与全站移动端一致',
-        '修复「显示网络状态」开关打开设置面板时不回填 —— 用户看到的状态与实际不符，误操作会导致功能反被关闭',
-        '同步补齐设置面板内所有开关的回填：窗口亚克力 / 二级亚克力 / 透明度 / 自动登录 / 视觉风格 / 字体大小'
-      ]
-    }
-  },
-  { v:'0.24.42', d:'2026-09-30',
-    t: '增强自动登录',
-    s: {
-      Added: [
-        '页面加载时若检测到有效令牌，将自动提交登录，无需任何点击',
-        '令牌续期：每次免密登录都会刷新令牌的最后使用时间',
-        '90 天未使用的令牌在密码登录时自动清理',
-        '多标签页令牌同步：一个标签页关闭自动登录后，其它标签页立即感知'
-      ],
-      Changed: [
-        '令牌失效时提示更明确（"本设备令牌已失效，请输入密码"），并自动清除本地失效令牌',
-        '自动登录期间，登录按钮显示"自动登录中…"并禁用'
-      ]
-    }
-  },
-  {
-    v: '0.24.41', d: '2026-09-30',
-    t: '修复重启后原终端未退出',
-    s: {
-      Fixed: [
-        '修复 Windows 上 restart 后原 cmd 窗口不关闭 —— 子进程改为在新窗口独立运行，父进程退出前先释放 Socket / HTTP / readline'
-      ]
-    }
-  },
-  {
-    v: '0.24.40', d: '2026-09-30',
-    t: '封禁到期自动恢复登录',
-    s: {
-      Added: [
-        '限时封禁在登录页显示实时倒计时，到期后自动恢复登录按钮，无需手动刷新'
-      ]
-    }
-  },
-  {
-    v: '0.24.39', d: '2026-09-30',
-    t: '新增自动登录开关',
-    s: {
-      Added: [
-        '设置面板新增「自动登录」开关（默认开启）；关闭后立即清除本设备已保存的登录令牌'
-      ]
-    }
-  },
-  {
-    v: '0.24.38', d: '2026-09-30',
-    t: '撤回嵌入式弹窗',
-    s: {
-      Removed: [
-        '撤回 v0.24.33 / v0.24.34 引入的移动端嵌入式界面，恢复为普通弹窗'
-      ],
-      Fixed: [
-        '修复 v0.24.36 注释中反引号导致的启动崩溃'
-      ]
-    }
-  },
-  {
-    v: '0.24.37', d: '2026-09-30',
-    t: '服务器崩溃改为输出日志',
-    s: {
-      Added: [
-        '新增崩溃日志：所有异常写入终端与 files/crash.log，进程保持存活',
-        '新增 retry 命令：端口被占用 / 权限不足时，释放端口后无需重启即可重新监听'
-      ],
-      Changed: [
-        '端口占用 / 权限不足不再让进程退出，改为打印详细排查步骤并保持运行'
-      ]
-    }
-  },
-  {
-    v: '0.24.36', d: '2026-09-30',
-    t: '修复移动端弹窗无法滚动',
-    s: {
-      Fixed: [
-        '修复移动端弹窗内容超长时无法滚动（如创建群聊、签到日历等）'
-      ]
-    }
-  },
-  {
-    v: '0.24.35', d: '2026-09-30',
-    t: '嵌入式界面重做 · 在线用户 · 相对时间修复',
-    s: {
-      Changed: [
-        '移动端嵌入式界面重做：修正空间等特殊弹窗未被覆盖的问题；弹窗与底栏平级，不再互相遮挡'
-      ],
-      Added: [
-        '移动端「发现」页面新增「在线用户」入口，显示在线 / 离线人数并可打开全部用户列表'
-      ],
-      Fixed: [
-        '修复消息下方未显示相对时间（此前移动端被隐藏，只剩时钟）'
-      ]
-    }
-  },
-  CLT('0.24.34', '2026-09-30'),
-  {
-    v: '0.24.33', d: '2026-09-30',
-    t: '移动端嵌入式界面',
-    s: {
-      Changed: [
-        '移动端「朋友圈」改名为「空间」',
-        '空间 / 音乐 / 钱包 / 关于 / 设置 / 更新日志 / 设备管理 / 存储空间 / 签到日历 / 全部用户 / 收藏 / 快捷键 在移动端改为嵌入式界面：不透明背景、铺满视口、左上角返回按钮、底部 TabBar 保持可见',
-        '切换底部 tab 时自动关闭当前嵌入式界面'
-      ]
-    }
-  },
-  {
-    v: '0.24.32', d: '2026-09-30',
-    t: '消息预览省略号 + 全站动效',
-    s: {
-      Added: [
-        '为官网 /gw、版本日志 /log、下载中心 /download 添加了入场与滚动动效',
-        '全部动效遵循系统的「减少动效」偏好'
-      ],
-      Fixed: [
-        '修复消息预览超长时被硬截断、末尾缺省略号'
-      ]
-    }
-  },
-  {
-    v: '0.24.31', d: '2026-09-30',
-    t: '右下角弹窗修复',
-    s: {
-      Fixed: [
-        '修复移动端消息弹窗铺满底部、遮挡输入栏与红色连接状态提示',
-        '修复弹窗容器空白区域拦截下方点击'
-      ]
-    }
-  },
-  {
-    v: '0.24.30', d: '2026-09-30',
-    t: '移动端浅色主题修复',
-    s: {
-      Fixed: [
-        '修复移动端浅色主题下提示 / 占位 / 输入框文字对比度不足'
-      ]
-    }
-  },
-  {
-    v: '0.24.29', d: '2026-09-30',
-    t: '移动端布局重构',
-    s: {
-      Added: [
-        '移动端聊天头部新增「≡ 联系人菜单」按钮'
-      ],
-      Changed: [
-        '移动端底栏改为独立布局层，不再遮挡内容',
-        '移动端联系人列表单击直接进会话，移除双击 / 长按菜单'
-      ],
-      Fixed: [
-        '修复移动端浅色主题下主界面透明'
-      ]
-    }
-  },
-  {
-    v: '0.24.28', d: '2026-09-29',
-    t: '移动端群管理入口',
-    s: {
-      Added: [
-        '移动端群聊头部与「我」页面新增群管理 / 管理员面板入口'
-      ],
-      Fixed: [
-        '修复移动端联系人列表底部被底栏遮挡',
-        '修复群聊未显示 @ 等群专属按钮'
-      ]
-    }
-  },
-  {
-    v: '0.24.27', d: '2026-09-29',
-    t: 'PC 未选中会话时隐藏输入区',
-    s: {
-      Added: [
-        'PC 端未选中会话时隐藏整个输入区'
-      ]
-    }
-  },
-  {
-    v: '0.24.26', d: '2026-09-29',
-    t: 'PC 按钮显隐修正',
-    s: {
-      Fixed: [
-        '修复 PC 群聊/私聊输入区显示了不匹配的按钮',
-        '修复 PC 群聊顶部重复显示群公告',
-        '修复移动端长文本溢出后无省略号'
-      ]
-    }
-  },
-  {
-    v: '0.24.25', d: '2026-09-29',
-    t: 'PC 聊天头部修复',
-    s: {
-      Fixed: [
-        '修复 PC 聊天头部缺少清空记录按钮、按钮顺序错乱'
-      ]
-    }
-  },
-  {
-    v: '0.24.24', d: '2026-09-29',
-    t: '移动端新建群按钮',
-    s: {
-      Added: [
-        '移动端联系人列表顶部新增「＋ 新建群聊」按钮'
-      ],
-      Fixed: [
-        '修复移动端底栏在部分情况下不显示'
-      ]
-    }
-  },
-  {
-    v: '0.24.23', d: '2026-09-29',
-    t: '壁纸显示与关于弹窗修复',
-    s: {
-      Added: [
-        '移动端联系人列表与「我」页面新增刷新 / 通知 / 设备 / 存储 / 网络 / 全屏入口'
-      ],
-      Fixed: [
-        '修复 PC 端壁纸无法完整显示',
-        '修复移动端「关于」弹窗分区被挤压'
-      ]
-    }
-  },
-  {
-    v: '0.24.22', d: '2026-09-29',
-    t: 'PC 弹窗尺寸恢复',
-    s: {
-      Fixed: [
-        '修复 PC 端弹窗 / 设置面板 / 名片 / 钱包 / 红包 / 音乐 / 空间被强制全屏'
-      ]
-    }
-  },
-  {
-    v: '0.24.21', d: '2026-09-29',
-    t: 'PC 完全退出微信风格',
-    s: {
-      Fixed: [
-        '修复 PC 端仍显示移动端微信风格（方头像、紧凑认证勾等）'
-      ]
-    }
-  },
-  {
-    v: '0.24.20', d: '2026-09-29',
-    t: '修复 PC 顶栏消失',
-    s: {
-      Fixed: [
-        '修复部分环境下 PC 顶栏不显示'
-      ]
-    }
-  },
-  {
-    v: '0.24.19', d: '2026-09-29',
-    t: '修复侧边栏昵称逐字折行',
-    s: {
-      Fixed: [
-        '修复侧边栏昵称被长认证标签挤压后逐字折行'
-      ]
-    }
-  },
-  {
-    v: '0.24.18', d: '2026-09-29',
-    t: '修复 PC 显示为移动端布局',
-    s: {
-      Fixed: [
-        '修复 PC 上侧边栏占满全屏 / 出现底部 TabBar / 顶栏消失'
-      ]
-    }
-  },
-  {
-    v: '0.24.17', d: '2026-09-29',
-    t: 'PC 群侧栏与移动端点击',
-    s: {
-      Fixed: [
-        '修复 PC 上群聊右侧面板入口不显示、窗口 resize 后不刷新'
-      ],
-      Changed: [
-        '移动端联系人改为单击进会话、双击开菜单'
-      ]
-    }
-  },
-  {
-    v: '0.24.16', d: '2026-09-29',
-    t: '修复移动端聊天页双头部',
-    s: {
-      Fixed: [
-        '修复移动端聊天页同时显示 app 顶栏与聊天头'
-      ],
-      Changed: [
-        '移动端聊天页只保留聊天头（返回 + 标题 + ⋯ + ✕）'
-      ]
-    }
-  },
-  {
-    v: '0.24.15', d: '2026-09-29',
-    t: '修复菜单按钮误触发保护',
-    s: {
-      Fixed: [
-        '修复删除的菜单按钮被界面保护判为「被删除」并误封禁'
-      ]
-    }
-  },
-  {
-    v: '0.24.14', d: '2026-09-29',
-    t: '清理冗余按钮',
-    s: {
-      Removed: [
-        '移除顶栏 ☰ 菜单按钮与弹窗右上角自动注入的 ✕'
-      ]
-    }
-  },
-  {
-    v: '0.24.13', d: '2026-09-29',
-    t: '弹窗穿透修复与移动端全屏',
-    s: {
-      Added: [
-        '移动端弹窗改为全屏，新增防点击穿透锁'
-      ],
-      Fixed: [
-        '修复点弹窗空白关闭后穿透到下方按钮',
-        '修复弹窗标题 / 设置项 / 成员名 / 菜单项过长被裁剪'
-      ],
-      Changed: [
-        '移除聊天头部的「🗑️ 清空聊天」按钮'
-      ]
-    }
-  },
-  {
-    v: '0.24.12', d: '2026-09-29',
-    t: '移动端联系人微信化',
-    s: {
-      Changed: [
-        '移动端状态行改为「最后一条消息预览」',
-        '移动端认证标签精简为小圆勾，隐藏 LV / 心情 emoji'
-      ]
-    }
-  },
-  {
-    v: '0.24.11', d: '2026-09-29',
-    t: '移动端「发现」「我」独立页面',
-    s: {
-      Added: [
-        '移动端「发现」与「我」改为独立全屏页面'
-      ],
-      Changed: [
-        '登录后移动端自动显示联系人列表'
-      ]
-    }
-  },
-  {
-    v: '0.24.10', d: '2026-09-29',
-    t: '移动端布局层级优化',
-    s: {
-      Fixed: [
-        '修复会话列表底部被底栏遮挡、TabBar 被侧栏覆盖'
-      ],
-      Changed: [
-        '移动端输入栏精简为单行'
-      ]
-    }
-  },
-  {
-    v: '0.24.9', d: '2026-09-29',
-    t: '移动端微信风格',
-    s: {
-      Added: [
-        '新增底部 TabBar（微信 / 发现 / 我）',
-        '移动端聊天界面全面采用微信配色与布局'
-      ]
-    }
-  },
-  {
-    v: '0.24.8', d: '2026-09-29',
-    t: '移动端微信风格 · 缩放窗口不误触保护',
-    s: {
-      Added: [
-        '移动端微信风格：登录后显示联系人列表、点击进全屏聊天、聊天头部加返回按钮'
-      ],
-      Fixed: [
-        '修复拖动缩放窗口误触发「界面保护」封禁'
-      ],
-      Changed: [
-        '登录后不再自动打开第一个会话'
-      ]
-    }
-  },
-  {
-    v: '0.24.7', d: '2026-09-28',
-    t: '界面保护封禁稳定性加固',
-    s: {
-      Added: [
-        '界面保护新增独立巡检通道与上报确认，防止漏检'
-      ],
-      Fixed: [
-        '修复封禁状态在登录时可能被清空、多设备登录时部分设备未被踢出'
-      ]
-    }
-  },
-  {
-    v: '0.24.6', d: '2026-09-28',
-    t: '界面保护违规累进封禁',
-    s: {
-      Added: [
-        '同一账号 10 分钟内触发 3 次「界面保护」→ 自动封禁 10 分钟',
-        '管理员账号不参与统计；公开页面同样上报'
-      ],
-      Changed: [
-        '自动解封与手动解封都会清空违规计数'
-      ]
-    }
-  },
-  {
-    v: '0.24.5', d: '2026-09-28',
-    t: '联系人分割线 · SYSTEM 配色修复',
-    s: {
-      Added: [
-        '联系人栏每项之间添加细分隔线'
-      ],
-      Fixed: [
-        '修复管理员面板 SYSTEM 认证标签显示为金色（应为官方蓝）'
-      ]
-    }
-  },
-  {
-    v: '0.24.4', d: '2026-09-28',
-    t: '联系人栏显示消息时间',
-    s: {
-      Added: [
-        '联系人栏右侧显示最新消息时间（今天 / 昨天 / 周X / M月D日 分级显示）',
-        '置顶与静音标记移至昵称行内联显示'
-      ]
-    }
-  },
-  {
-    v: '0.24.3', d: '2026-09-28',
-    t: '管理员面板支持离线用户',
-    s: {
-      Added: [
-        '管理员面板列出全部账号（含离线），可对离线用户封禁 / 认证 / 改余额等'
-      ],
-      Fixed: [
-        '修复管理员操作离线用户报「用户不在线」'
-      ],
-      Changed: [
-        '登录后不再自动打开第一个会话'
-      ]
-    }
-  },
-  {
-    v: '0.24.2', d: '2026-09-28',
-    t: '界面动画设置',
-    s: {
-      Added: [
-        '新增「界面动画」设置（关闭 / 精简 / 标准 / 流畅），遵循系统减少动效偏好'
-      ],
-      Fixed: [
-        '修复右键菜单 / Emoji / 更多菜单等浮层只有淡入没有淡出'
-      ]
-    }
-  },
-  {
-    v: '0.24.1', d: '2026-09-28',
-    t: '界面保护扩充',
-    s: {
-      Added: [
-        '界面保护覆盖扩展到全部主界面 / 弹窗 / 菜单 / 状态提示',
-        '官网 / 版本日志 / 下载中心 / 反馈中心 / Web 终端 / 登录页 / 404 新增界面保护'
-      ]
-    }
-  },
-  {
-    v: '0.24.0', d: '2026-09-27',
-    t: '界面保护 · 消息交互重构 · 群聊解散语义',
-    s: {
-      Added: [
-        '新增「🛡️ 界面保护」：删除 / 移动 / 粘贴 / 修改敏感属性 关键界面元素时，立即断连 + 全屏阻断遮罩 + 2 秒后刷新页面（强制开启，可在设置面板查看状态）',
-        '界面保护带二次确认（300ms）：打开 F12 或 DevTools 选中 / 编辑属性 / 拖拽抖动 不会误触发；只有真实的删除、移动、粘贴、非法属性修改才触发',
-        '新增「解散群聊」（仅群主 / 管理员）：仿微信语义，群保留但标记为已解散',
-        '已解散群保留在侧边栏，可继续翻看历史消息；输入框与工具栏禁用，提示「无法在已解散的群聊中发送消息」；成员需自行点「退出群聊」才真正移除',
-        '转发消息气泡内新增「↪ 转发的消息 · 来自 xxx」头部标识条',
-        '转发弹窗界面重做：群聊 / 在线 / 离线 三分组 + 真实头像 + 在线状态点 + 认证小勾 + 顶部搜索框'
-      ],
-      Fixed: [
-        '修复右键 / 双击消息时整个消息菜单无法弹出（isSelf 未定义导致 ReferenceError）',
-        '修复点击引用块无法跳转到原消息（同名函数覆盖，选择器错写成 .msg-item[data-msg-id]，永远匹配不到）',
-        '修复退出群聊后侧边栏该群不消失（服务端先移除自己再广播，导致本人收不到通知）',
-        '修复右键群聊项会叠加两个菜单、视觉上出现多余线条',
-        '修复转发消息在接收方看不到任何"转发"标识（服务端未透传 forwardFrom / forwardFromName）'
-      ],
-      Changed: [
-        '编辑选项改为「5 分钟后变灰不可点」：菜单项始终显示，悬浮可见超时原因',
-        '右键菜单改为紧凑样式：内边距 8→6px、字号 14→13px、最小宽度 160→132px，一屏可完整显示全部菜单项',
-        '右键群菜单改为单列布局，菜单项之间使用细分隔线（替代过宽的空白）',
-        '「🛡️ 界面保护」改为强制开启，设置面板中仅显示状态、无法关闭（如需临时停用，仅能在控制台执行 uiGuardDisable()，刷新后自动恢复）'
-      ],
-      Security: [
-        '界面保护覆盖 40+ 关键元素：一级容器 / 侧边栏 / 聊天区 / 消息列表 / 输入框 / 发送键 / 全部弹窗 / 顶栏核心按钮',
-        '属性校验白名单：class / style / value / disabled / title / placeholder / lang 等允许变更；id / src / href / type / name / for / action 被修改立即触发保护',
-        '界面保护触发时立即主动断开 Socket 连接（不触发自动重连），并在服务端日志留下「断开连接」记录，便于审计'
-      ]
-    }
-  },
-  {
-    v: '0.23.38', d: '2026-09-27',
-    t: '消息菜单与群聊操作集中修复',
-    s: {
-      Fixed: [
-        '修复右键消息菜单无法弹出、引用块无法跳转到原消息',
-        '修复退出群聊后侧边栏该群不消失、右键群聊项出现双菜单',
-        '修复转发消息接收方看不到"转发"标识'
-      ],
-      Added: [
-        '新增「解散群聊」（群主/管理员）：群保留可看历史，成员自行退出后自动清理',
-        '转发消息气泡与弹窗重做，引用跳转支持跨会话'
-      ]
-    }
-  },
-  {
-    v: '0.23.37', d: '2026-09-27',
-    t: '修复编辑按钮不显示',
-    s: {
-      Fixed: [
-        '修复自己的消息右键菜单不显示「编辑」'
-      ]
-    }
-  },
-  {
-    v: '0.23.36', d: '2026-09-27',
-    t: '双击消息弹出菜单',
-    s: {
-      Changed: [
-        '双击消息改为弹出菜单，编辑功能移至菜单项'
-      ]
-    }
-  },
-  {
-    v: '0.23.35', d: '2026-09-27',
-    t: '新增 404 页面',
-    s: {
-      Added: [
-        '访问不存在的路径时显示「未找到该界面」并附官网地址'
-      ]
-    }
-  },
-  {
-    v: '0.23.34', d: '2026-09-27',
-    t: '公开页面体验优化',
-    s: {
-      Added: [
-        '官网新增回到顶部、滚动阴影、入场动画等细节；登录页新增密码可见切换与记住昵称'
-      ],
-      Changed: [
-        '官网锚点跳转改为平滑滚动并避开固定顶栏'
-      ]
-    }
-  },
-  {
-    v: '0.23.33', d: '2026-09-27',
-    t: '全局登录入口',
-    s: {
-      Added: [
-        '官网与版本日志页顶栏新增「登录 / 用户名 · 退出」'
-      ],
-      Changed: [
-        '统一登录页样式与自定义滚动条'
-      ]
-    }
-  },
-  {
-    v: '0.23.32', d: '2026-09-27',
-    t: '请求体与红包状态修复',
-    s: {
-      Fixed: [
-        '修复 11 个扩展 API 拿到空请求体、红包状态缺字段'
-      ],
-      Added: [
-        '反馈中心补齐管理员回复入口'
-      ]
-    }
-  },
-  {
-    v: '0.23.31', d: '2026-09-27',
-    t: '修复备注名无法删除',
-    s: {
-      Fixed: [
-        '修复「设置备注名」留空保存无反应'
-      ]
-    }
-  },
-  {
-    v: '0.23.30', d: '2026-09-27',
-    t: '补全备注名与标签',
-    s: {
-      Added: [
-        '备注名改为自定义弹窗（留空即删除）；新增勾选式标签选择器（上限 30 个）'
-      ]
-    }
-  },
-  {
-    v: '0.23.29', d: '2026-09-27',
-    t: '修复 Apple 风格 CSS 泄漏',
-    s: {
-      Fixed: [
-        '修复开启 Apple 风格后整段 CSS 被当作页面文本显示'
-      ]
-    }
-  },
-  {
-    v: '0.23.28', d: '2026-09-27',
-    t: 'Apple 官网风格重做',
-    s: {
-      Changed: [
-        'Apple 风格完全重做，色彩 / 字体 / 毛玻璃 / 圆角 / 阴影全面对齐 Apple 规范'
-      ]
-    }
-  },
-  {
-    v: '0.23.27', d: '2026-09-27',
-    t: '登录设备管理',
-    s: {
-      Added: [
-        '新增登录设备管理，可查看设备信息并单独或批量移出其它设备'
-      ]
-    }
-  },
-  {
-    v: '0.23.26', d: '2026-09-27',
-    t: 'Apple 官网视觉风格',
-    s: {
-      Added: [
-        '新增「Apple 官网风格」主题，可在设置中切换并持久化'
-      ]
-    }
-  },
-  {
-    v: '0.23.25', d: '2026-09-27',
-    t: '反馈中心增强',
-    s: {
-      Added: [
-        '反馈新增分类与优先级、统计卡片、筛选排序、管理员回复、JSON / CSV 导出',
-        '顶栏新增「📮 反馈」按钮'
-      ]
-    }
-  },
-  {
-    v: '0.23.24', d: '2026-09-27',
-    t: '群通话重新上线',
-    s: {
-      Added: [
-        '重新启用群语音通话（最多 6 人），发起 / 结束时写入系统消息'
-      ],
-      Changed: [
-        '私聊隐藏群通话按钮；群聊隐藏一对一通话按钮'
-      ]
-    }
-  },
-  {
-    v: '0.23.22', d: '2026-09-27',
-    t: '反馈中心上线',
-    s: {
-      Added: [
-        '新增反馈中心 /kf，用户可提交反馈、管理员可改状态写备注',
-        '服务端命令行打印页面连接与断开日志'
-      ]
-    }
-  },
-  {
-    v: '0.23.20', d: '2026-09-26',
-    t: '停用群通话',
-    s: {
-      Changed: [
-        '停用群通话功能'
-      ]
-    }
-  },
-  {
-    v: '0.23.19', d: '2026-09-26',
-    t: '官网版本日志页',
-    s: {
-      Added: [
-        '新增 /log 版本日志页，与「关于」弹窗共用同一份数据'
-      ]
-    }
-  },
-  {
-    v: '0.23.18', d: '2026-09-26',
-    t: '命令面板 + 取色器 + 多置顶',
-    s: {
-      Added: [
-        '新增 Ctrl+K 命令面板、自定义主题色、消息多条置顶'
-      ]
-    }
-  },
-  {
-    v: '0.23.17', d: '2026-09-26',
-    t: '修复下载中心登录报错',
-    s: {
-      Fixed: [
-        '修复下载中心提交登录表单时的报错'
-      ]
-    }
-  },
-  {
-    v: '0.23.16', d: '2026-09-26',
-    t: '修复登录后服务器崩溃',
-    s: {
-      Fixed: [
-        '修复登录后服务器立即崩溃，新增全局异常兜底'
-      ]
-    }
-  },
-  {
-    v: '0.23.15', d: '2026-09-26',
-    t: '下载中心需登录',
-    s: {
-      Added: [
-        '下载中心需登录账号才能访问，会话保持 7 天'
-      ]
-    }
-  },
-  {
-    v: '0.23.14', d: '2026-09-26',
-    t: '官网下载中心与多语言',
-    s: {
-      Added: [
-        '新增 /download 下载中心；/gw 与 /download 支持四种语言切换'
-      ]
-    }
-  },
-  {
-    v: '0.23.13', d: '2026-09-26',
-    t: '官网版本号动态显示',
-    s: {
-      Changed: [
-        '官网版本号自动读取，无需手动修改'
-      ]
-    }
-  },
-  {
-    v: '0.23.12', d: '2026-09-26',
-    t: '官网页面',
-    s: {
-      Added: [
-        '新增 /gw 官网页面（Hero、功能、技术栈、亮点、联系方式）'
-      ]
-    }
-  },
-  {
-    v: '0.23.11', d: '2026-09-26',
-    t: '关于我们与官网入口',
-    s: {
-      Added: [
-        '「关于」弹窗新增「关于我们」栏；Web 终端地址变为可点击链接'
-      ]
-    }
-  },
-  {
-    v: '0.23.10', d: '2026-09-26',
-    t: '关于面板内容更新',
-    s: {
-      Changed: [
-        '「关于」面板各 Tab 内容全面更新'
-      ]
-    }
-  },
-  {
-    v: '0.23.9', d: '2026-09-26',
-    t: '详细调试模式',
-    s: {
-      Added: [
-        '设置面板新增「详细调试模式」，右下角 🐞 按钮实时展示 Socket / 错误 / 网络日志'
-      ],
-      Fixed: [
-        '修复网络详情面板延迟统计不累积数据'
-      ]
-    }
-  },
-  {
-    v: '0.23.8', d: '2026-09-26',
-    t: '细节修复与体验优化',
-    s: {
-      Added: [
-        '点击顶栏网络状态徽章可打开网络详情'
-      ],
-      Fixed: [
-        '修复向上滚动时「自动滚动」被误关闭'
-      ]
-    }
-  },
-  {
-    v: '0.23.7', d: '2026-09-25',
-    t: '命令行控制台 + 限时封禁',
-    s: {
-      Added: [
-        '新增命令行控制台（用户 / 群组列表、事件流、操作菜单）',
-        '新增服务器暂停 / 恢复；封禁支持时长与到期自动解封'
-      ]
-    }
-  },
-  {
-    v: '0.23.5', d: '2026-09-25',
-    t: '修复设置面板显示错误',
-    s: {
-      Fixed: [
-        '修复设置面板显示错误'
-      ]
-    }
-  },
-  {
-    v: '0.23.4', d: '2026-09-25',
-    t: '网络状态显示',
-    s: {
-      Added: [
-        '顶栏新增网络状态徽章，设置面板新增显示开关'
-      ]
-    }
-  },
-  {
-    v: '0.23.3', d: '2026-09-25',
-    t: '自定义字体 + 设置导出',
-    s: {
-      Added: [
-        '界面字体支持自定义上传；新增设置导出 / 导入（JSON）'
-      ]
-    }
-  },
-  {
-    v: '0.23.2', d: '2026-09-25',
-    t: '二级亚克力扩展',
-    s: {
-      Added: [
-        '新增二级亚克力透明度滑块，覆盖范围扩展至语音浮层 / 卡片 / 通知 / 横幅'
-      ]
-    }
-  },
-  {
-    v: '0.23.1', d: '2026-09-25',
-    t: '二级窗口亚克力',
-    s: {
-      Added: [
-        '新增「二级窗口亚克力」开关：弹窗 / 卡片 / 菜单 / 通知变为磨砂玻璃'
-      ]
-    }
-  },
-  {
-    v: '0.23.0', d: '2026-09-25',
-    t: '设置双栏布局',
-    s: {
-      Changed: [
-        '设置面板改为左导航 + 右内容双栏布局'
-      ],
-      Fixed: [
-        '修复背景模糊度滑块拖动无效'
-      ]
-    }
-  },
-  {
-    v: '0.22.9', d: '2026-09-24',
-    t: '背景模糊度调节',
-    s: {
-      Added: [
-        '设置面板按用途分为 9 组；新增「背景模糊度」与「背景透明度」滑块'
-      ]
-    }
-  },
-  {
-    v: '0.22.8', d: '2026-09-24',
-    t: '窗口亚克力与背景设置',
-    s: {
-      Added: [
-        '新增「窗口亚克力」开关；「背景样式」支持 5 套渐变预设 + 自定义图片'
-      ]
-    }
-  },
-  {
-    v: '0.22.7', d: '2026-09-24',
-    t: '登录与注册职责分离',
-    s: { Fixed: ['修复登录界面可直接注册的问题'] }
-  },
-  {
-    v: '0.22.6', d: '2026-09-24',
-    t: '管理员删除用户 + 修复已登录可注册',
-    s: {
-      Added: [
-        '管理员面板新增「删除」按钮，彻底清除账号及全部关联数据'
-      ],
-      Fixed: [
-        '修复已登录用户仍可发送注册 / 找回密码请求'
-      ]
-    }
-  },
-  {
-    v: '0.22.5', d: '2026-09-24',
-    t: '关于面板 + 自带对话框',
-    s: {
-      Added: [
-        '新增代码自带的对话框组件（替代原生 confirm / prompt）；「关于」面板 5 个 Tab 内容重写'
-      ]
-    }
-  },
-  {
-    v: '0.22.4', d: '2026-09-24',
-    t: '多语言适配 + 系统消息归位 + 语法修复',
-    s: {
-      Changed: [
-        '系统消息发送者由匿名 "system" 改为内置 "SYSTEM" 账号'
-      ],
-      Fixed: [
-        '修复客户端脚本整块无法解析的语法错误；修复繁体 / 文言文界面大量简体残留'
-      ]
-    }
-  },
-  {
-    v: '0.22.3', d: '2026-09-23',
-    t: '新增 SYSTEM 系统账号',
-    s: { Added: ['新增 SYSTEM 官方账号，与微信团队 / 微信支付并列'] }
-  },
-  {
-    v: '0.22.2', d: '2026-09-23',
-    t: '全部用户弹窗',
-    s: { Added: ['「x人在线」改为可点击按钮，打开「全部用户」弹窗（在线 / 离线分组）'] }
-  },
-  {
-    v: '0.22.1', d: '2026-09-23',
-    t: '顶栏通栏 + 群侧栏变矮',
-    s: { Changed: ['主布局改为 grid：聊天顶栏横跨整个聊天区，群侧栏从顶栏下方开始'] }
-  },
-  {
-    v: '0.22.0', d: '2026-09-23',
-    t: '聊天顶栏改为 QQ 风格',
-    s: {
-      Added: ['群名后新增 ✏️ 铅笔按钮（仅群主可见）'],
-      Changed: ['顶栏去掉底边分割线，图标改为无边框大图标']
-    }
-  },
-  {
-    v: '0.21.7', d: '2026-09-23',
-    t: '悬停高亮扩展 + 聊天顶栏通栏',
-    s: { Changed: ['补齐所有头部 / 聊天头 / 菜单 / 弹窗按钮的悬停高亮；右键菜单悬停改为主题色'] }
-  },
-  {
-    v: '0.21.6', d: '2026-09-23',
-    t: '设置面板通栏',
-    s: { Changed: ['设置项横栏延伸到面板右边缘，不再提早截断'] }
-  },
-  {
-    v: '0.21.5', d: '2026-09-23',
-    t: '弹窗淡出动画 + 设置面板扩宽',
-    s: {
-      Added: ['所有弹窗添加关闭时的淡出动画'],
-      Changed: ['设置面板宽度从 400px 扩到 560px，大屏下进一步扩宽']
-    }
-  },
-  {
-    v: '0.21.4', d: '2026-09-23',
-    t: '签到日历简化',
-    s: { Removed: ['移除签到日历日期格子下方的星期几小标签'] }
-  },
-  {
-    v: '0.21.3', d: '2026-09-23',
-    t: '签到按钮整合与日历增强',
-    s: { Changed: ['签到按钮与日历入口合并为单一按钮；日历月份切换解除范围限制'] }
-  },
-  {
-    v: '0.21.2', d: '2026-09-23',
-    t: '签到日历',
-    s: { Added: ['新增签到日历：月历视图 + 连续 / 本月 / 累计统计'] }
-  },
-  {
-    v: '0.21.1', d: '2026-09-22',
-    t: '修复无法自动登录',
-    s: { Fixed: ['修复所有浏览器都无法自动登录（设备令牌未挂到 socket）'] }
-  },
-  {
-    v: '0.21.0', d: '2026-09-22',
-    t: '通话记录系统消息',
-    s: {
-      Added: ['私聊通话结束后双方各写入一条系统消息，含时长与结果'],
-      Fixed: ['修复群通话系统消息缺 groupId 导致群里看不到通话消息']
-    }
-  },
-  {
-    v: '0.20.21', d: '2026-09-22',
-    t: '群通话系统消息',
-    s: { Added: ['群通话发起 / 结束时写入系统消息，含通话时长'] }
-  },
-  {
-    v: '0.20.20', d: '2026-09-22',
-    t: '音乐播放条靠边模式',
-    s: { Added: ['迷你播放条支持靠边收起为圆形展开按钮'] }
-  },
-  {
-    v: '0.20.19', d: '2026-09-22',
-    t: '音乐播放提示',
-    s: { Added: ['新增全局迷你播放条（歌名 / 歌手 / 进度 / 上下首）'] }
-  },
-  {
-    v: '0.20.18', d: '2026-09-22',
-    t: '音乐功能',
-    s: { Added: ['新增音乐库：上传 / 在线播放 / 进度拖动 / 音量 / 循环 / 随机 / 点赞 / 搜索'] }
-  },
-  {
-    v: '0.20.17', d: '2026-09-22',
-    t: '修复封禁状态错位',
-    s: { Fixed: ['修复联系人封禁状态显示错位'] }
-  },
-  {
-    v: '0.20.16', d: '2026-09-22',
-    t: '修复封禁标签错位',
-    s: { Fixed: ['修复联系人封禁标识位置错乱'] }
-  },
-  {
-    v: '0.20.15', d: '2026-09-22',
-    t: '修复刷新后封禁标签丢失',
-    s: { Fixed: ['修复刷新后封禁标签不显示'] }
-  },
-  {
-    v: '0.20.14', d: '2026-09-22',
-    t: '封禁状态可视化',
-    s: { Added: ['名片顶部显示封禁横幅；侧边栏联系人显示封禁标识'] }
-  },
-  {
-    v: '0.20.13', d: '2026-09-22',
-    t: '账号封禁功能',
-    s: { Added: ['新增账号封禁功能与命令行 ban / unban / bans 命令'] }
-  },
-  {
-    v: '0.20.12', d: '2026-09-22',
-    t: '修复私聊通话挂断后未真正断开',
-    s: { Fixed: ['修复私聊通话挂断后无法再次发起'] }
-  },
-  {
-    v: '0.20.11', d: '2026-09-22',
-    t: '通话优化',
-    s: { Added: ['新增 TURN 中继 / 连接质量指示器 / 音量环 / 静音徽章 / 媒体状态同步 / 通话记录'] }
-  },
-  {
-    v: '0.20.10', d: '2026-09-21',
-    t: '大屏登录界面重排',
-    s: { Changed: ['大屏登录改为两栏布局；登录后不再抢焦点'] }
-  },
-  {
-    v: '0.20.9', d: '2026-09-21',
-    t: '密码预哈希与传输加密提示',
-    s: { Added: ['新增客户端 SHA256 预哈希与传输加密状态徽章'] }
-  },
-  {
-    v: '0.20.8', d: '2026-09-21',
-    t: '修复老用户密码未保存',
-    s: { Fixed: ['修复老用户密码与密保未保存；新增 authinfo 命令'] }
-  },
-  {
-    v: '0.20.7', d: '2026-09-21',
-    t: '密码必填与设备免密',
-    s: { Added: ['新增设备令牌与老用户强制安全设置；注册密码改为必填'] }
-  },
-  {
-    v: '0.20.6', d: '2026-09-21',
-    t: '独立注册与密码体系',
-    s: { Added: ['新增独立注册 / 验证码 / 密码与密保 / 找回密码，及 codes / setpassword / resetsecurity 命令'] }
-  },
-  {
-    v: '0.20.5', d: '2026-09-21',
-    t: '工具栏精简与消息按钮修复',
-    s: {
-      Changed: ['私聊隐藏 @ 按钮；微信支付服务栏精简为钱包与红包'],
-      Fixed: ['修复微信团队消息按钮无法点击']
-    }
-  },
-  {
-    v: '0.20.4', d: '2026-09-20',
-    t: '更新日志折叠',
-    s: { Added: ['新增更新日志折叠与懒加载'] }
-  },
-  {
-    v: '0.20.3', d: '2026-09-20',
-    t: '断线遮罩禁用交互',
-    s: { Changed: ['断线遮罩显示时禁用所有交互（仅保留重试）'] }
-  },
-  {
-    v: '0.20.2', d: '2026-09-20',
-    t: '多语言与时间显示',
-    s: { Changed: ['命令行日志时间改为本地时间；补全多语言翻译'] }
-  },
-  {
-    v: '0.20.1', d: '2026-09-20',
-    t: '离线用户显示与名片',
-    s: {
-      Added: ['新增离线用户全量显示与名片打开'],
-      Fixed: ['修复离线用户不显示在联系人栏 / 昵称显示为 ID']
-    }
-  },
-  {
-    v: '0.20.0', d: '2026-09-19',
-    t: '等级与经验系统',
-    s: { Added: ['新增等级与经验系统 / 每日签到 / 升级动画 / 名片经验进度条'] }
-  },
-  {
-    v: '0.19.4', d: '2026-09-19',
-    t: '命令行控制遮罩延时',
-    s: { Added: ['新增 overlay 命令，断线遮罩延时改为可配置'] }
-  },
-  {
-    v: '0.19.3', d: '2026-09-19',
-    t: '全屏断线遮罩',
-    s: { Added: ['新增全屏断线遮罩；重启横幅关闭后 10 秒自动重显'] }
-  },
-  {
-    v: '0.19.2', d: '2026-09-19',
-    t: '系统账号消息裁剪',
-    s: { Changed: ['微信支付改为每次登录发送介绍消息；系统消息上限 20 条'] }
-  },
-  {
-    v: '0.19.1', d: '2026-09-19',
-    t: '微信团队改为服务号',
-    s: { Changed: ['微信团队改为服务号，禁止发送消息；欢迎消息改为每次登录发送'] }
-  },
-  {
-    v: '0.19.0', d: '2026-09-19',
-    t: '系统账号输入区与图层修复',
-    s: {
-      Added: ['系统账号会话下工具栏自动禁用；微信支付流水通知不计入未读'],
-      Fixed: ['修复微信团队输入框被禁用 / 移动端侧边栏被群公告遮挡']
-    }
-  },
-  {
-    v: '0.18.24', d: '2026-09-19',
-    t: '认证配色与微信团队修复',
-    s: { Fixed: ['修复内置账号认证标识配色 / 微信团队输入框 / 微信支付服务栏按钮'] }
-  },
-  {
-    v: '0.18.23', d: '2026-09-19',
-    t: '微信支付与微信团队',
-    s: {
-      Added: ['新增微信支付 / 微信团队系统账号与流水通知'],
-      Changed: ['统一了认证配色']
-    }
-  },
-  {
-    v: '0.18.22', d: '2026-09-19',
-    t: '修复名片头像位置',
-    s: { Fixed: ['修复大屏名片头像位置'] }
-  },
-  {
-    v: '0.18.21', d: '2026-09-19',
-    t: '名片头像居中',
-    s: { Changed: ['大屏名片头像改为垂直居中'] }
-  },
-  {
-    v: '0.18.20', d: '2026-09-19',
-    t: '名片头像上移',
-    s: { Changed: ['名片头像进一步上移'] }
-  },
-  {
-    v: '0.18.19', d: '2026-09-19',
-    t: '窗口扩宽',
-    s: { Changed: ['大屏红包 / 空间 / 钱包窗口扩宽'] }
-  },
-  {
-    v: '0.18.18', d: '2026-09-19',
-    t: '修复名片外框',
-    s: { Fixed: ['修复名片外框未随内容扩宽'] }
-  },
-  {
-    v: '0.18.17', d: '2026-09-19',
-    t: '修复大屏名片布局',
-    s: { Fixed: ['修复大屏名片三栏错位与滚动'] }
-  },
-  {
-    v: '0.18.16', d: '2026-09-19',
-    t: '名片扩宽与布局',
-    s: { Changed: ['大屏名片改为三栏布局'] }
-  },
-  {
-    v: '0.18.15', d: '2026-09-19',
-    t: '大屏窗口布局',
-    s: { Changed: ['大屏窗口布局重构（红包 / 名片 / 钱包 / 空间）'] }
-  },
-  {
-    v: '0.18.14', d: '2026-09-19',
-    t: '横屏 UI 适配',
-    s: { Added: ['新增横屏专用 UI 适配'] }
-  },
-  {
-    v: '0.18.13', d: '2026-09-19',
-    t: '离线用户与横屏修复',
-    s: { Fixed: ['修复离线用户昵称显示 / 横屏窗口尺寸'] }
-  },
-  {
-    v: '0.18.12', d: '2026-09-19',
-    t: '群聊右侧信息栏',
-    s: { Added: ['新增群聊右侧信息栏'] }
-  },
-  {
-    v: '0.18.11', d: '2026-09-19',
-    t: '消息免打扰 + 存储空间管理',
-    s: { Added: ['新增「消息免打扰」总开关与「存储空间」管理（分项查看与清理）'] }
-  },
-  { v: '0.18.10', d: '2026-09-19', t: CL_KNOWN, s: { Fixed: [CL_KNOWN] } },
-  {
-    v: '0.18.9', d: '2026-09-18',
-    t: '修复昵称被压缩',
-    s: { Fixed: ['修复聊天昵称被压缩成缩写'] }
-  },
-  { v: '0.18.8', d: '2026-09-18', t: CL_KNOWN, s: { Fixed: [CL_KNOWN] } },
-  { v: '0.18.7', d: '2026-09-18', t: CL_KNOWN, s: { Fixed: [CL_KNOWN] } },
-  { v: '0.18.6', d: '2026-09-18', t: CL_KNOWN, s: { Fixed: [CL_KNOWN] } },
-  { v: '0.18.5', d: '2026-09-18', t: CL_KNOWN, s: { Fixed: [CL_KNOWN] } },
-  {
-    v: '0.18.4', d: '2026-09-18',
-    t: '认证改为头像角标',
-    s: { Changed: ['聊天认证改为头像右下角小勾'] }
-  },
-  {
-    v: '0.18.3', d: '2026-09-18',
-    t: '修复昵称被截断',
-    s: { Fixed: ['修复聊天昵称被截断'] }
-  },
-  {
-    v: '0.18.2', d: '2026-09-18',
-    t: '改名记录弹窗',
-    s: {
-      Added: ['添加了改名记录弹窗'],
-      Fixed: ['修复昵称与认证标签显示']
-    }
-  },
-  {
-    v: '0.18.1', d: '2026-09-18',
-    t: '改名功能迁移至名片',
-    s: { Added: ['添加了改名功能与改名记录'] }
-  },
-  {
-    v: '0.18.0', d: '2026-09-18',
-    t: '用户 ID 改版与改名',
-    s: {
-      Added: ['添加了修改昵称功能'],
-      Changed: [
-        '用户 ID 改为 10 位纯数字',
-        '空白处单击滚动改为双击滚动'
-      ]
-    }
-  },
-  {
-    v: '0.17.0', d: '2026-09-18',
-    t: '撤销 CSS 懒加载',
-    s: {
-      Changed: ['撤销了 CSS 懒加载，全部 CSS 回归主样式块'],
-      Fixed: ['修复了窄屏布局崩塌']
-    }
-  },
-  {
-    v: '0.16.26', d: '2026-09-18',
-    t: 'CSS 模块按需加载',
-    s: {
-      Added: ['添加了 CSS 模块按需加载'],
-      Fixed: ['修复了首屏 CSS 体积过大']
-    }
-  },
-  {
-    v: '0.16.25', d: '2026-09-18',
-    t: '更新日志按需加载',
-    s: { Changed: ['更新日志改为按需加载'] }
-  },
-  {
-    v: '0.16.24', d: '2026-09-17',
-    t: '大屏铺满与省市选择',
-    s: {
-      Added: ['添加了省市两级地区选择'],
-      Changed: ['大屏改为铺满整个视口']
-    }
-  },
-  {
-    v: '0.16.23', d: '2026-09-17',
-    t: '已读回执与输入中提示',
-    s: {
-      Added: ['添加了输入中提示'],
-      Fixed: ['修复了已读回执未上报']
-    }
-  },
-  {
-    v: '0.16.22', d: '2026-09-16',
-    t: '修复小屏消息重叠',
-    s: { Fixed: ['修复了小屏幕消息重叠'] }
-  },
-  {
-    v: '0.16.21', d: '2026-09-16',
-    t: '修复手表模式消息重叠',
-    s: { Fixed: ['修复了手表模式消息重叠'] }
-  },
-  {
-    v: '0.16.20', d: '2026-09-16',
-    t: '移除地铁跑酷',
-    s: { Changed: ['移除了地铁跑酷小游戏'] }
-  },
-  {
-    v: '0.16.19', d: '2026-09-16',
-    t: '修复登录失效',
-    s: {
-      Added: ['添加了内联 JS 语法自检'],
-      Fixed: ['修复了登录按钮无响应']
-    }
-  },
-  {
-    v: '0.16.18', d: '2026-09-16',
-    t: '构建与传输优化',
-    s: {
-      Added: [
-        '添加了 Brotli 与 Gzip 预压缩',
-        '添加了 ETag 304 缓存'
-      ],
-      Changed: ['优化了前端构建压缩']
-    }
-  },
-  {
-    v: '0.16.17', d: '2026-09-16',
-    t: '地铁跑酷透视调整',
-    s: {
-      Added: ['添加了金币兑换'],
-      Changed: ['减弱了地铁跑酷透视']
-    }
-  },
-  {
-    v: '0.16.16', d: '2026-09-16',
-    t: '地铁跑酷完整版',
-    s: { Added: ['添加了地铁跑酷完整版'] }
-  },
-  {
-    v: '0.16.15', d: '2026-09-16',
-    t: '地铁跑酷与双击交互',
-    s: {
-      Added: ['添加了地铁跑酷小游戏'],
-      Changed: ['移动端联系人改为双击进入会话']
-    }
-  },
-  {
-    v: '0.16.14', d: '2026-09-16',
-    t: '关于界面版本号同步',
-    s: { Changed: ['关于界面版本号改为动态读取'] }
-  },
-  {
-    v: '0.16.13', d: '2026-09-16',
-    t: '表情回应持久化与构建压缩',
-    s: {
-      Added: [
-        '添加了前端构建压缩',
-        '添加了服务端 message-react 处理器'
-      ],
-      Fixed: ['修复了表情回应刷新后消失']
-    }
-  },
-  {
-    v: '0.16.12', d: '2026-09-16',
-    t: '聊天记录读取修复',
-    s: {
-      Changed: ['签名上限提升至 200 字'],
-      Fixed: ['修复了聊天记录无法读取']
-    }
-  },
-  {
-    v: '0.16.11', d: '2026-09-16',
-    t: '表情回应持久化',
-    s: {
-      Added: ['添加了表情回应持久化'],
-      Fixed: ['修复了刷新后表情回应消失']
+      Changed: ['更新日志按需加载']
     }
   },
   {
-    v: '0.16.10', d: '2026-09-16',
-    t: '修复移动端头像修改',
-    s: { Fixed: ['修复了移动端无法修改头像'] }
-  },
-  {
-    v: '0.16.9', d: '2026-09-16',
-    t: '服务器自重启与刷新提示',
-    s: {
-      Added: [
-        '添加了服务器自重启',
-        '添加了客户端刷新提示横幅'
-      ]
-    }
-  },
-  {
-    v: '0.16.8', d: '2026-09-15',
-    t: '输入区菜单去重',
-    s: {
-      Changed: [
-        '输入区菜单去重',
-        '更新日志标题支持多语言'
-      ]
-    }
-  },
-  {
-    v: '0.16.7', d: '2026-09-15',
-    t: '完善更新日志',
-    s: { Added: ['补全了全部历史版本条目'] }
-  },
-  {
-    v: '0.16.6', d: '2026-09-15',
-    t: '添加更新日志',
-    s: { Added: ['添加了更新日志弹窗'] }
-  },
-  {
-    v: '0.16.5', d: '2026-09-15',
-    t: 'About 面板与教程',
-    s: { Added: ['添加了关于面板与使用教程'] }
-  },
-  {
-    v: '0.16.4', d: '2026-09-15',
-    t: '修复名片头像溢出',
-    s: { Fixed: ['修复了名片头像被裁切'] }
-  },
-  {
-    v: '0.16.3', d: '2026-09-15',
-    t: '名片编辑表单',
-    s: {
-      Added: [
-        '添加了名片编辑表单',
-        '添加了名片操作栏'
-      ]
-    }
-  },
-  {
-    v: '0.16.2', d: '2026-09-15',
-    t: '证书通用化与菜单系统',
-    s: {
-      Changed: [
-        '证书 SAN 改为通配',
-        '完善了更多菜单面板'
-      ]
-    }
-  },
-  {
-    v: '0.16.1', d: '2026-09-15',
-    t: 'selfsigned 证书自举',
-    s: { Added: ['添加了 selfsigned 证书生成'] }
-  },
-  {
-    v: '0.16.0', d: '2026-09-15',
-    t: 'HTTPS、群通话与红包算法',
-    s: {
-      Added: [
-        '添加了 HTTPS 支持',
-        '添加了群语音 / 视频通话'
-      ],
-      Changed: [
-        '红包算法改为混合方式',
-        '取消了红包金额上限'
-      ]
-    }
-  },
-  /* ---------- v0.15.10 ~ v0.15.1：10 个过渡构建 ---------- */
-  CLT('0.15.10', '2026-09-14'),
-  CLT('0.15.9', '2026-09-14'),
-  CLT('0.15.8', '2026-09-14'),
-  CLT('0.15.7', '2026-09-14'),
-  CLT('0.15.6', '2026-09-14'),
-  CLT('0.15.5', '2026-09-14'),
-  CLT('0.15.4', '2026-09-14'),
-  CLT('0.15.3', '2026-09-13'),
-  CLT('0.15.2', '2026-09-13'),
-  CLT('0.15.1', '2026-09-13'),
-  {
-    v: '0.15.0', d: '2026-09-13',
-    t: '钱包、红包、液态玻璃、名片、内置浏览器',
-    s: {
-      Added: [
-        '钱包系统（¥1000 初始余额 / 分精度 / 200 条流水）',
-        '红包系统（拼手气 + 普通 / 24h 过期）',
-        '空间动态 / 访客记录 / 双向拉黑',
-        '液态玻璃主题、个人名片、内置浏览器',
-        '官方认证蓝标、@提醒弹窗、消息行内编辑、语音倍速'
-      ]
-    }
-  },
-  /* ---------- v0.14.3 ~ v0.14.2：2 个过渡构建 ---------- */
-  CLT('0.14.3', '2026-09-13'),
-  CLT('0.14.2', '2026-09-13'),
-  {
-    v: '0.14.1', d: '2026-09-12',
-    t: '空间系统与黑名单',
-    s: {
-      Added: [
-        '朋友圈：发布 / 点赞 / 评论 / 9 图',
-        '访客记录（每人最近 100 人）',
-        '双向拉黑 blocks.json'
-      ]
-    }
-  },
-  CLT('0.14.0.1', '2026-09-12'),
-  {
-    v: '0.14.0', d: '2026-09-12',
-    t: '用户档案与文件大小上限',
+    v: '0.15.0',
+    d: '2026-09-13',
+    t: '钱包 · 红包 · 液态玻璃',
     s: {
       Added: [
-        'profiles.json 持久化头像 / 签名 / 心情 / 星座',
-        'config.maxFileSize 配置项（默认 50MB）'
+        '钱包 / 红包 / 空间动态 / 访客记录 / 双向拉黑',
+        '液态玻璃主题 / 内置浏览器 / 官方认证 / 行内编辑'
       ]
     }
-  },
-  CLT('0.13.6', '2026-09-11'),
-  CLT('0.13.5', '2026-09-10'),
-  CLT('0.13.4', '2026-09-10'),
-  CLT('0.13.3', '2026-09-10'),
-  {
-    v: '0.13.2', d: '2026-09-10',
-    t: '认证标识字段（稳定版）',
-    s: { Added: ['broadcastUserList 新增 verified 字段（蓝 V / 自定义认证）'] }
-  },
-  CLT('0.13.1', '2026-09-08'),
-  {
-    v: '0.13.0', d: '2026-09-05',
-    t: '稳定分支锁定',
-    s: { Changed: ['锁定精简日志 + 完整暗色 CSS + String.raw 前端'] }
   },
-  CLT('0.12.3', '2026-09-05'),
-  CLT('0.12.2', '2026-09-05'),
-  CLT('0.12.1', '2026-09-04'),
   {
-    v: '0.12.0', d: '2026-09-04',
-    t: '日志瘦身与暗色补全',
+    v: '0.14.0',
+    d: '2026-09-12',
+    t: '空间 · 拉黑 · 用户档案',
     s: {
-      Changed: [
-        '日志 typeMap 裁剪，仅保留核心生命周期事件',
-        '补全暗色 CSS 变量，暗色模式正式可用'
-      ]
+      Added: ['朋友圈（发布 / 点赞 / 评论 / 9 图）、访客记录、双向拉黑、用户档案持久化']
     }
-  },
-  {
-    v: '0.11.3', d: '2026-09-03',
-    t: '日志最细，String.raw 回归',
-    s: { Changed: ['前端切回 String.raw 避免转义断裂，兼容 TV / 老浏览器'] }
-  },
-  CLT('0.11.2', '2026-09-03'),
-  {
-    v: '0.11.1', d: '2026-09-03',
-    t: '同构维护构建',
-    s: { Changed: ['服务端持久化与 socket 层与 0.11.0 完全一致'] }
   },
   {
-    v: '0.11.0', d: '2026-09-01',
-    t: '数据持久化落地（架构跃迁）',
+    v: '0.13.0',
+    d: '2026-09-05',
+    t: '稳定分支',
     s: {
-      Added: [
-        'files/ 目录 + 5 个 JSON 持久化文件',
-        '防抖保存 scheduleSaveHistory()（1s 合并）',
-        '登录恢复 history-bulk 全量下发',
-        '群结构完整序列化（members Set↔Array 等）',
-        '消息幂等去重、已读回执、表情包持久化'
-      ]
+      Changed: ['锁定精简日志 + 完整暗色 CSS + 前端 String.raw']
     }
   },
-  CLT('0.10.3', '2026-09-01'),
   {
-    v: '0.10.2', d: '2026-08-27',
-    t: '前端单文件直出重构、空状态占位',
+    v: '0.12.0',
+    d: '2026-09-04',
+    t: '日志瘦身 · 暗色可用',
     s: {
-      Added: ['未选择联系人时的空状态占位界面'],
-      Changed: ['服务端改为单串内嵌 HTML 直出']
+      Changed: ['日志 typeMap 裁剪，暗色模式正式可用']
     }
   },
   {
-    v: '0.10.1', d: '2026-08-27',
-    t: '联系人右键菜单、静音、关于',
+    v: '0.11.0',
+    d: '2026-09-01',
+    t: '数据持久化落地',
     s: {
-      Added: [
-        '联系人右键菜单（置顶 / 拉黑）',
-        '置顶系统 + 侧边栏分区渲染',
-        '拉黑系统 + 侧边栏实时刷新',
-        '静音按钮、关于对话框'
-      ]
+      Added: ['files/ 目录 + 5 个 JSON 持久化文件、防抖保存、登录全量恢复历史、群结构序列化']
     }
   },
   {
-    v: '0.10.0', d: '2026-08-27',
+    v: '0.10.0',
+    d: '2026-08-27',
     t: '功能冻结快照',
     s: {
-      Added: [
-        '全局刷新按钮',
-        'showToast() 全链路可用',
-        '图片压缩、语音录制、QQ 群文件上传完整'
-      ]
+      Added: ['联系人右键菜单、置顶 / 拉黑、静音、关于对话框、语音录制、图片压缩']
     }
   },
   {
-    v: '0.9.2', d: '2026-08-27',
-    t: '服务端 readline 命令行、全局刷新按钮',
+    v: '0.9.0',
+    d: '2026-08-26',
+    t: 'UI 稳定基线',
     s: {
-      Added: [
-        'readline 交互式命令行（list / kick / announce / help / exit）',
-        '前端全局刷新按钮'
-      ]
+      Added: ['微信风格三栏布局、深色模式、已读回执、群聊骨架、交互式命令行']
     }
   },
   {
-    v: '0.9.1', d: '2026-08-26',
-    t: '日志双写、自动日志窗口、压缩 CSS',
-    s: {
-      Added: [
-        '日志双写（终端 + server.log）',
-        '自动打开日志窗口（Win / macOS / Linux）',
-        '全量 CSS 压缩为单行嵌入',
-        '图片预览缩放、语音录制 60s、@提及、QQ 群相册 / 投票'
-      ]
-    }
-  },
-  {
-    v: '0.9.0', d: '2026-08-26',
-    t: 'UI 稳定基线（稳定版）',
-    s: {
-      Added: [
-        '微信风格三栏布局、深色模式、自定义滚动条',
-        '已读回执、群聊骨架、TV / 老浏览器适配',
-        'Express + Socket.io 服务骨架'
-      ]
-    }
-  },
-  /* ---------- v0.8.1 ~ v0.1.2：34 个过渡构建 ---------- */
-  CLT('0.8.1', '2026-08-26'),
-  CLT('0.8.0', '2026-08-26'),
-  CLT('0.7.2', '2026-08-26'),
-  CLT('0.7.1', '2026-08-26'),
-  CLT('0.7.0', '2026-08-26'),
-  CLT('0.6.3', '2026-08-26'),
-  CLT('0.6.2', '2026-08-26'),
-  CLT('0.6.1', '2026-08-26'),
-  CLT('0.6.0', '2026-08-26'),
-  CLT('0.5.3', '2026-08-26'),
-  CLT('0.5.2', '2026-08-26'),
-  CLT('0.5.1', '2026-08-26'),
-  CLT('0.5.0', '2026-08-26'),
-  CLT('0.4.4', '2026-08-26'),
-  CLT('0.4.3', '2026-08-26'),
-  CLT('0.4.2', '2026-08-26'),
-  CLT('0.4.1', '2026-08-26'),
-  CLT('0.4.0', '2026-08-26'),
-  CLT('0.3.4', '2026-08-26'),
-  CLT('0.3.3', '2026-08-25'),
-  CLT('0.3.2', '2026-08-25'),
-  CLT('0.3.1', '2026-08-25'),
-  CLT('0.3.0', '2026-08-25'),
-  CLT('0.2.4', '2026-08-25'),
-  CLT('0.2.3', '2026-08-25'),
-  CLT('0.2.2', '2026-08-25'),
-  CLT('0.2.1', '2026-08-25'),
-  CLT('0.2.0', '2026-08-25'),
-  CLT('0.1.4', '2026-08-25'),
-  CLT('0.1.3', '2026-08-25'),
-  CLT('0.1.2', '2026-08-25'),
-  {
-    v: '0.1.1', d: '2026-08-25',
-    t: CL_FEW,
-    s: { Added: [CL_FEW] }
-  },
-  {
-    v: '0.1.0', d: '2026-08-25',
+    v: '0.1.0',
+    d: '2026-08-25',
     t: '项目创建',
-    s: { Added: ['刚刚创建了微信·局域网项目'] }
+    s: {
+      Added: ['项目初始化']
+    }
   }
 ];
 
@@ -72765,6 +71675,8 @@ app.get('/api/bili/video', function (req, res) {
           cover: d.pic || '',
           desc: String(d.desc || '').slice(0, 500),
           duration: d.duration || 0,
+          /* ★ v0.28.0：发布时间（秒级时间戳，客户端按需格式化） */
+          pubdate: Number(d.pubdate) || 0,
           owner: {
             mid: d.owner ? d.owner.mid : 0,
             name: d.owner ? d.owner.name : '未知UP主',
@@ -72773,7 +71685,11 @@ app.get('/api/bili/video', function (req, res) {
           stat: {
             view: d.stat ? (d.stat.view || 0) : 0,
             danmaku: d.stat ? (d.stat.danmaku || 0) : 0,
-            like: d.stat ? (d.stat.like || 0) : 0
+            like: d.stat ? (d.stat.like || 0) : 0,
+            /* ★ v0.28.0：投币数 / 收藏数 / 分享数 */
+            coin: d.stat ? (d.stat.coin || 0) : 0,
+            favorite: d.stat ? (d.stat.favorite || 0) : 0,
+            share: d.stat ? (d.stat.share || 0) : 0
           },
           pages: pages
         });
@@ -73761,6 +72677,9 @@ io.on('connection', function (socket) {
       } catch (eLeave) { }
 
       var _w = getWallet(id);
+      /* ★ v0.28.0：构建互动标识视图，随登录一并下发 */
+      var _myInteractions = { private: {}, group: {} };
+      try { _myInteractions = buildInteractionView(id); } catch (eBI) { }
       socket.emit('login-success', {
         id: id, name: name, status: 'online',
         level: level, vip: vip, isAdmin: isAdmin, muted: muted,
@@ -73849,7 +72768,9 @@ io.on('connection', function (socket) {
         shortcuts: customShortcuts[id] || {},
         timeTheme: timeTheme[id] || { enabled: false, dayStart: '08:00', dayEnd: '20:00' },
         scheduled: scheduledMessages[id] || [],
-        autoReplies: autoReplies[id] || []
+        autoReplies: autoReplies[id] || [],
+        /* ★ v0.28.0：互动标识（连续聊天火花 / 群聊龙王） */
+        interactions: _myInteractions
       });
       /* ★ 记录/更新登录设备（含 deviceId、分辨率、设备类型等） */
       try {
@@ -74786,11 +73707,43 @@ io.on('connection', function (socket) {
     var user = getUserBySocketId(socket.id);
     if (user) {
       user.online = false;
-      /* 掉线自动退出所有群通话 */
-      try { removeUserFromAllGroupCalls(user.id, user.name); } catch (e) { }
-      io.emit('user-left', { id: user.id, name: user.name });
-      broadcastUserList();
-      log('DISCONNECT', { userId: user.id, name: user.name });
+
+      /* ★ v0.28.0：判断该用户是否还有其它 socket 在线（多设备）
+         —— 只要有任一端还连着，就不能把整账号标离线。 */
+      var _stillOnline = false;
+      try {
+        io.sockets.sockets.forEach(function (sk) {
+          if (!sk || sk.id === socket.id) return;
+          if (sk.connected === false) return;
+          if (sk.data && sk.data.userId === user.id) _stillOnline = true;
+        });
+      } catch (eChk) { }
+
+      if (!_stillOnline) {
+        /* ---- 该用户真的完全离线 ---- */
+        try { removeUserFromAllGroupCalls(user.id, user.name); } catch (e) { }
+
+        /* ★ v0.28.0：离线时刷新最后活跃时间并持久化 */
+        var _now = Date.now();
+        var _rec = persistentUsers[user.name];
+        if (_rec) {
+          _rec.lastActive = _now;
+          saveUsers();
+        }
+
+        io.emit('user-left', { id: user.id, name: user.name });
+        /* ★ 广播 lastActive，让所有在线客户端的名片 / 全部用户弹窗
+           实时看到「最后活跃」已更新 */
+        io.emit('user-updated', {
+          id: user.id, name: user.name, lastActive: _now
+        });
+        broadcastUserList();
+        log('DISCONNECT', { userId: user.id, name: user.name });
+      } else {
+        log('DISCONNECT', {
+          userId: user.id, name: user.name, stillOnline: true
+        });
+      }
     }
     /* 防御性清理：某些旧客户端重连过程里可能残留 room 关联，
        这里主动把当前 socket 从 user:* 房间退出，
@@ -75628,6 +74581,18 @@ io.on('connection', function (socket) {
     }
     var key = getHistoryKey('private', fromUser.id, toUser.id);
     saveMessage('private', key, msgData);
+
+    /* ★ v0.28.0：更新连续聊天火花，并分别推给双方 */
+    try {
+      var _pStreak = updatePrivateStreak(key);
+      saveInteractions();
+      var _pBase = { kind: 'private', days: _pStreak.days, lastDate: _pStreak.lastDate };
+      emitToUser(fromUser.id, 'interaction-update',
+        Object.assign({ peerId: toUser.id }, _pBase));
+      emitToUser(toUser.id, 'interaction-update',
+        Object.assign({ peerId: fromUser.id }, _pBase));
+    } catch (eI) { }
+
     /* 在线才推送；离线跳过，上线后由 history 拉取 */
     if (!_peerOffline) {
       emitToUser(toUser.id, 'private-message', msgData);
@@ -76370,6 +75335,26 @@ io.on('connection', function (socket) {
     }
     var key = getHistoryKey('group', group.id);
     saveMessage('group', key, msgData);
+
+    /* ★ v0.28.0：更新群聊火花与当日龙王，并广播给全体成员 */
+    try {
+      var _gRec = updateGroupInteraction(group.id, fromUser.id);
+      saveInteractions();
+      var _gPayload = {
+        kind: 'group',
+        groupId: group.id,
+        days: _gRec.days,
+        lastDate: _gRec.lastDate,
+        dailyTop: _gRec.dailyTop
+          ? { uid: _gRec.dailyTop.uid, count: _gRec.dailyTop.count }
+          : null
+      };
+      group.members.forEach(function (uid) {
+        var u = getUserById(uid);
+        if (u && u.online) emitToUser(uid, 'interaction-update', _gPayload);
+      });
+    } catch (eI) { }
+
     /* 通过房间广播 → 不再受 userMap 里陈旧 socketId 影响，
        彻底修复「非发送者群成员必须重新登录才可领取红包」 */
     group.members.forEach(function (uid) {
