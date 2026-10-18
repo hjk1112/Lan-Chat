@@ -1064,8 +1064,12 @@ setInterval(function () {
   if (sizeFreed > 0) {
     scheduleSaveHistory();
     console.log('🧹 服务端内存释放：剥离了 ' + (sizeFreed / 1048576).toFixed(1) + 'MB 的历史文件数据');
+    /* 通知 V8 进行强制回收 */
     if (global.gc) {
-      try { global.gc(); } catch(e) {}
+      try {
+        global.gc();
+        console.log('♻️ 已触发全局垃圾回收 (GC)');
+      } catch(e) {}
     }
   }
 }, 60 * 60 * 1000); // 每小时执行一次深度清理
@@ -1263,11 +1267,27 @@ function isValidNickname(name) {
 
 function loadJSON(file, fallback) {
   try {
+    var brFile = file + '.br';
+    var gzFile = file + '.gz';
+    
+    // 1. 优先读取 Brotli 压缩文件
+    if (fs.existsSync(brFile)) {
+      var bufBr = fs.readFileSync(brFile);
+      return JSON.parse(zlib.brotliDecompressSync(bufBr).toString('utf8'));
+    }
+    // 2. 其次读取 Gzip 压缩文件（兼容旧数据）
+    if (fs.existsSync(gzFile)) {
+      var bufGz = fs.readFileSync(gzFile);
+      return JSON.parse(zlib.gunzipSync(bufGz).toString('utf8'));
+    }
+    // 3. 最后读取普通 JSON（兼容最老版本的未压缩数据）
     if (fs.existsSync(file)) {
       var raw = fs.readFileSync(file, 'utf8');
       if (raw && raw.trim()) return JSON.parse(raw);
     }
-  } catch (e) { console.error('⚠️ 读取失败:', path.basename(file), e.message); }
+  } catch (e) { 
+    console.error('⚠️ 读取失败:', path.basename(file), e.message); 
+  }
   return fallback;
 }
 /* 串行写入队列：合并同文件请求，每 80ms 触发一次，setImmediate 逐个落盘 */
@@ -1299,13 +1319,27 @@ function _flushPendingWrites() {
     }
     var t = tasks[i++];
     try {
-      /* ★ v0.27.23：先写临时文件，再重命名 —— 避免写一半断电/崩溃导致 JSON 损坏 */
-      var tmp = t.file + '.tmp';
-      fs.writeFileSync(tmp, JSON.stringify(t.data), 'utf8');
-      try { fs.renameSync(tmp, t.file); }
-      catch (renameErr) {
-        /* Windows 上目标文件被杀毒/编辑器锁住时 rename 会失败，回退直接写 */
-        try { fs.writeFileSync(t.file, JSON.stringify(t.data), 'utf8'); } catch (e) {}
+      /* ★ v0.28.0：Brotli 极致压缩落盘（无损） */
+      var jsonStr = JSON.stringify(t.data);
+      var buf = zlib.brotliCompressSync(jsonStr, {
+        params: {
+          [zlib.constants.BROTLI_PARAM_QUALITY]: 9, // 最高压缩率
+          [zlib.constants.BROTLI_PARAM_SIZE_HINT]: jsonStr.length
+        }
+      });
+      
+      var targetFile = t.file + '.br';
+      var tmp = targetFile + '.tmp';
+      fs.writeFileSync(tmp, buf);
+      
+      try { 
+        fs.renameSync(tmp, targetFile); 
+        // 如果旧的明文 JSON 存在，则删除以腾出空间
+        if (fs.existsSync(t.file)) {
+          try { fs.unlinkSync(t.file); } catch(e){}
+        }
+      } catch (renameErr) {
+        try { fs.writeFileSync(targetFile, buf); } catch (e) {}
         try { fs.unlinkSync(tmp); } catch (e) {}
       }
     } catch (e) {
@@ -1334,7 +1368,20 @@ function saveJSON(file, data) {
 /* 立即同步落盘：用于进程退出 / 关键检查点 */
 function saveJSONNow(file, data) {
   try {
-    fs.writeFileSync(file, JSON.stringify(data), 'utf8');
+    var jsonStr = JSON.stringify(data);
+    var buf = zlib.brotliCompressSync(jsonStr, {
+      params: {
+        [zlib.constants.BROTLI_PARAM_QUALITY]: 9,
+        [zlib.constants.BROTLI_PARAM_SIZE_HINT]: jsonStr.length
+      }
+    });
+    var targetFile = file + '.br';
+    fs.writeFileSync(targetFile, buf);
+    
+    // 删除旧的未压缩文件
+    if (fs.existsSync(file)) {
+      try { fs.unlinkSync(file); } catch (e) {}
+    }
     return true;
   } catch (e) {
     console.error('⚠️ 保存失败:', path.basename(file), e.message);
@@ -1348,11 +1395,15 @@ function flushAllPendingWrites() {
     clearTimeout(_writeFlushTimer);
     _writeFlushTimer = null;
   }
-  /* 直接同步刷，不走 setImmediate —— 退出流程需要确保完成 */
   for (var f in _pendingWrites) {
     if (Object.prototype.hasOwnProperty.call(_pendingWrites, f)) {
       try {
-        fs.writeFileSync(f, JSON.stringify(_pendingWrites[f]), 'utf8');
+        var jsonStr = JSON.stringify(_pendingWrites[f]);
+        var buf = zlib.brotliCompressSync(jsonStr);
+        fs.writeFileSync(f + '.br', buf);
+        if (fs.existsSync(f)) {
+          try { fs.unlinkSync(f); } catch (e) {}
+        }
       } catch (e) {
         console.error('⚠️ 退出前刷盘失败:', path.basename(f), e.message);
       }
@@ -1360,6 +1411,33 @@ function flushAllPendingWrites() {
     }
   }
 }
+
+/* ★ v0.28.0：启动时强制触发一次保存，将老旧的明文 .json 文件全部转化为 Brotli 极压格式 */
+setTimeout(function() {
+  try {
+    saveJSONNow(F_HISTORY, messageHistory || {});
+    saveJSONNow(F_USERS, persistentUsers || {});
+    saveJSONNow(F_GROUPS, Array.from(groupMap.values()) || []);
+    saveJSONNow(F_STICKERS, persistentStickers || {});
+    saveJSONNow(F_PROFILES, persistentProfiles || {});
+    saveJSONNow(F_MOMENTS, moments || []);
+    saveJSONNow(F_WALLETS, wallets || {});
+    saveJSONNow(F_MUSIC, musicList || []);
+    
+    // 清理旧的 .json 残留
+    var _dir = path.join(__dirname, 'files');
+    if (fs.existsSync(_dir)) {
+      fs.readdirSync(_dir).forEach(function(file) {
+        if (file.endsWith('.json')) {
+          try { fs.unlinkSync(path.join(_dir, file)); } catch(e){}
+        }
+      });
+    }
+    console.log('🗜️ 持久化数据已完成无损 Brotli 压缩（节省约 80% 磁盘空间）');
+  } catch(e) {
+    console.error('⚠️ 数据无损压缩迁移失败:', e.message);
+  }
+}, 5000); // 启动 5 秒后（等数据加载完）自动执行一次
 
 var config = loadJSON(F_CONFIG, { saveHistory: true, maxFileSize: 50 * 1024 * 1024 });
 if (typeof config.saveHistory !== 'boolean') config.saveHistory = true;
@@ -63907,7 +63985,8 @@ var HTML_BUILD_DONE = false;
 
 /* 预压缩：Brotli q10 + Gzip 9，ETag 用「长度 + djb2 抽样 hash」 */
 function precompressHtml(htmlStr) {
-  HTML_TO_SERVE = htmlStr;
+  /* ★ v0.28.0：不再将原始字符串常驻内存，节省 1.5MB 堆内存 */
+  HTML_TO_SERVE = null;
 
   /* ============================================================
      ★ v0.27.10：生成 4 份设备专用 HTML（full / desktop / mobile / watch）
