@@ -1417,7 +1417,8 @@ setTimeout(function() {
   try {
     saveJSONNow(F_HISTORY, messageHistory || {});
     saveJSONNow(F_USERS, persistentUsers || {});
-    saveJSONNow(F_GROUPS, Array.from(groupMap.values()) || []);
+    /* ★ 修复：必须调用 saveGroups()，它内部会正确地把 Set 转换为 Array 再保存 */
+    saveGroups();
     saveJSONNow(F_STICKERS, persistentStickers || {});
     saveJSONNow(F_PROFILES, persistentProfiles || {});
     saveJSONNow(F_MOMENTS, moments || []);
@@ -3078,9 +3079,20 @@ var MAX_GROUP_CALL_PARTICIPANTS = 6;
   for (var i = 0; i < arr.length; i++) {
     var g = arr[i];
     try {
+      /* ★ 新增：兼容之前被错误序列化为 {} 的 members 数据 */
+      var _members = g.members;
+      if (!Array.isArray(_members)) {
+        if (_members && typeof _members === 'object') {
+          // 如果发现是被错误序列化的 Set，尝试提取键（虽然大概率是空，但聊胜于无）
+          _members = Object.keys(_members);
+        } else {
+          _members = [];
+        }
+      }
+
       groupMap.set(g.id, {
         id: g.id, name: g.name, owner: g.owner,
-        members: new Set(g.members || []),
+        members: new Set(_members),
         titles: g.titles || {},
         announcement: g.announcement || '',
         muted: g.muted || {},
@@ -45294,14 +45306,18 @@ dom.createGroupBtn.addEventListener('click', function () {
   for (k in state.users) {
     if (!state.users.hasOwnProperty(k) || k === state.myId) continue;
     var u = state.users[k];
-    if (!u.online) continue;
+    // ★ 取消过滤离线用户，并增加离线标识
+    var isOffline = !u.online;
+    if (isSystemUserId(k) && !u.online) {
+      // 系统账号如果离线可能是本地缓存，最好也屏蔽
+    }
     hasUser = true;
     var label = document.createElement('label');
     var cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.value = k;
     label.appendChild(cb);
-    label.appendChild(document.createTextNode(u.name));
+    label.appendChild(document.createTextNode(u.name + (isOffline ? ' (离线)' : '')));
     select.appendChild(label);
   }
   if (!hasUser) select.innerHTML = '<div style="color:var(--text-muted);font-size:14px;">' +
@@ -45396,7 +45412,7 @@ function openGroupManage(gid) {
   for (k in state.users) {
     if (!state.users.hasOwnProperty(k) || k === state.myId) continue;
     var uu = state.users[k];
-    if (!uu.online) continue;
+    // ★ 取消过滤离线用户，并增加离线标识
     if (mem.indexOf(k) !== -1) continue;
     hasInvite = true;
     var lbl = document.createElement('label');
@@ -45404,7 +45420,7 @@ function openGroupManage(gid) {
     cb2.type = 'checkbox';
     cb2.value = k;
     lbl.appendChild(cb2);
-    lbl.appendChild(document.createTextNode(uu.name));
+    lbl.appendChild(document.createTextNode(uu.name + (uu.online ? '' : ' (离线)')));
     inviteDiv.appendChild(lbl);
   }
   if (!hasInvite) inviteDiv.innerHTML = '<span style="font-size:13px;color:var(--text-muted);">' +
