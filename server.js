@@ -340,11 +340,8 @@ const io = new Server(server, {
   cors: { origin: "*" },
   transports: ['websocket', 'polling'],
   maxHttpBufferSize: 1.6e8,
-  /* ★ 开启 WebSocket 传输层数据压缩，大幅节省带宽 */
-  perMessageDeflate: {
-    threshold: 1024,  // 大于 1KB 的 payload 才压缩
-    zlibDeflateOptions: { level: 4 } // level 4 速度最快，压缩率也不错
-  }
+  /* ★ 关闭 WebSocket 压缩：局域网带宽充足，关闭可大幅降低手机端 CPU 解压耗时 */
+  perMessageDeflate: false
 });
 
 
@@ -1425,12 +1422,18 @@ setTimeout(function() {
     saveJSONNow(F_WALLETS, wallets || {});
     saveJSONNow(F_MUSIC, musicList || []);
     
-    // 清理旧的 .json 残留
+    // 清理旧的 .json 残留（★ 仅当 .br 压缩版存在时才删除，防止未压缩数据丢失）
+    // 此前这里会无条件删除所有 .json，导致 user_data.json / feedback.json /
+    // contact_tags.json / remarks.json 等未生成 .br 备份的文件的用户数据
+    // 在服务端重启后永久丢失 —— 这正是"无法从服务器恢复设置"的根因。
     var _dir = path.join(__dirname, 'files');
     if (fs.existsSync(_dir)) {
       fs.readdirSync(_dir).forEach(function(file) {
         if (file.endsWith('.json')) {
-          try { fs.unlinkSync(path.join(_dir, file)); } catch(e){}
+          var _brFile = path.join(_dir, file + '.br');
+          if (fs.existsSync(_brFile)) {
+            try { fs.unlinkSync(path.join(_dir, file)); } catch(e){}
+          }
         }
       });
     }
@@ -3076,23 +3079,37 @@ var MAX_GROUP_CALL_PARTICIPANTS = 6;
 (function loadGroups() {
   var arr = loadJSON(F_GROUPS, []);
   if (!Array.isArray(arr)) return;
+  
   for (var i = 0; i < arr.length; i++) {
     var g = arr[i];
+    if (!g || !g.id) continue;
+    
     try {
-      /* ★ 新增：兼容之前被错误序列化为 {} 的 members 数据 */
+      /* 兼容旧数据：防止因意外导致 members 变成对象 */
       var _members = g.members;
       if (!Array.isArray(_members)) {
         if (_members && typeof _members === 'object') {
-          // 如果发现是被错误序列化的 Set，尝试提取键（虽然大概率是空，但聊胜于无）
           _members = Object.keys(_members);
         } else {
           _members = [];
         }
       }
 
+      var memberSet = new Set(_members);
+      
+      /* 过滤掉不应该当群主的系统账号 */
+      ['SYSTEM', 'system', 'wx_team', 'wx_pay'].forEach(function(sysId) {
+        memberSet.delete(sysId);
+      });
+
+      /* 确保群主一定在群成员列表里 */
+      if (g.owner && !memberSet.has(g.owner)) {
+        memberSet.add(g.owner);
+      }
+
       groupMap.set(g.id, {
         id: g.id, name: g.name, owner: g.owner,
-        members: new Set(_members),
+        members: memberSet,
         titles: g.titles || {},
         announcement: g.announcement || '',
         muted: g.muted || {},
@@ -3100,17 +3117,19 @@ var MAX_GROUP_CALL_PARTICIPANTS = 6;
         files: g.files || [],
         albums: g.albums || [],
         votes: g.votes || [],
-        /* ★ 已解散状态（重启后恢复） */
+        /* 已解散状态（重启后恢复） */
         disbanded: !!g.disbanded,
         disbandedAt: g.disbandedAt || 0,
         disbandedBy: g.disbandedBy || '',
         disbandedByName: g.disbandedByName || ''
       });
-    } catch (e) { }
+    } catch (e) {
+      console.error('⚠️ 群组加载失败:', g.id, e.message);
+    }
   }
+  
   console.log('📦 已加载群组:', groupMap.size, '个');
 })();
-
 
 /* 结构：contactTags[ownerId] = [{ name, color, members: [userId] }] */
 var F_CONTACT_TAGS = path.join(DATA_DIR, 'contact_tags.json');
@@ -3874,7 +3893,8 @@ function broadcastUserList() {
 function broadcastGroupList(userId) {
   var groups = [];
   groupMap.forEach(function (g) {
-    if (g.members.has(userId)) {
+    /* 只要成员表里有这个人，或者他是群主，就发给他 */
+    if (g.members.has(userId) || g.owner === userId) {
       groups.push({
         id: g.id, name: g.name, owner: g.owner,
         members: Array.from(g.members),
@@ -7433,6 +7453,306 @@ html.is-watch .burn-banner-text{
   max-width:90%;box-shadow:0 20px 60px rgba(0,0,0,.3);max-height:80vh;overflow-y:auto;
   overscroll-behavior:contain}
 .modal-overlay.open .modal-box{animation:modalBoxIn .3s cubic-bezier(.16,1,.3,1)}
+
+/* ============================================================
+   ★ B站全屏视频面板（左侧列表 + 右侧播放器 + 详情）
+   ============================================================ */
+#biliModal.modal-overlay{
+  padding:0 !important;
+  align-items:stretch !important;
+  justify-content:stretch !important;
+  background:var(--bg-app) !important;
+  -webkit-backdrop-filter:none !important;
+  backdrop-filter:none !important;
+}
+#biliModal .bili-shell{
+  width:100%;height:100%;
+  display:flex;flex-direction:column;
+  background:var(--bg-app);color:var(--text-primary);
+  animation:biliFadeIn .22s ease;
+}
+@keyframes biliFadeIn{from{opacity:0}to{opacity:1}}
+
+/* ---- 顶栏 ---- */
+.bili-top{
+  display:flex;align-items:center;gap:12px;
+  height:56px;padding:0 18px;flex-shrink:0;
+  background:var(--bg-sidebar);
+  border-bottom:1px solid var(--border-sidebar);
+}
+.bili-logo{
+  font-size:16px;font-weight:700;color:var(--text-primary);
+  white-space:nowrap;letter-spacing:.2px;
+}
+.bili-tabs{display:flex;gap:4px;margin-left:6px;}
+.bili-tabs button{
+  padding:6px 14px;border:none;border-radius:16px;
+  background:transparent;color:var(--text-secondary);
+  font-size:13.5px;font-family:inherit;cursor:pointer;
+  transition:all .15s;white-space:nowrap;
+}
+.bili-tabs button:hover{background:rgba(251,114,153,.12);color:#fb7299;}
+.bili-tabs button.active{
+  background:#fb7299;color:#fff;font-weight:600;
+  box-shadow:0 2px 8px rgba(251,114,153,.35);
+}
+.bili-search-wrap{
+  margin-left:auto;
+  display:flex;align-items:center;gap:6px;
+  flex:0 1 320px;min-width:0;
+}
+#biliSearchInput{
+  flex:1;min-width:0;
+  padding:7px 14px;border:1px solid var(--border-input);
+  border-radius:20px;background:var(--bg-input);
+  color:var(--text-primary);font-size:13.5px;
+  font-family:inherit;outline:none;
+  transition:border-color .15s,box-shadow .15s;
+}
+#biliSearchInput:focus{
+  border-color:#fb7299;
+  box-shadow:0 0 0 3px rgba(251,114,153,.18);
+}
+.bili-search-wrap button{
+  width:34px;height:34px;border:none;border-radius:50%;
+  background:#fb7299;color:#fff;font-size:15px;
+  cursor:pointer;flex-shrink:0;
+  transition:filter .15s,transform .1s;
+}
+.bili-search-wrap button:hover{filter:brightness(1.06);}
+.bili-search-wrap button:active{transform:scale(.94);}
+.bili-icon-btn{
+  width:34px;height:34px;border:none;border-radius:50%;
+  background:rgba(0,0,0,.05);color:var(--text-secondary);
+  font-size:16px;cursor:pointer;flex-shrink:0;
+  transition:all .15s;display:inline-flex;
+  align-items:center;justify-content:center;
+}
+.bili-icon-btn:hover{background:rgba(251,114,153,.15);color:#fb7299;}
+[data-theme="dark"] .bili-icon-btn{background:rgba(255,255,255,.08);}
+
+/* ---- 主体：左右分栏 ---- */
+.bili-body{flex:1;display:flex;min-height:0;}
+
+/* 左侧视频列表 */
+.bili-side{
+  flex:0 0 380px;width:380px;
+  display:flex;flex-direction:column;min-height:0;
+  border-right:1px solid var(--border-sidebar);
+  background:var(--bg-sidebar);
+}
+.bili-side-head{
+  padding:10px 16px;flex-shrink:0;
+  font-size:12.5px;font-weight:600;
+  color:var(--text-muted);letter-spacing:.4px;
+  border-bottom:1px solid var(--border-modal);
+}
+.bili-list{
+  flex:1;overflow-y:auto;padding:8px;
+  display:flex;flex-direction:column;gap:6px;
+  align-content:start;min-height:0;
+}
+.bili-card{
+  display:flex;gap:10px;padding:8px;
+  border-radius:10px;cursor:pointer;
+  background:var(--bg-app);
+  border:1px solid transparent;
+  transition:all .15s;
+}
+.bili-card:hover{
+  border-color:rgba(251,114,153,.32);
+  transform:translateX(2px);
+}
+.bili-card.active{
+  background:rgba(251,114,153,.1);
+  border-color:#fb7299;
+}
+.bili-card-cover{
+  width:100px;height:60px;border-radius:6px;
+  object-fit:cover;flex-shrink:0;
+  background:#111;display:block;
+}
+.bili-card-body{
+  flex:1;min-width:0;
+  display:flex;flex-direction:column;
+  justify-content:space-between;gap:4px;
+}
+.bili-card-title{
+  font-size:13px;font-weight:600;
+  color:var(--text-primary);line-height:1.4;
+  overflow:hidden;display:-webkit-box;
+  -webkit-line-clamp:2;-webkit-box-orient:vertical;
+}
+.bili-card-meta{
+  font-size:11.5px;color:var(--text-muted);
+  display:flex;gap:8px;flex-wrap:wrap;
+}
+
+/* 右侧：播放器固定不滚动 + 详情独立滚动 */
+.bili-stage{
+  flex:1;min-width:0;min-height:0;
+  display:flex;flex-direction:column;
+  background:var(--bg-app);
+  overflow:hidden;             /* ★ 整块不滚动 */
+}
+.bili-player{
+  position:relative;width:100%;flex-shrink:0;
+  background:#000;
+  display:flex;align-items:center;justify-content:center;
+  /* ★ 高度自适应：小窗 ~180px，常规屏 ~52vh，大屏封顶 60vh */
+  height:clamp(180px, 52vh, 60vh);
+  transition:height .2s ease;
+}
+/* ★ iframe 铺满播放器区域，但宽度不超过 16:9，避免超宽屏过度拉伸 */
+.bili-player iframe{
+  position:relative;
+  display:none;
+  border:none;
+  width:100%;
+  height:100%;
+  max-width:calc(60vh * 16 / 9);
+  background:#000;
+}
+.bili-player.has-video iframe{display:block;}
+.bili-player.has-video .bili-player-empty{display:none;}
+.bili-player-empty{
+  position:absolute;inset:0;
+  display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+  gap:8px;color:#888;font-size:14px;
+  text-align:center;padding:20px;line-height:1.6;
+}
+.bili-player-empty > div:first-child{font-size:52px;}
+.bili-tip{font-size:12px;opacity:.7;}
+
+/* ★ 播放器加载遮罩：切换视频时淡入，避免白屏闪烁 */
+.bili-loading-mask{
+  position:absolute;inset:0;
+  background:rgba(0,0,0,.62);
+  display:flex;align-items:center;justify-content:center;
+  gap:10px;color:#fff;font-size:13px;
+  z-index:2;pointer-events:none;
+  opacity:0;transition:opacity .25s;
+}
+.bili-player.loading .bili-loading-mask{opacity:1;pointer-events:auto;}
+.bili-loading-mask .bili-spin{
+  width:20px;height:20px;
+  border:2px solid rgba(255,255,255,.25);
+  border-top-color:#fff;border-radius:50%;
+  animation:biliSpin .8s linear infinite;
+}
+@keyframes biliSpin{to{transform:rotate(360deg)}}
+
+/* 详情区：独立滚动，不影响上方播放器 */
+.bili-detail{
+  flex:1;padding:16px 22px;min-height:0;
+  overflow-y:auto;
+}
+.bili-detail-empty{
+  text-align:center;color:var(--text-muted);
+  padding:40px 0;font-size:13px;
+}
+.bili-detail-title{
+  font-size:18px;font-weight:700;
+  color:var(--text-primary);line-height:1.4;
+  margin-bottom:8px;
+}
+.bili-detail-meta{
+  display:flex;gap:14px;flex-wrap:wrap;
+  font-size:13px;color:var(--text-secondary);
+  margin-bottom:12px;
+}
+.bili-detail-desc{
+  font-size:13px;color:var(--text-secondary);
+  line-height:1.7;white-space:pre-wrap;
+  word-break:break-word;max-height:110px;
+  overflow-y:auto;padding:12px 14px;
+  background:rgba(0,0,0,.03);
+  border-radius:8px;margin-bottom:16px;
+}
+[data-theme="dark"] .bili-detail-desc{
+  background:rgba(255,255,255,.04);
+}
+.bili-related-title{
+  font-size:13px;font-weight:600;
+  color:var(--text-muted);letter-spacing:.4px;
+  margin-bottom:10px;
+}
+.bili-related-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(180px,1fr));
+  gap:12px;
+}
+.bili-related-card{
+  cursor:pointer;border-radius:8px;overflow:hidden;
+  background:var(--bg-sidebar);
+  border:1px solid var(--border-sidebar);
+  transition:all .15s;
+}
+.bili-related-card:hover{
+  transform:translateY(-2px);
+  box-shadow:0 6px 18px rgba(0,0,0,.12);
+}
+.bili-related-card img{
+  width:100%;aspect-ratio:16/10;
+  object-fit:cover;display:block;background:#111;
+}
+.bili-related-card .bili-rc-body{padding:8px 10px;}
+.bili-related-card .bili-rc-title{
+  font-size:12px;font-weight:600;
+  color:var(--text-primary);line-height:1.4;
+  overflow:hidden;display:-webkit-box;
+  -webkit-line-clamp:2;-webkit-box-orient:vertical;
+}
+.bili-related-card .bili-rc-meta{
+  font-size:11px;color:var(--text-muted);
+  margin-top:4px;
+}
+.bili-loading{
+  grid-column:1/-1;text-align:center;
+  color:var(--text-muted);padding:36px 0;
+  font-size:13px;width:100%;
+}
+
+/* ---- 移动端：改为纵向布局 ---- */
+@media (max-width:768px){
+  .bili-body{flex-direction:column;}
+  .bili-side{
+    flex:1 1 auto;width:100%;
+    border-right:none;
+    border-bottom:1px solid var(--border-sidebar);
+    max-height:52vh;
+  }
+  .bili-stage{flex:1 1 auto;min-height:0;}
+  .bili-player{max-height:38vh;}
+  .bili-top{padding:0 10px;gap:6px;height:52px;}
+  .bili-logo{display:none;}
+  .bili-tabs button{padding:5px 10px;font-size:12px;}
+  .bili-search-wrap{flex:1 1 130px;max-width:160px;}
+  .bili-detail{padding:12px 14px;}
+  .bili-detail-title{font-size:15px;}
+  .bili-related-grid{
+    grid-template-columns:repeat(auto-fill,minmax(140px,1fr));
+  }
+}
+
+/* ---- B站推荐面板：卡片网格悬停增强 ---- */
+#biliGrid > div {
+  transition: transform .15s ease, box-shadow .2s ease;
+}
+#biliGrid::-webkit-scrollbar {
+  width: 8px;
+}
+#biliGrid::-webkit-scrollbar-thumb {
+  background: rgba(0,0,0,.18);
+  border-radius: 8px;
+}
+[data-theme="dark"] #biliGrid::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,.18);
+}
+#biliPlayerWrap iframe {
+  display: block;
+}
 @keyframes modalBoxIn{
   from{opacity:0;transform:translateY(18px) scale(.94)}
   to{opacity:1;transform:translateY(0) scale(1)}
@@ -23726,6 +24046,7 @@ button:not(:disabled):active {
             <button id="starredBtn" data-i18n-title="ttStarred" title="收藏夹">⭐</button>
             <button id="settingsBtn" data-i18n-title="ttSettings" title="设置">🔧</button>
             <button id="clearChatBtn" data-i18n-title="ttClearChat" title="清空聊天记录">🗑️</button>
+            <button id="biliBtn" title="看视频">📺</button>
             <!-- ★ v0.24.28：移动端群聊「群管理」按钮（仅群主/管理员可见） -->
             <button class="mobile-group-manage-btn" id="mobileGroupManageBtn"
                     type="button" data-i18n-title="ttGroupManage"
@@ -23855,6 +24176,11 @@ button:not(:disabled):active {
         <button class="mp-cell" type="button" id="mpMusicBtn">
           <span class="mp-cell-icon" style="background:#9c27b0;">🎵</span>
           <span class="mp-cell-label" data-i18n="mpMusic">音乐</span>
+          <span class="mp-cell-arrow">›</span>
+        </button>
+        <button class="mp-cell" type="button" id="mpBiliBtn">
+          <span class="mp-cell-icon" style="background:#fb7299;">📺</span>
+          <span class="mp-cell-label" data-i18n="mpBili">看视频</span>
           <span class="mp-cell-arrow">›</span>
         </button>
       </div>
@@ -25481,6 +25807,68 @@ button:not(:disabled):active {
 
 <!-- ★ v0.24.63：未读跳转按钮已移除（Alt+N 仍可跳转） -->
 <div class="toast-notification" id="toastContainer"></div>
+
+<!-- ==================== B站全屏视频面板 ==================== -->
+<div class="modal-overlay" id="biliModal">
+  <div class="bili-shell">
+
+    <!-- 顶栏：Logo / Tab / 搜索 / 换一换 / 关闭 -->
+    <header class="bili-top">
+      <span class="bili-logo">📺 看视频</span>
+      <nav class="bili-tabs">
+        <button type="button" data-bili-tab="recommend" class="active">推荐</button>
+        <button type="button" data-bili-tab="popular">热门</button>
+        <button type="button" data-bili-tab="rank">排行榜</button>
+      </nav>
+      <div class="bili-search-wrap">
+        <input type="text" id="biliSearchInput"
+               placeholder="搜索视频（回车确认）"
+               maxlength="50" autocomplete="off">
+        <button type="button" id="biliSearchBtn" title="搜索">🔍</button>
+      </div>
+      <button type="button" class="bili-icon-btn" id="biliRefreshBtn"
+              title="换一换">🔄</button>
+      <button type="button" class="bili-icon-btn" id="biliCloseBtn"
+              title="关闭 (Esc)">✕</button>
+    </header>
+
+    <!-- 主体：左侧列表 + 右侧播放器/详情 -->
+    <div class="bili-body">
+      <aside class="bili-side">
+        <div class="bili-side-head" id="biliSourceTag">推荐视频</div>
+        <div class="bili-list" id="biliGrid">
+          <div class="bili-loading">正在加载推荐视频…</div>
+        </div>
+      </aside>
+
+      <main class="bili-stage" id="biliStage">
+        <div class="bili-player" id="biliPlayerWrap">
+          <div class="bili-player-empty" id="biliPlayerEmpty">
+            <div>🎬</div>
+            <div>从左侧选择一个视频开始播放</div>
+            <div class="bili-tip">视频播放需要外网访问 B 站 CDN</div>
+          </div>
+          <iframe id="biliFrame" allowfullscreen
+                  scrolling="no" frameborder="no" framespacing="0"
+                  sandbox="allow-scripts allow-same-origin allow-forms
+                           allow-popups allow-modals">
+          </iframe>
+          <!-- ★ 播放器加载遮罩 -->
+          <div class="bili-loading-mask" id="biliLoadingMask">
+            <div class="bili-spin"></div>
+            <span>加载播放器…</span>
+          </div>
+        </div>
+        <div class="bili-detail" id="biliDetail">
+          <div class="bili-detail-empty">
+            选择视频后将在此处显示标题、UP主、简介与相关推荐
+          </div>
+        </div>
+      </main>
+    </div>
+
+  </div>
+</div>
 
 <!-- ★ 命令面板（Ctrl+K 打开） -->
 <div class="cmd-palette-overlay" id="cmdPaletteOverlay">
@@ -28241,6 +28629,7 @@ var I18N = {
     mpOnlineUsers: '在线用户',
     mpSpace: '空间',
     mpMusic: '音乐',
+    mpBili: '看视频',
     mpMySpace: '我的空间',
     mpWebsite: '官方网站',
     mpDownload: '下载中心',
@@ -29698,6 +30087,7 @@ var I18N = {
     mpOnlineUsers: 'Online Users',
     mpSpace: 'Space',
     mpMusic: 'Music',
+    mpBili: 'Watch Video',
     mpMySpace: 'My Space',
     mpWebsite: 'Website',
     mpDownload: 'Downloads',
@@ -31114,6 +31504,7 @@ var I18N = {
     mpOnlineUsers: '線上使用者',
     mpSpace: '空間',
     mpMusic: '音樂',
+    mpBili: '看視頻',
     mpMySpace: '我的空間',
     mpWebsite: '官方網站',
     mpDownload: '下載中心',
@@ -32063,6 +32454,7 @@ var I18N = {
     mpOnlineUsers: '在 線 之 人',
     mpSpace: '空 間',
     mpMusic: '樂',
+    mpBili: '觀 視 頻',
     mpMySpace: '吾 之 空 間',
     mpWebsite: '官 網',
     mpDownload: '下 載 之 所',
@@ -35302,13 +35694,13 @@ dom.orientationToggle.addEventListener('click', function () {
   /* 桌面端聊天头部还原顺序 */
   var CHAT_ORDER = ['replyHint', 'closeChatBtn', 'memberBtn', 'qqTools',
     'scrollToggle', 'refreshBtn', 'searchToggleBtn', 'starredBtn',
-    'settingsBtn', 'clearChatBtn'];
+    'settingsBtn', 'clearChatBtn', 'biliBtn'];
   /* ★ 聊天头部按钮收纳策略：双端统一收纳。
      PC 与移动端都把 7 个次要按钮收进 ⋯ 菜单
      （关闭会话 ✕ 保留在头部，随时可退）。
      保持两端行为一致，交互心智模型统一。 */
   var CHAT_MOVE  = ['qqTools', 'scrollToggle', 'refreshBtn', 'searchToggleBtn',
-    'starredBtn', 'settingsBtn', 'clearChatBtn'];
+    'starredBtn', 'settingsBtn', 'clearChatBtn', 'biliBtn'];
 
   var headerMoved = false, chatMoved = false;
 
@@ -35419,6 +35811,18 @@ dom.orientationToggle.addEventListener('click', function () {
   document.addEventListener('click', function () { closeAll(null); });
 
   /* 点击菜单里的按钮后自动收起 */
+  /* ---- 看视频按钮（放在更多菜单中） ---- */
+  (function bindBiliBtn() {
+    var btn = document.getElementById('biliBtn');
+    if (!btn) return;
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (typeof window.__openBiliPanel === 'function') {
+        window.__openBiliPanel();
+      }
+    });
+  })();
+
   function bindAutoClose(menu, btn) {
     if (!menu || !btn) return;
     menu.addEventListener('click', function (e) {
@@ -42676,11 +43080,23 @@ function setupSocketEvents(socket) {
           skipped++;
           continue;
         }
-        /* ★ v0.27.23：单键 > 2MB 的跳过 localStorage，防止配额溢出 */
-        var _v = String(store[key] == null ? '' : store[key]);
+        /* ★ 修复：服务端存的是字符串，但保险起见做类型安全转换。
+           之前用 String(obj) 会变成 "[object Object]"，这里用
+           JSON.stringify 兜底，避免历史数据/第三方写入导致设置被覆盖成垃圾。 */
+        var _raw = store[key];
+        var _v;
+        if (_raw == null) {
+          _v = '';
+        } else if (typeof _raw === 'string') {
+          _v = _raw;
+        } else {
+          try { _v = JSON.stringify(_raw); }
+          catch (e) { _v = String(_raw); }
+        }
         if (_v.length > 2 * 1024 * 1024) {
           skipped++;
-          console.warn('[sync-all] 跳过超大项:', key, '(' + (_v.length / 1024 / 1024).toFixed(1) + 'MB)');
+          console.warn('[sync-all] 跳过超大项:', key,
+            '(' + (_v.length / 1024 / 1024).toFixed(1) + 'MB)');
           continue;
         }
         try {
@@ -42692,7 +43108,12 @@ function setupSocketEvents(socket) {
         }
       }
       if (count === 0) {
-        showToast('ℹ️ 服务器上没有可恢复的设置');
+        /* ★ 修复：区分"服务器真的为空"与"服务器有数据但本机全跳过"两种情况 */
+        if (skipped > 0) {
+          showToast('⚠️ 服务器有 ' + skipped + ' 项设置，但均无法写入本机（可能因单键过大或存储空间不足）');
+        } else {
+          showToast('ℹ️ 服务器上没有可恢复的设置');
+        }
         return;
       }
 
@@ -43242,11 +43663,17 @@ function setupSocketEvents(socket) {
     }
     for (k in d.group) {
       if (!d.group.hasOwnProperty(k)) continue;
-      if (!state.groups[k]) state.groups[k] = {
-        id: k, name: '(群聊)', owner: '', members: [], titles: {},
-        announcement: '', muted: {}, allMuted: false,
-        files: [], albums: [], votes: [], messages: []
-      };
+      if (!state.groups[k]) {
+        state.groups[k] = {
+          id: k, name: '(群聊)', owner: '', members: [], titles: {},
+          announcement: '', muted: {}, allMuted: false,
+          files: [], albums: [], votes: [], messages: []
+        };
+        /* ★ 如果发现历史记录里有这个群，但群列表里没有，主动向服务端请求一次最新群列表 */
+        if (state.socket && state.socket.connected) {
+          state.socket.emit('get-groups');
+        }
+      }
       if (!state.groups[k].messages) state.groups[k].messages = [];
       var arr2 = d.group[k];
       for (var gj = 0; gj < arr2.length; gj++) {
@@ -43632,9 +44059,15 @@ function setupSocketEvents(socket) {
     for (var i = 0; i < list.length; i++) {
       var g = list[i];
       var old = state.groups[g.id];
+      /* 兜底：如果服务端没下发 members，或者当前用户不在 members 里，强制加进去，防止群消失 */
+      var _mem = g.members || [];
+      if (_mem.length > 0 && _mem.indexOf(state.myId) === -1 && g.owner !== state.myId) {
+         _mem.push(state.myId);
+      }
+
       ng[g.id] = {
         id: g.id, name: g.name, owner: g.owner,
-        members: g.members || [],
+        members: _mem,
         titles: g.titles || {},
         announcement: g.announcement || '',
         muted: g.muted || {},
@@ -43672,6 +44105,27 @@ function setupSocketEvents(socket) {
       renderGroupSidePanel();
     }
   });
+  /* ★ 接收群主变更广播 */
+  socket.on('group-owner-changed', function (d) {
+    if (!d || !d.groupId) return;
+    var g = state.groups[d.groupId];
+    if (g) {
+      g.owner = d.owner;
+      renderContacts();
+      if (state.currentTarget === d.groupId && state.currentType === 'group') {
+        /* 刷新聊天头部铅笔按钮 */
+        if (typeof updateChatTitleEditBtn === 'function') updateChatTitleEditBtn();
+        /* 刷新右侧群信息面板 */
+        if (typeof renderGroupSidePanel === 'function') renderGroupSidePanel();
+        /* 如果群管理弹窗开着，直接刷新面板 */
+        if (dom.groupManageModal && dom.groupManageModal.classList.contains('open')) {
+          openGroupManage(d.groupId);
+        }
+      }
+      showToast('👑 群主已转让给 ' + (d.ownerName || d.owner));
+    }
+  });
+
   socket.on('group-created', function (g) {
     if (!state.groups[g.id]) {
       state.groups[g.id] = {
@@ -45377,6 +45831,29 @@ function openGroupManage(gid) {
     item.innerHTML = '<span>' + escapeHtml(name) + vBadge + (uid === g.owner ? ' 👑' : '') +
       (title ? ' (' + escapeHtml(title) + ')' : '') + '</span>' + titleInput;
     if (isOwner && uid !== state.myId) {
+      var actionWrap = document.createElement('div');
+      actionWrap.style.display = 'flex';
+      actionWrap.style.gap = '4px';
+
+      // ★ 新增：转让群主按钮
+      var trBtn = document.createElement('button');
+      trBtn.className = 'remove-btn';
+      trBtn.style.background = '#ff9800'; // 橙色醒目
+      trBtn.textContent = '设为群主';
+      (function (mid, mname) {
+        trBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          showConfirm('确定将群主转让给 ' + mname + ' 吗？\n转让后你将失去群管理权限。', {
+            icon: '👑', danger: true, confirmText: '转让'
+          }).then(function (ok) {
+            if (!ok) return;
+            state.socket.emit('transfer-group-owner', { groupId: gid, targetId: mid });
+          });
+        });
+      })(uid, name);
+      actionWrap.appendChild(trBtn);
+
+      // 原有：移除成员按钮
       var btn = document.createElement('button');
       btn.className = 'remove-btn';
       btn.textContent = t('btnRemove');
@@ -45391,7 +45868,9 @@ function openGroupManage(gid) {
           });
         });
       })(uid, name);
-      item.appendChild(btn);
+      actionWrap.appendChild(btn);
+
+      item.appendChild(actionWrap);
     }
     list.appendChild(item);
     if (isOwner) {
@@ -49620,7 +50099,11 @@ function debugCopyLogs() {
       var store = collectLocalStore();
       var n = 0;
       for (var k in store) if (store.hasOwnProperty(k)) n++;
-      if (n === 0) { showToast('ℹ️ 没有可同步的本地设置'); return; }
+      if (n === 0) {
+        /* ★ 修复：更明确的提示，避免用户误以为"推送成功"但实际什么都没发 */
+        showToast('ℹ️ 本机没有任何可同步的设置项（请先调整一些设置后重试）');
+        return;
+      }
       state.socket.emit('sync-all-settings', { store: store });
       showToast('☁️ 正在推送 ' + n + ' 项设置…');
     });
@@ -56842,6 +57325,416 @@ function musicUploadFiles(files) {
   });
 })();
 
+/* ============================================================
+   ★ B站全屏视频面板
+   ------------------------------------------------------------
+   · window.__openBiliPanel()   从任意位置打开
+   · 三个 Tab：推荐（WBI 推荐）/ 热门 / 排行榜
+   · 支持关键词搜索（WBI 签名）
+   · 全屏双栏：左视频列表 + 右播放器 + 详情 + 相关推荐
+   · 本地记录播放历史（localStorage.bili_history）
+   ============================================================ */
+(function initBiliPanel() {
+  var modal       = document.getElementById('biliModal');
+  if (!modal) return;
+
+  var grid        = document.getElementById('biliGrid');
+  var stage       = document.getElementById('biliStage');
+  var playerWrap  = document.getElementById('biliPlayerWrap');
+  var playerEmpty = document.getElementById('biliPlayerEmpty');
+  var frame       = document.getElementById('biliFrame');
+  var loadingMask = document.getElementById('biliLoadingMask');
+  var detail      = document.getElementById('biliDetail');
+  var sourceTag   = document.getElementById('biliSourceTag');
+  var searchInput = document.getElementById('biliSearchInput');
+  var searchBtn   = document.getElementById('biliSearchBtn');
+  var refreshBtn  = document.getElementById('biliRefreshBtn');
+  var closeBtn    = document.getElementById('biliCloseBtn');
+  var tabBtns     = modal.querySelectorAll('[data-bili-tab]');
+
+  var currentTab      = 'recommend';
+  var currentFreshIdx = 1;
+  var currentList     = [];
+  var currentBvid     = '';
+  var currentItem     = null;
+  var searchKeyword   = '';
+  var isLoading       = false;
+  var escHandler      = null;
+
+  /* ---- 播放历史 ---- */
+  var HISTORY_KEY = 'bili_history';
+  var HISTORY_MAX = 30;
+
+  function getHistory() {
+    try {
+      var raw = localStorage.getItem(HISTORY_KEY);
+      var arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) { return []; }
+  }
+  function pushHistory(item) {
+    if (!item || !item.bvid) return;
+    try {
+      var h = getHistory().filter(function (x) { return x.bvid !== item.bvid; });
+      h.unshift({
+        bvid: item.bvid,
+        cid: item.cid || 0,
+        title: item.title || '',
+        cover: item.cover || '',
+        owner: item.owner || { name: '' },
+        stat: item.stat || { view: 0 },
+        ts: Date.now()
+      });
+      if (h.length > HISTORY_MAX) h.length = HISTORY_MAX;
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
+    } catch (e) {}
+  }
+
+  /* ---- 打开 / 关闭 ---- */
+  function open() {
+    modal.classList.add('open');
+    document.body.style.overflow = 'hidden';
+
+    /* ★ 仅在首次打开时加载；未打开面板前不发任何 B 站请求 */
+    if (!currentList.length) loadTab('recommend', true);
+
+    /* ★ Esc 监听只在打开时挂载，关闭即解绑 */
+    if (!escHandler) {
+      escHandler = function (e) {
+        if (e.key === 'Escape' && modal.classList.contains('open')) {
+          e.preventDefault();
+          close();
+        }
+      };
+      document.addEventListener('keydown', escHandler);
+    }
+  }
+  function close() {
+    modal.classList.remove('open');
+    document.body.style.overflow = '';
+
+    /* ★ 双重停止：removeAttribute + 设置 about:blank
+       —— 部分浏览器在 removeAttribute 后仍保留已加载的播放器，
+          设置 about:blank 会真正卸载 iframe 内容、停止音频 */
+    try { frame.removeAttribute('src'); } catch (e) {}
+    try { frame.src = 'about:blank'; } catch (e) {}
+    playerWrap.classList.remove('has-video');
+    playerWrap.classList.remove('loading');
+
+    currentBvid = '';
+    currentItem = null;
+
+    /* ★ 关闭时解绑 Esc 监听 */
+    if (escHandler) {
+      document.removeEventListener('keydown', escHandler);
+      escHandler = null;
+    }
+  }
+  window.__openBiliPanel = open;
+
+  /* ---- Tab 切换 ---- */
+  function setTab(tab) {
+    currentTab = tab;
+    currentFreshIdx = 1;
+    for (var i = 0; i < tabBtns.length; i++) {
+      tabBtns[i].classList.toggle('active',
+        tabBtns[i].getAttribute('data-bili-tab') === tab);
+    }
+    sourceTag.textContent = ({
+      recommend: '推荐视频',
+      popular:   '热门视频',
+      rank:      '排行榜',
+      search:    '搜索结果：' + (searchKeyword || '')
+    })[tab] || '视频';
+    loadTab(tab, true);
+  }
+
+  /* ---- 加载列表 ---- */
+  function loadTab(tab, resetScroll) {
+    if (isLoading) return;
+    isLoading = true;
+    if (resetScroll) grid.scrollTop = 0;
+    grid.innerHTML = '<div class="bili-loading">加载中…</div>';
+
+    var url;
+    if (tab === 'popular') {
+      url = '/api/bili/popular?ps=20&pn=1';
+    } else if (tab === 'rank') {
+      url = '/api/bili/rank?rid=0';
+    } else if (tab === 'search') {
+      url = '/api/bili/search?keyword=' +
+        encodeURIComponent(searchKeyword) + '&page=1';
+    } else {
+      url = '/api/bili/recommend?ps=20&fresh_idx=' + currentFreshIdx;
+    }
+
+    fetch(url)
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        isLoading = false;
+        if (d && d.ok && d.list && d.list.length) {
+          currentList = d.list;
+          renderGrid(d.list);
+          return;
+        }
+        /* 推荐降级热门 */
+        if (tab === 'recommend') {
+          sourceTag.textContent = '热门视频（推荐不可用）';
+          return fetch('/api/bili/popular?ps=20&pn=1')
+            .then(function (r) { return r.json(); })
+            .then(function (d2) {
+              if (d2 && d2.ok && d2.list && d2.list.length) {
+                currentList = d2.list;
+                renderGrid(d2.list);
+              } else {
+                grid.innerHTML =
+                  '<div class="bili-loading">⚠️ 推荐与热门均不可用</div>';
+              }
+            });
+        }
+        grid.innerHTML = '<div class="bili-loading">⚠️ ' +
+          escapeHtml((d && d.error) || '加载失败') + '</div>';
+      })
+      .catch(function () {
+        isLoading = false;
+        grid.innerHTML = '<div class="bili-loading">⚠️ 网络错误</div>';
+      });
+  }
+
+  /* ---- 渲染左侧列表 ---- */
+  function renderGrid(list) {
+    grid.innerHTML = '';
+    for (var i = 0; i < list.length; i++) {
+      (function (item) {
+        var card = document.createElement('div');
+        card.className = 'bili-card';
+        if (currentBvid === item.bvid) card.classList.add('active');
+
+        var coverHtml = item.cover
+          ? '<img class="bili-card-cover" src="' + escapeHtml(item.cover) +
+            '" alt="" loading="lazy">'
+          : '<div class="bili-card-cover"></div>';
+
+        card.innerHTML = coverHtml +
+          '<div class="bili-card-body">' +
+            '<div class="bili-card-title">' + escapeHtml(item.title) + '</div>' +
+            '<div class="bili-card-meta">' +
+              '<span>👤 ' +
+                escapeHtml((item.owner && item.owner.name) || '') + '</span>' +
+              (item.stat && item.stat.view
+                ? '<span>▶ ' + fmtView(item.stat.view) + '</span>'
+                : '') +
+            '</div>' +
+          '</div>';
+
+        card.addEventListener('click', function () { playVideo(item); });
+        grid.appendChild(card);
+      })(list[i]);
+    }
+  }
+
+  /* ---- 播放视频（缺 cid 时自动拉详情） ---- */
+  function playVideo(item) {
+    if (!item || !item.bvid) return;
+
+    /* ★ 点击同一个视频且正在播放 → 不重复加载 */
+    if (currentBvid === item.bvid &&
+        frame.getAttribute('src') &&
+        frame.getAttribute('src') !== 'about:blank') {
+      return;
+    }
+
+    currentItem = item;
+    currentBvid = item.bvid;
+    pushHistory(item);
+
+    /* 更新左侧高亮 */
+    renderGrid(currentList);
+
+    /* ★ 显示 loading 遮罩（B 站播放器初始化期间覆盖黑屏） */
+    playerWrap.classList.add('loading');
+    playerWrap.classList.add('has-video');
+
+    var doPlay = function (cid) {
+      var url = '//player.bilibili.com/player.html'
+        + '?bvid=' + encodeURIComponent(item.bvid)
+        + '&cid=' + encodeURIComponent(cid || 0)
+        + '&page=1'
+        + '&isOutside=true'
+        + '&high_quality=1'
+        + '&danmaku=1'
+        + '&autoplay=0';
+      /* ★ 直接赋值新 src，不先设 about:blank（少一次导航） */
+      try { frame.src = url; } catch (e) {}
+      loadDetail(item.bvid);
+    };
+
+    if (item.cid) { doPlay(item.cid); return; }
+
+    fetch('/api/bili/video?bvid=' + encodeURIComponent(item.bvid))
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d && d.ok) {
+          var cid = (d.pages && d.pages.length) ? d.pages[0].cid : 0;
+          doPlay(cid);
+        } else {
+          doPlay(0);
+        }
+      })
+      .catch(function () { doPlay(0); });
+  }
+
+  /* ---- 右侧详情 + 相关推荐 ---- */
+  function loadDetail(bvid) {
+    detail.innerHTML = '<div class="bili-detail-empty">加载详情…</div>';
+    fetch('/api/bili/video?bvid=' + encodeURIComponent(bvid))
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.ok) {
+          detail.innerHTML =
+            '<div class="bili-detail-empty">⚠️ 无法获取详情</div>';
+          return;
+        }
+        var html = '';
+        html += '<div class="bili-detail-title">' +
+          escapeHtml(d.title) + '</div>';
+        html += '<div class="bili-detail-meta">';
+        if (d.owner && d.owner.name) {
+          html += '<span>👤 ' + escapeHtml(d.owner.name) + '</span>';
+        }
+        if (d.stat && d.stat.view) {
+          html += '<span>▶ ' + fmtView(d.stat.view) + ' 播放</span>';
+        }
+        if (d.stat && d.stat.like) {
+          html += '<span>👍 ' + fmtView(d.stat.like) + '</span>';
+        }
+        if (d.duration) {
+          html += '<span>⏱ ' + fmtDur(d.duration) + '</span>';
+        }
+        html += '</div>';
+        if (d.desc) {
+          html += '<div class="bili-detail-desc">' +
+            escapeHtml(d.desc) + '</div>';
+        }
+        html += '<div class="bili-related-title">相关推荐</div>';
+        html += '<div class="bili-related-grid" id="biliRelatedGrid">' +
+          '<div class="bili-loading">加载中…</div></div>';
+        detail.innerHTML = html;
+        loadRelated(bvid);
+      })
+      .catch(function () {
+        detail.innerHTML =
+          '<div class="bili-detail-empty">⚠️ 网络错误</div>';
+      });
+  }
+
+  function loadRelated(bvid) {
+    var box = document.getElementById('biliRelatedGrid');
+    if (!box) return;
+    fetch('/api/bili/related?bvid=' + encodeURIComponent(bvid))
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.ok || !d.list || !d.list.length) {
+          box.innerHTML = '<div class="bili-loading">暂无相关推荐</div>';
+          return;
+        }
+        box.innerHTML = '';
+        for (var i = 0; i < d.list.length && i < 12; i++) {
+          (function (item) {
+            var card = document.createElement('div');
+            card.className = 'bili-related-card';
+            card.innerHTML =
+              (item.cover
+                ? '<img src="' + escapeHtml(item.cover) +
+                  '" alt="" loading="lazy">'
+                : '<div style="aspect-ratio:16/10;background:#111"></div>') +
+              '<div class="bili-rc-body">' +
+                '<div class="bili-rc-title">' +
+                  escapeHtml(item.title) + '</div>' +
+                '<div class="bili-rc-meta">' +
+                  escapeHtml((item.owner && item.owner.name) || '') +
+                  (item.stat && item.stat.view
+                    ? ' · ▶ ' + fmtView(item.stat.view)
+                    : '') +
+                '</div>' +
+              '</div>';
+            card.addEventListener('click', function () {
+              playVideo(item);
+              if (stage) stage.scrollTop = 0;
+            });
+            box.appendChild(card);
+          })(d.list[i]);
+        }
+      })
+      .catch(function () {
+        box.innerHTML = '<div class="bili-loading">⚠️ 加载失败</div>';
+      });
+  }
+
+  /* ---- 工具 ---- */
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function fmtView(n) {
+    n = Number(n) || 0;
+    if (n >= 1e8) return (n / 1e8).toFixed(1) + '亿';
+    if (n >= 1e4) return (n / 1e4).toFixed(1) + '万';
+    return String(n);
+  }
+  function fmtDur(sec) {
+    sec = Math.max(0, Math.floor(Number(sec) || 0));
+    var m = Math.floor(sec / 60);
+    var s = sec % 60;
+    return m + ':' + (s < 10 ? '0' : '') + s;
+  }
+
+  /* ---- 搜索 ---- */
+  function doSearch() {
+    var kw = String(searchInput.value || '').trim();
+    if (!kw) { showToast('请输入搜索关键词'); return; }
+    searchKeyword = kw;
+    setTab('search');
+  }
+
+  /* ---- 事件绑定 ---- */
+  for (var i = 0; i < tabBtns.length; i++) {
+    (function (btn) {
+      btn.addEventListener('click', function () {
+        setTab(btn.getAttribute('data-bili-tab'));
+      });
+    })(tabBtns[i]);
+  }
+
+  searchBtn.addEventListener('click', doSearch);
+  searchInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); doSearch(); }
+  });
+
+  refreshBtn.addEventListener('click', function () {
+    if (currentTab === 'recommend') {
+      currentFreshIdx++;
+      loadTab('recommend', true);
+    } else if (currentTab === 'search') {
+      loadTab('search', true);
+    } else {
+      loadTab(currentTab, true);
+    }
+  });
+
+  /* ★ iframe load → 隐藏 loading 遮罩
+     —— 只在真正加载新视频时移除遮罩，about:blank 或空 src 不触发 */
+  frame.addEventListener('load', function () {
+    var src = frame.getAttribute('src') || '';
+    if (src && src !== 'about:blank') {
+      playerWrap.classList.remove('loading');
+    }
+  });
+
+  closeBtn.addEventListener('click', close);
+})();
+
 /* 音乐库事件绑定（一次性） */
 (function initMusicUI() {
   if (dom.musicBtn) {
@@ -60777,6 +61670,10 @@ window.updateMobileMePage = updateMobileMePage;
     if (b) b.addEventListener('click', function () {
       if (dom.musicBtn) dom.musicBtn.click();
     });
+    b = document.getElementById('mpBiliBtn');
+    if (b) b.addEventListener('click', function () {
+      if (typeof window.__openBiliPanel === 'function') window.__openBiliPanel();
+    });
     b = document.getElementById('mpWebsiteBtn');
     if (b) b.addEventListener('click', function () {
       var url = state.officialWebsite || (location.origin + '/gw');
@@ -64001,8 +64898,8 @@ var HTML_BUILD_DONE = false;
 
 /* 预压缩：Brotli q10 + Gzip 9，ETag 用「长度 + djb2 抽样 hash」 */
 function precompressHtml(htmlStr) {
-  /* ★ v0.28.0：不再将原始字符串常驻内存，节省 1.5MB 堆内存 */
-  HTML_TO_SERVE = null;
+  /* ★ 修复：必须保留原始字符串引用，否则 serveHtml 会一直判定为未准备好而等待 30 秒 */
+  HTML_TO_SERVE = htmlStr;
 
   /* ============================================================
      ★ v0.27.10：生成 4 份设备专用 HTML（full / desktop / mobile / watch）
@@ -64167,7 +65064,8 @@ function serveHtml(req, res) {
     if (_q === '1' || _q === 'true') _wantStream = true;
   } catch (e) {}
 
-  if (HTML_BUILD_DONE && HTML_TO_SERVE) {
+  /* ★ 优化：改用检查 HTML_BY_DEVICE 是否就绪，真正释放 HTML_TO_SERVE 内存 */
+  if (HTML_BUILD_DONE && HTML_BY_DEVICE && HTML_BY_DEVICE.full && HTML_BY_DEVICE.full.raw) {
     /* ★ v0.27.10：按设备分流 */
     var _dev = _detectDevice(req);
     var _ver = HTML_BY_DEVICE[_dev];
@@ -71514,6 +72412,394 @@ app.get('/api/ip-status', function (req, res) {
   }
 });
 
+/* ============================================================
+   ★ B站推荐 / 热门 / 详情 代理
+   ------------------------------------------------------------
+   · /api/bili/recommend  首页推荐 feed（WBI 签名）
+   · /api/bili/popular    热门视频（无需签名，降级后备）
+   · /api/bili/video      视频详情（原有，获取 cid）
+   ============================================================ */
+
+/* ---- WBI 签名工具（简化版，仅用于推荐 feed） ---- */
+var _WBI_CACHE = { keys: null, ts: 0 };
+var _WBI_TTL = 6 * 3600 * 1000;   /* 密钥缓存 6 小时 */
+
+function _wbiMixinKey(imgKey, subKey) {
+  var orig = String(imgKey + subKey);
+  var MIXIN_TAB = [
+    46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,
+    27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,
+    37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,
+    22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52
+  ];
+  var out = '';
+  for (var i = 0; i < 32; i++) {
+    out += orig.charAt(MIXIN_TAB[i] % orig.length);
+  }
+  return out;
+}
+
+function _wbiSign(params, imgKey, subKey) {
+  var mixinKey = _wbiMixinKey(imgKey, subKey);
+  var wts = Math.floor(Date.now() / 1000);
+  params.wts = wts;
+  var keys = Object.keys(params).sort();
+  var query = '';
+  for (var i = 0; i < keys.length; i++) {
+    if (i > 0) query += '&';
+    query += encodeURIComponent(keys[i]) + '=' + encodeURIComponent(params[keys[i]]);
+  }
+  var w_rid = crypto.createHash('md5').update(query + mixinKey).digest('hex');
+  return query + '&w_rid=' + w_rid;
+}
+
+function _getWbiKeys(callback) {
+  if (_WBI_CACHE.keys && Date.now() - _WBI_CACHE.ts < _WBI_TTL) {
+    callback(null, _WBI_CACHE.keys);
+    return;
+  }
+  var httpsMod = require('https');
+  var opt = {
+    hostname: 'api.bilibili.com',
+    path: '/x/web-interface/nav',
+    method: 'GET',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Referer': 'https://www.bilibili.com/'
+    },
+    timeout: 6000
+  };
+  var r = httpsMod.request(opt, function (res) {
+    var chunks = [];
+    res.on('data', function (c) { chunks.push(c); });
+    res.on('end', function () {
+      try {
+        var d = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        var wbi = d.data && d.data.wbi_img;
+        if (!wbi) return callback(new Error('no wbi keys'));
+        var imgKey = wbi.img_url.split('/').pop().split('.')[0];
+        var subKey = wbi.sub_url.split('/').pop().split('.')[0];
+        _WBI_CACHE.keys = { img: imgKey, sub: subKey };
+        _WBI_CACHE.ts = Date.now();
+        callback(null, _WBI_CACHE.keys);
+      } catch (e) { callback(e); }
+    });
+  });
+  r.on('timeout', function () { r.destroy(); callback(new Error('timeout')); });
+  r.on('error', callback);
+  r.end();
+}
+
+/* ---- 通用 B 站 GET 代理 ---- */
+function _biliGet(path, params, useWbi, callback) {
+  var httpsMod = require('https');
+  var doRequest = function (query) {
+    var opt = {
+      hostname: 'api.bilibili.com',
+      path: path + '?' + query,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.bilibili.com/',
+        'Accept': 'application/json'
+      },
+      timeout: 8000
+    };
+    var req = httpsMod.request(opt, function (res) {
+      var chunks = [];
+      res.on('data', function (c) { chunks.push(c); });
+      res.on('end', function () {
+        try { callback(null, JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+        catch (e) { callback(e); }
+      });
+    });
+    req.on('timeout', function () { req.destroy(); callback(new Error('timeout')); });
+    req.on('error', callback);
+    req.end();
+  };
+
+  var keys = Object.keys(params).sort();
+  var q = '';
+  for (var i = 0; i < keys.length; i++) {
+    if (i > 0) q += '&';
+    q += encodeURIComponent(keys[i]) + '=' + encodeURIComponent(params[keys[i]]);
+  }
+
+  if (!useWbi) { doRequest(q); return; }
+
+  _getWbiKeys(function (err, k) {
+    if (err) { doRequest(q); return; }
+    var signed = _wbiSign(Object.assign({}, params), k.img, k.sub);
+    doRequest(signed);
+  });
+}
+
+/* ---- /api/bili/recommend 首页推荐 ---- */
+app.get('/api/bili/recommend', function (req, res) {
+  var ps = Math.min(30, parseInt(req.query.ps, 10) || 12);
+  var freshIdx = parseInt(req.query.fresh_idx, 10) || 1;
+
+  _biliGet('/x/web-interface/wbi/index/top/feed/rcmd', {
+    fresh_type: 4,
+    ps: ps,
+    fresh_idx: freshIdx,
+    brush: freshIdx,
+    fetch_row: (freshIdx - 1) * ps + 1,
+    web_location: 1430650
+  }, true, function (err, data) {
+    if (err || !data || data.code !== 0) {
+      res.status(502).json({
+        ok: false,
+        error: '推荐接口不可用（' + (err ? err.message : 'code ' + (data && data.code)) + '），请使用热门降级'
+      });
+      return;
+    }
+    var items = (data.data && data.data.item) || [];
+    var list = items.filter(function (x) { return x && x.bvid; }).map(function (x) {
+      return {
+        bvid: x.bvid,
+        cid: x.cid || 0,
+        title: x.title || '',
+        cover: x.pic || '',
+        duration: x.duration || 0,
+        owner: x.owner ? { name: x.owner.name || '' } : { name: '' },
+        stat: x.stat ? { view: x.stat.view || 0 } : { view: 0 }
+      };
+    });
+    res.json({ ok: true, list: list });
+  });
+});
+
+/* ---- /api/bili/popular 热门视频（无签名，后备） ---- */
+app.get('/api/bili/popular', function (req, res) {
+  var ps = Math.min(30, parseInt(req.query.ps, 10) || 12);
+  var pn = parseInt(req.query.pn, 10) || 1;
+
+  _biliGet('/x/web-interface/popular', { ps: ps, pn: pn }, false, function (err, data) {
+    if (err || !data || data.code !== 0) {
+      res.status(502).json({ ok: false, error: '热门接口也不可用' });
+      return;
+    }
+    var items = (data.data && data.data.list) || [];
+    var list = items.map(function (x) {
+      return {
+        bvid: x.bvid,
+        cid: x.cid || 0,
+        title: x.title || '',
+        cover: x.pic || '',
+        duration: x.duration || 0,
+        owner: { name: (x.owner && x.owner.name) || '' },
+        stat: { view: (x.stat && x.stat.view) || 0 }
+      };
+    });
+    res.json({ ok: true, list: list });
+  });
+});
+
+/* ---- /api/bili/rank 排行榜（无需签名） ---- */
+app.get('/api/bili/rank', function (req, res) {
+  var rid = String((req.query && req.query.rid) || '0');
+  if (!/^\d{1,5}$/.test(rid)) rid = '0';
+
+  _biliGet('/x/web-interface/ranking/v2', { rid: rid, type: 'all' }, false,
+    function (err, data) {
+      if (err || !data || data.code !== 0 || !data.data) {
+        res.status(502).json({
+          ok: false,
+          error: '排行榜接口不可用' + (err ? '：' + err.message : '')
+        });
+        return;
+      }
+      var items = data.data.list || [];
+      var list = items.map(function (x) {
+        return {
+          bvid: x.bvid,
+          cid: x.cid || 0,
+          title: x.title || '',
+          cover: x.pic || '',
+          duration: x.duration || 0,
+          owner: { name: (x.owner && x.owner.name) || '' },
+          stat: {
+            view: (x.stat && x.stat.view) || 0,
+            like: (x.stat && x.stat.like) || 0
+          }
+        };
+      });
+      res.json({ ok: true, list: list });
+    });
+});
+
+/* ---- /api/bili/search 搜索视频（WBI 签名） ---- */
+app.get('/api/bili/search', function (req, res) {
+  var kw = String((req.query && req.query.keyword) || '').trim().slice(0, 50);
+  if (!kw) { res.status(400).json({ ok: false, error: '关键词为空' }); return; }
+  var page = parseInt((req.query && req.query.page) || 1, 10) || 1;
+  if (page < 1) page = 1;
+  if (page > 50) page = 50;
+
+  _biliGet('/x/web-interface/wbi/search/type', {
+    search_type: 'video',
+    keyword: kw,
+    page: page,
+    page_size: 20
+  }, true, function (err, data) {
+    if (err || !data || data.code !== 0 || !data.data) {
+      res.status(502).json({
+        ok: false,
+        error: '搜索接口不可用' +
+          (err ? '：' + err.message : '（code ' + (data && data.code) + '）')
+      });
+      return;
+    }
+    var items = (data.data.result || []).filter(function (x) {
+      return x && x.type === 'video' && x.bvid;
+    });
+    var list = items.map(function (x) {
+      /* 搜索结果的 title 含 <em class="keyword"> 高亮标签，去掉返回纯文本 */
+      var cleanTitle = String(x.title || '').replace(/<[^>]+>/g, '');
+      var pic = String(x.pic || '');
+      /* 部分图片是协议相对 URL，补 https: */
+      if (pic.indexOf('//') === 0) pic = 'https:' + pic;
+      return {
+        bvid: x.bvid,
+        cid: 0,               /* 搜索结果无 cid，前端点击时拉详情 */
+        title: cleanTitle,
+        cover: pic,
+        duration: 0,
+        owner: { name: x.author || '' },
+        stat: { view: Number(x.play) || 0, like: 0 }
+      };
+    });
+    res.json({ ok: true, list: list });
+  });
+});
+
+/* ---- /api/bili/related 相关推荐（无需签名） ---- */
+app.get('/api/bili/related', function (req, res) {
+  var bvid = String((req.query && req.query.bvid) || '').trim();
+  if (!/^BV[0-9A-Za-z]{10}$/.test(bvid)) {
+    res.status(400).json({ ok: false, error: 'BV 号格式不正确' });
+    return;
+  }
+  _biliGet('/x/web-interface/archive/related', { bvid: bvid }, false,
+    function (err, data) {
+      if (err || !data || data.code !== 0 || !data.data) {
+        res.status(502).json({ ok: false, error: '相关推荐接口不可用' });
+        return;
+      }
+      var items = (data.data || []).filter(function (x) { return x && x.bvid; });
+      var list = items.map(function (x) {
+        return {
+          bvid: x.bvid,
+          cid: x.cid || 0,
+          title: x.title || '',
+          cover: x.pic || '',
+          duration: x.duration || 0,
+          owner: { name: (x.owner && x.owner.name) || '' },
+          stat: { view: (x.stat && x.stat.view) || 0 }
+        };
+      });
+      res.json({ ok: true, list: list });
+    });
+});
+
+/* ============================================================
+   ★ B站视频信息代理（原有）
+   ============================================================ */
+app.get('/api/bili/video', function (req, res) {
+  var bvid = String((req.query && req.query.bvid) || '').trim();
+
+  /* BV 号格式：BV + 10 位数字/字母 */
+  if (!/^BV[0-9A-Za-z]{10}$/.test(bvid)) {
+    res.status(400).json({ ok: false, error: 'BV 号格式不正确' });
+    return;
+  }
+
+  var httpsMod = require('https');
+  var options = {
+    hostname: 'api.bilibili.com',
+    path: '/x/web-interface/view?bvid=' + encodeURIComponent(bvid),
+    method: 'GET',
+    headers: {
+      /* ★ B站接口对 User-Agent 和 Referer 有基础校验，缺失可能返回 -412 */
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+        'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+        'Chrome/120.0.0.0 Safari/537.36',
+      'Referer': 'https://www.bilibili.com/',
+      'Accept': 'application/json'
+    },
+    timeout: 8000
+  };
+
+  var upstream = httpsMod.request(options, function (upRes) {
+    var chunks = [];
+    upRes.on('data', function (c) { chunks.push(c); });
+    upRes.on('end', function () {
+      try {
+        var raw = Buffer.concat(chunks).toString('utf8');
+        var data = JSON.parse(raw);
+
+        if (data.code !== 0 || !data.data) {
+          res.status(502).json({
+            ok: false,
+            error: 'B站接口返回异常：' + (data.message || 'code ' + data.code)
+          });
+          return;
+        }
+
+        var d = data.data;
+        var pages = Array.isArray(d.pages) ? d.pages.map(function (p) {
+          return {
+            cid: p.cid,
+            page: p.page,
+            part: p.part || ('P' + p.page),
+            duration: p.duration || 0
+          };
+        }) : [];
+
+        res.json({
+          ok: true,
+          bvid: d.bvid,
+          aid: d.aid,
+          title: d.title,
+          cover: d.pic || '',
+          desc: String(d.desc || '').slice(0, 500),
+          duration: d.duration || 0,
+          owner: {
+            mid: d.owner ? d.owner.mid : 0,
+            name: d.owner ? d.owner.name : '未知UP主',
+            face: d.owner ? (d.owner.face || '') : ''
+          },
+          stat: {
+            view: d.stat ? (d.stat.view || 0) : 0,
+            danmaku: d.stat ? (d.stat.danmaku || 0) : 0,
+            like: d.stat ? (d.stat.like || 0) : 0
+          },
+          pages: pages
+        });
+      } catch (e) {
+        console.error('❌ /api/bili/video 解析失败:', e.message);
+        res.status(502).json({ ok: false, error: 'B站数据解析失败' });
+      }
+    });
+  });
+
+  upstream.on('timeout', function () {
+    upstream.destroy();
+    res.status(504).json({ ok: false, error: '请求B站超时（局域网可能无法访问外网）' });
+  });
+
+  upstream.on('error', function (e) {
+    console.error('❌ /api/bili/video 请求失败:', e.message);
+    res.status(502).json({
+      ok: false,
+      error: '无法连接B站（局域网离线环境不支持在线视频）'
+    });
+  });
+
+  upstream.end();
+});
+
 /* 更新日志按需下发：仅弹窗打开时请求，客户端内存缓存 */
 app.get('/api/changelog', function (req, res) {
   try {
@@ -72872,20 +74158,22 @@ io.on('connection', function (socket) {
             if (_raw && _raw.indexOf('"__proto__"') !== -1) { skipped++; continue; }
           } catch (e) { skipped++; continue; }
         }
-        var str = (t === 'string') ? v : JSON.stringify(v);
-        if (!str) { skipped++; continue; }
-        if (str.length > USER_DATA_MAX_KEY_BYTES) { skipped++; continue; }
-        totalBytes += str.length;
-        if (totalBytes > USER_DATA_MAX_TOTAL_BYTES) {
-          socket.emit('sync-all-result', {
-            ok: false,
-            error: '数据总量超过 ' + Math.round(USER_DATA_MAX_TOTAL_BYTES / 1048576) +
-              'MB 上限，请减少聊天背景图 / 自定义背景图片等大体积数据'
-          });
-          return;
-        }
-        staged[key] = v;
-        count++;
+      var str = (t === 'string') ? v : JSON.stringify(v);
+      if (!str) { skipped++; continue; }
+      if (str.length > USER_DATA_MAX_KEY_BYTES) { skipped++; continue; }
+      totalBytes += str.length;
+      if (totalBytes > USER_DATA_MAX_TOTAL_BYTES) {
+        socket.emit('sync-all-result', {
+          ok: false,
+          error: '数据总量超过 ' + Math.round(USER_DATA_MAX_TOTAL_BYTES / 1048576) +
+            'MB 上限，请减少聊天背景图 / 自定义背景图片等大体积数据'
+        });
+        return;
+      }
+      /* ★ 修复：统一按字符串存储，保证客户端恢复时类型稳定（不再有
+         [object Object] 之类的异常值）。 */
+      staged[key] = str;
+      count++;
       }
 
       /* 合并写入 */
@@ -72894,7 +74182,14 @@ io.on('connection', function (socket) {
         merged[k2] = staged[k2];
       }
       userDataStore[uid] = merged;
-      saveUserDataStore();
+      /* ★ 修复：立即同步落盘，避免用户推送后立刻刷新页面导致异步 debounce
+         （saveJSON 有 80ms 延迟）写入丢失。 */
+      try {
+        saveJSONNow(F_USER_DATA, userDataStore);
+      } catch (eSave) {
+        console.error('❌ user_data 立即落盘失败:', eSave && eSave.message);
+        saveUserDataStore();
+      }
 
       console.log('☁️ 用户 ' + (socket.data.pendingName || uid) +
         ' 同步了 ' + count + ' 项设置到服务器（' +
@@ -72917,9 +74212,15 @@ io.on('connection', function (socket) {
       socket.emit('sync-all-data', { ok: false, error: '未登录' });
       return;
     }
+    var _store = userDataStore[uid] || {};
+    var _keys = Object.keys(_store);
+    /* ★ 修复：服务器端打印日志，方便排查"服务器上到底有没有数据" */
+    console.log('☁️ 用户 ' + (socket.data.userName || uid) +
+      ' 请求恢复设置，服务器缓存中有 ' + _keys.length + ' 项');
     socket.emit('sync-all-data', {
       ok: true,
-      store: userDataStore[uid] || {}
+      store: _store,
+      count: _keys.length
     });
   });
 
@@ -74763,6 +76064,69 @@ io.on('connection', function (socket) {
     log('DISBAND_GROUP', { groupId: group.id, name: group.name, by: user.name });
     console.log('🗑️ 群聊已解散（成员可自行退出）：' + group.name +
       ' (' + group.id + ') by ' + user.name);
+  });
+
+  /* ============================================================
+     ★ 转让群主
+     ============================================================ */
+  socket.on('transfer-group-owner', function (data) {
+    var fromUser = getUserBySocketId(socket.id);
+    if (!fromUser || !data || !data.groupId || !data.targetId) return;
+    var group = getGroupById(data.groupId);
+    if (!group) return;
+    
+    // 只有当前群主可以转让
+    if (group.owner !== fromUser.id) {
+      socket.emit('group-error', '只有群主可以转让群主');
+      return;
+    }
+    if (!group.members.has(data.targetId)) {
+      socket.emit('group-error', '该用户不在群内');
+      return;
+    }
+    if (data.targetId === fromUser.id) return;
+    
+    var targetUser = getUserById(data.targetId);
+    var targetName = targetUser ? targetUser.name : data.targetId;
+    
+    group.owner = data.targetId;
+    saveGroups();
+    
+    // 广播给所有成员刷新群列表
+    group.members.forEach(function (uid) {
+      var u = getUserById(uid);
+      if (u && u.online) {
+        emitToUser(uid, 'group-owner-changed', {
+          groupId: group.id,
+          owner: data.targetId,
+          ownerName: targetName,
+          byName: fromUser.name
+        });
+        broadcastGroupList(uid);
+      }
+    });
+    
+    // 写入系统消息记录
+    var msgData = {
+      groupId: group.id,
+      from: 'SYSTEM',
+      fromName: '系统',
+      content: '👑 "' + fromUser.name + '" 将群主转让给了 "' + targetName + '"',
+      time: new Date().toLocaleString('zh-CN', { hour12: false }),
+      msgId: generateId(),
+      type: 'text',
+      recalled: false, recalledBy: null, readUsers: [],
+      fromLevel: 100, fromVip: true, fromAdmin: false,
+      fromVerified: '系统通知 官方账号'
+    };
+    var gkey = getHistoryKey('group', group.id);
+    saveMessage('group', gkey, msgData);
+    group.members.forEach(function (uid) {
+      var u = getUserById(uid);
+      if (u && u.online) emitToUser(uid, 'group-message', msgData);
+    });
+    
+    log('TRANSFER_OWNER', { groupId: group.id, from: fromUser.name, to: targetName });
   });
 
   socket.on('remove-group-member', function (data) {
@@ -77074,7 +78438,7 @@ var _CMD_LIST = [
   'cleardm', 'cleargroup', 'clearuser', 'delmsg',
   'moments', 'delmoment', 'blocks', 'unblock',
   'money', 'moneyadd', 'moneyall', 'wallet', 'wallets', 'redpackets',
-  'delredpacket', 'cleardeadredpackets', 'settime'
+  'delredpacket', 'cleardeadredpackets','setowner', 'settime'
 ];
 
 /* 二级子命令（Tab 在已输入一级命令后再按，补全子命令） */
@@ -80902,39 +82266,99 @@ rl.on('line', function (line) {
   }
 
   /* ============================================================
+     ★ 拦截 setowner 命令（修改群主）
+     用法：setowner <群名或群ID> <新群主用户名>
+     ============================================================ */
+  if (_trimLine.toLowerCase().indexOf('setowner ') === 0) {
+    var _parts = _trimLine.split(/\s+/);
+    var _newUser = _parts[_parts.length - 1];
+    var _groupName = _parts.slice(1, _parts.length - 1).join(' ');
+
+    if (!_groupName || !_newUser) {
+      console.log('❌ 用法: setowner <群名或群ID> <新群主用户名>');
+      console.log('   例如: setowner 测试群 张三');
+    } else {
+      var _group = null;
+      groupMap.forEach(function (g) {
+        if (g.id === _groupName || g.name === _groupName) {
+          _group = g;
+        }
+      });
+
+      if (!_group) {
+        console.log('❌ 未找到群组: ' + _groupName + ' (如果群名有空格，请尝试使用群ID)');
+      } else {
+        var _user = persistentUsers[_newUser];
+        if (!_user) {
+          console.log('❌ 用户不存在: ' + _newUser);
+        } else if (!_group.members.has(_user.id)) {
+          console.log('❌ 该用户不在群内，无法设为群主。');
+        } else {
+          _group.owner = _user.id;
+          saveGroups();
+
+          /* 发系统消息并广播 */
+          var _msgData = {
+            groupId: _group.id,
+            from: 'SYSTEM',
+            fromName: '系统',
+            content: '👑 命令行操作："' + _user.name + '" 被设为新群主',
+            time: new Date().toLocaleString('zh-CN', { hour12: false }),
+            msgId: generateId(),
+            type: 'text',
+            recalled: false, recalledBy: null, readUsers: [],
+            fromLevel: 100, fromVip: true, fromAdmin: false,
+            fromVerified: '系统通知 官方账号'
+          };
+          
+          var _gkey = getHistoryKey('group', _group.id);
+          saveMessage('group', _gkey, _msgData);
+
+          _group.members.forEach(function (uid) {
+            var u = getUserById(uid);
+            if (u && u.online) {
+              emitToUser(uid, 'group-message', _msgData);
+              broadcastGroupList(uid);
+            }
+          });
+
+          console.log('✅ 已将群 "' + _group.name + '" 的群主修改为: ' + _user.name);
+        }
+      }
+    }
+    rl.prompt();
+    return; /* 拦截成功，结束当前回调 */
+  }
+
+  /* ============================================================
      ★ 拦截 settime 命令（修改用户注册时间）
      ============================================================ */
   if (_trimLine.toLowerCase().indexOf('settime ') === 0) {
-    var _parts = _trimLine.split(/\s+/);
-    var _targetName = _parts[1];
-    var _dateStr = _parts[2];
+    var _parts2 = _trimLine.split(/\s+/);
+    var _targetName = _parts2[1];
+    var _dateStr = _parts2[2];
     
     if (!_targetName || !_dateStr) {
       console.log('❌ 用法: settime <用户名> <YYYY-MM-DD>');
-      console.log('   例如: settime 张三 2024-01-01');
     } else {
       var _rec = persistentUsers[_targetName];
       if (!_rec) {
         console.log('❌ 用户不存在: ' + _targetName);
       } else {
-        /* 把 - 替换成 / 兼容日期解析 */
         var _ts = Date.parse(_dateStr.replace(/-/g, '/'));
         if (isNaN(_ts)) {
           console.log('❌ 日期格式错误，请使用 YYYY-MM-DD 格式');
         } else {
           _rec.createdAt = _ts;
           saveUsers();
-          
-          /* 实时同步给所有在线用户，客户端名片会自动刷新 */
           io.emit('user-updated', { id: _rec.id, name: _rec.name, createdAt: _ts });
-          
           console.log('✅ 已修改 ' + _targetName + ' 的注册时间为：' + 
             new Date(_ts).toLocaleString('zh-CN', { hour12: false }));
         }
       }
     }
     rl.prompt();
-    return; /* 拦截成功，结束当前回调 */
+    return;
   }
 
   /* ============================================================
