@@ -16,6 +16,7 @@
 
 ### 1. 安装依赖
 ```bash
+下载node.js  https://nodejs.org
 npm install
 
 2.启动服务器
