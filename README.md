@@ -20,9 +20,11 @@
 https://nodejs.org
 
 2.安装前置
+
 ```bash
 npm install
 ```
+
 2.启动服务器
 双击 server.bat
 
