@@ -15,10 +15,14 @@
 ## 🚀 快速开始
 
 ### 1. 安装依赖
-```bash
-下载node.js  https://nodejs.org
-npm install
 
+下载node.js
+https://nodejs.org
+
+2.安装前置
+```
+npm install
+```
 2.启动服务器
 双击 server.bat
 
