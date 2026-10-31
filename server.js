@@ -1,3 +1,6 @@
+/* ★ v0.32.0：启动计时起点 */
+var BOOT_START = Date.now();
+
 /*进程异常兜底（Process Guard）*/
 process.on('uncaughtException', function (err) {
   try {
@@ -22,45 +25,94 @@ const KEY_FILE_EARLY = pathMod.join(__dirname, 'files', 'key.pem');
 if (!fsMod.existsSync(pathMod.join(__dirname, 'files'))) {
   fsMod.mkdirSync(pathMod.join(__dirname, 'files'), { recursive: true });
 }
+/* ★ v0.32.0 启动优化：证书生成顺序调整为「openssl 优先（同步、快速、可靠）→ selfsigned 兜底」。
+   这样首次启动不会因为 selfsigned v3 异步未写完而多走一次 openssl 分支。
+   给 openssl 加 3 秒超时，防止极端环境下卡死启动。 */
 if (!fsMod.existsSync(CERT_FILE_EARLY) || !fsMod.existsSync(KEY_FILE_EARLY)) {
-  try {
-    const selfsigned = require('selfsigned');
-    const result = selfsigned.generate(
-      [{ name: 'commonName', value: 'LAN-Chat' }],
-      {
-        days: 365,
-        keySize: 2048,
-        algorithm: 'sha256',
-        extensions: [{
-          name: 'subjectAltName',
-          altNames: [
-            { type: 2, value: 'localhost' },
-            { type: 7, ip: '127.0.0.1' },
-            { type: 7, ip: '0.0.0.0' }
-          ]
-        }]
-      }
-    );
+  var _certOk = false;
 
-    if (result && typeof result.then === 'function') {
-      result.then(function (pems) {
-        try {
-          fsMod.writeFileSync(CERT_FILE_EARLY, pems.cert);
-          fsMod.writeFileSync(KEY_FILE_EARLY, pems.private);
-          console.log('🔐 已用 selfsigned 生成 HTTPS 证书（v3+ 异步）');
-        } catch (we) {
-          console.error('❌ 写入自签名证书失败:', we.message);
+  /* 1. openssl 优先（同步 <200ms，最稳定） */
+  /* ★ v0.32.3：证书 SAN 自动包含本机所有 IPv4，避免局域网 IP 访问时 wss 握手被拒 */
+  var _allIps = ['127.0.0.1'];
+  try {
+    var _ifaces = require('os').networkInterfaces();
+    for (var _iname in _ifaces) {
+      if (!_ifaces.hasOwnProperty(_iname)) continue;
+      var _list = _ifaces[_iname] || [];
+      for (var _ii = 0; _ii < _list.length; _ii++) {
+        var _info = _list[_ii];
+        if (_info && _info.family === 'IPv4' && !_info.internal &&
+            _info.address && _allIps.indexOf(_info.address) === -1) {
+          _allIps.push(_info.address);
         }
-      }).catch(function (e) {
-        console.error('❌ selfsigned 生成证书失败:', e.message);
-      });
-    } else if (result && result.cert && result.private) {
-      fsMod.writeFileSync(CERT_FILE_EARLY, result.cert);
-      fsMod.writeFileSync(KEY_FILE_EARLY, result.private);
-      console.log('🔐 已用 selfsigned 生成 HTTPS 证书（v2 同步）');
+      }
+    }
+  } catch (_eIp) {}
+  var _sanStr = 'DNS:localhost,IP:' + _allIps.join(',IP:');
+  try {
+    const opensslCmd = 'openssl req -x509 -newkey rsa:2048 -keyout "' +
+      KEY_FILE_EARLY + '" -out "' + CERT_FILE_EARLY +
+      '" -days 365 -nodes -subj "/CN=LAN-Chat"' +
+      ' -addext "subjectAltName=' + _sanStr + '"';
+    require('child_process').execSync(opensslCmd, {
+      stdio: 'ignore',
+      timeout: 3000
+    });
+    _certOk = fsMod.existsSync(CERT_FILE_EARLY) &&
+              fsMod.existsSync(KEY_FILE_EARLY);
+    if (_certOk) {
+      console.log('🔐 已用 openssl 生成 HTTPS 证书');
     }
   } catch (e) {
-    console.error('❌ selfsigned 生成证书失败:', e.message);
+    console.warn('⚠️ openssl 生成失败，尝试 selfsigned:', e.message);
+  }
+
+  /* 2. selfsigned 兜底（优先 v2 同步；v3 异步时降级 HTTP，不阻塞启动） */
+  if (!_certOk) {
+    try {
+      const selfsigned = require('selfsigned');
+      const result = selfsigned.generate(
+        [{ name: 'commonName', value: 'LAN-Chat' }],
+        {
+          days: 365,
+          keySize: 2048,
+          algorithm: 'sha256',
+          extensions: [{
+            name: 'subjectAltName',
+            altNames: [
+              { type: 2, value: 'localhost' },
+              { type: 7, ip: '127.0.0.1' },
+              { type: 7, ip: '0.0.0.0' }
+            ]
+          }]
+        }
+      );
+
+      if (result && result.cert && result.private) {
+        /* selfsigned v2：同步返回 */
+        fsMod.writeFileSync(CERT_FILE_EARLY, result.cert);
+        fsMod.writeFileSync(KEY_FILE_EARLY, result.private);
+        _certOk = true;
+        console.log('🔐 已用 selfsigned 生成 HTTPS 证书（v2 同步）');
+      } else if (result && typeof result.then === 'function') {
+        /* selfsigned v3：异步 Promise，本次启动降级 HTTP，下次启动时文件已存在 */
+        console.warn('⚠️ selfsigned v3 为异步 API，本次启动降级为 HTTP；' +
+          '证书生成完成后下次启动自动启用 HTTPS');
+        result.then(function (pems) {
+          try {
+            fsMod.writeFileSync(CERT_FILE_EARLY, pems.cert);
+            fsMod.writeFileSync(KEY_FILE_EARLY, pems.private);
+            console.log('🔐 selfsigned v3 异步证书已生成（下次启动启用 HTTPS）');
+          } catch (we) {
+            console.error('❌ 写入自签名证书失败:', we.message);
+          }
+        }).catch(function (e) {
+          console.error('❌ selfsigned 生成证书失败:', e.message);
+        });
+      }
+    } catch (e) {
+      console.error('❌ selfsigned 生成证书失败:', e.message);
+    }
   }
 }
 
@@ -90,6 +142,12 @@ setInterval(function () {
 
     if (rssMB >= 1500) {
       console.warn('[内存告警] RSS ' + rssMB + 'MB（严重）');
+      try {
+        console.warn('  会话总数: ' + Object.keys(messageHistory).length +
+          ' · 用户总数: ' + Object.keys(persistentUsers).length +
+          ' · 在线: ' + userMap.size +
+          ' · 群组: ' + groupMap.size);
+      } catch (e) {}
       var top = [];
       for (var k in messageHistory) {
         if (messageHistory.hasOwnProperty(k) && Array.isArray(messageHistory[k])) {
@@ -138,13 +196,29 @@ setInterval(function () {
     if (typeof groupReadMap !== 'undefined') {
       var gKeys = Object.keys(groupReadMap);
       for (var gi = 0; gi < gKeys.length; gi++) {
-        var map = groupReadMap[gKeys[gi]];
+        var _gid = gKeys[gi];
+        var map = groupReadMap[_gid];
+        if (!map) { delete groupReadMap[_gid]; continue; }
         var mKeys = Object.keys(map);
         if (mKeys.length > 500) {
           for (var di = 0; di < mKeys.length - 500; di++) delete map[mKeys[di]];
         }
-        if (typeof groupMap !== 'undefined' && !groupMap.has(gKeys[gi])) {
-          delete groupReadMap[gKeys[gi]];
+        /* ★ v0.32.0：群已解散 / 不存在 → 整组清理 */
+        if (typeof groupMap !== 'undefined' && !groupMap.has(_gid)) {
+          delete groupReadMap[_gid];
+          continue;
+        }
+        /* ★ v0.32.0：组内消息已从 messageHistory 删除 → 清掉对应已读集合 */
+        var _hkey = 'group_' + _gid;
+        var _hist = messageHistory[_hkey];
+        if (Array.isArray(_hist)) {
+          var _live = new Set();
+          for (var hi = 0; hi < _hist.length; hi++) {
+            if (_hist[hi] && _hist[hi].msgId) _live.add(_hist[hi].msgId);
+          }
+          for (var ki = 0; ki < mKeys.length; ki++) {
+            if (!_live.has(mKeys[ki])) delete map[mKeys[ki]];
+          }
         }
       }
     }
@@ -170,7 +244,26 @@ setInterval(function () {
   }
 }, 10 * 60 * 1000);
 
-app.set('trust proxy', true);
+/* ★ Cloudflare Tunnel / 反向代理安全：
+   - 默认不信任代理，避免攻击者伪造 X-Forwarded-For 绕过 IP 封禁
+   - cloudflared 场景无需配置：它必注入 cf-ray 头，_getRealIp 自动取 CF-Connecting-IP
+   - 若前面另有 nginx 等自建反代，设置 TRUSTED_PROXIES=127.0.0.1,::1 */
+(function _configureTrustProxy() {
+  var _trusted = String(process.env.TRUSTED_PROXIES || '').trim();
+  if (!_trusted) {
+    app.set('trust proxy', false);
+    console.log('🔐 Trust proxy: off（只信 socket 层 IP；Cloudflare 走 cf-ray 自动检测）');
+    return;
+  }
+  var _arr = _trusted.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+  try {
+    app.set('trust proxy', _arr);
+    console.log('🔐 Trust proxy: ' + _arr.join(', '));
+  } catch (e) {
+    app.set('trust proxy', false);
+    console.error('⚠️ TRUSTED_PROXIES 配置无效，已降级为 off:', e.message);
+  }
+})();
 
 app.use(function (req, res, next) {
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
@@ -277,6 +370,7 @@ var _bodyJsonParser = express.json({ limit: '2mb' });
 var _bodyUrlParser = express.urlencoded({ extended: true, limit: '2mb' });
 app.use(function (req, res, next) {
   if (req.path.indexOf('/kf/api/') === 0 ||
+    req.path.indexOf('/jb/api/') === 0 ||
     req.path === '/download/login') {
     return next();
   }
@@ -305,10 +399,13 @@ var PAGE_NAMES = {
 };
 
 function _clientIp(req) {
-  try {
-    return String(req.ip || req.connection.remoteAddress || '')
-      .replace(/^::ffff:/, '');
-  } catch (e) { return ''; }
+  try { return _getRealIp(req); }
+  catch (e) {
+    try {
+      return String(req.ip || req.connection.remoteAddress || '')
+        .replace(/^::ffff:/, '');
+    } catch (e2) { return ''; }
+  }
 }
 
 app.use(function (req, res, next) {
@@ -340,6 +437,89 @@ catch (e) { console.error('❌ 创建 music 目录失败:', e.message); }
 const DOWNLOAD_DIR = path.join(DATA_DIR_EARLY, 'Download');
 try { if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true }); }
 catch (e) { console.error('❌ 创建 Download 目录失败:', e.message); }
+
+/* ★ v0.32.0 内存优化：大 fileData 剥离到磁盘，消息体只留 fileId
+ * 不减少任何聊天记录条数，只把 base64 文件内容从内存挪到磁盘 */
+const FILE_STORE_DIR = path.join(DATA_DIR_EARLY, 'filestore');
+try { if (!fs.existsSync(FILE_STORE_DIR)) fs.mkdirSync(FILE_STORE_DIR, { recursive: true }); }
+catch (e) { console.error('❌ 创建 filestore 目录失败:', e.message); }
+
+/* ★ v0.32.2：阈值从 32KB 提升到 512KB，绝大多数图片/表情包/短语音直接内联 */
+var FILE_STORE_THRESHOLD = 512 * 1024;
+
+function _fileStoreSave(base64Data, hintExt) {
+  try {
+    if (typeof base64Data !== 'string' || !base64Data.length) return null;
+    var m = /^data:([^;]+);base64,(.+)$/.exec(base64Data);
+    if (!m) return null;
+    var buf = Buffer.from(m[2], 'base64');
+    if (!buf.length) return null;
+    var ext = '.bin';
+    if (hintExt && /^\.[a-z0-9]{1,8}$/i.test(hintExt)) ext = hintExt;
+    else {
+      var mimeExt = {
+        'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif',
+        'image/webp': '.webp', 'audio/webm': '.webm', 'audio/ogg': '.ogg',
+        'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'video/mp4': '.mp4',
+        'application/pdf': '.pdf'
+      };
+      ext = mimeExt[m[1]] || '.bin';
+    }
+    var fileId = 'f' + Date.now().toString(36) +
+      Math.random().toString(36).substring(2, 10) + ext;
+    var fullPath = path.join(FILE_STORE_DIR, fileId);
+    if (fullPath.indexOf(FILE_STORE_DIR) !== 0) return null;
+    fs.writeFileSync(fullPath, buf);
+    return {
+      fileId: fileId,
+      mimeType: m[1],
+      size: buf.length
+    };
+  } catch (e) {
+    console.error('⚠️ 剥离 fileData 失败:', e.message);
+    return null;
+  }
+}
+
+function _fileStoreLoad(fileId) {
+  try {
+    if (!fileId || typeof fileId !== 'string') return null;
+    if (fileId.indexOf('..') !== -1 || fileId.indexOf('/') !== -1 ||
+        fileId.indexOf('\\') !== -1 || fileId.indexOf('\x00') !== -1) return null;
+    var fullPath = path.join(FILE_STORE_DIR, fileId);
+    if (fullPath.indexOf(FILE_STORE_DIR) !== 0) return null;
+    if (!fs.existsSync(fullPath)) return null;
+    var buf = fs.readFileSync(fullPath);
+    var ext = path.extname(fileId).toLowerCase();
+    var mimeMap = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.gif': 'image/gif',
+      '.webp': 'image/webp', '.webm': 'audio/webm', '.ogg': 'audio/ogg',
+      '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.mp4': 'video/mp4',
+      '.pdf': 'application/pdf'
+    };
+    var mime = mimeMap[ext] || 'application/octet-stream';
+    return {
+      dataUrl: 'data:' + mime + ';base64,' + buf.toString('base64'),
+      size: buf.length
+    };
+  } catch (e) { return null; }
+}
+
+/* 自动剥离：保存消息前检查 fileData 大小 */
+function _maybeStripFileData(msg) {
+  if (!msg || !msg.fileData) return msg;
+  if (typeof msg.fileData !== 'string') return msg;
+  if (msg.fileData.length <= FILE_STORE_THRESHOLD) return msg;
+  var _hintExt = '';
+  if (msg.fileName) _hintExt = path.extname(msg.fileName);
+  var saved = _fileStoreSave(msg.fileData, _hintExt);
+  if (!saved) return msg;   /* 剥离失败，保留原样（不丢数据） */
+  msg.fileId = saved.fileId;
+  msg.fileMime = saved.mimeType;
+  msg.fileSize = saved.size;
+  msg.fileData = null;   /* 内存中彻底不保留 */
+  return msg;
+}
 
 var DL_SECRET_FILE = path.join(DOWNLOAD_DIR, '.secret');
 var DL_SIGN_TTL_MS = 10 * 60 * 1000;   /* 签名有效期：10 分钟 */
@@ -407,12 +587,67 @@ const CERT_FILE = path.join(DATA_DIR_EARLY, 'cert.pem');
 const KEY_FILE = path.join(DATA_DIR_EARLY, 'key.pem');
 
 function ensureSelfSignedCert() {
-  if (fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE)) return true;
+  if (fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE)) {
+    /* ★ v0.32.3：已有证书但 SAN 可能不含局域网 IP → 校验一次，不匹配则重建 */
+    try {
+      var _curAllIps = ['127.0.0.1'];
+      try {
+        var _if2 = require('os').networkInterfaces();
+        for (var _n2 in _if2) {
+          if (!_if2.hasOwnProperty(_n2)) continue;
+          var _l2 = _if2[_n2] || [];
+          for (var _i2 = 0; _i2 < _l2.length; _i2++) {
+            var _o2 = _l2[_i2];
+            if (_o2 && _o2.family === 'IPv4' && !_o2.internal &&
+                _o2.address && _curAllIps.indexOf(_o2.address) === -1) {
+              _curAllIps.push(_o2.address);
+            }
+          }
+        }
+      } catch (_e2) {}
+      var _needRebuild = false;
+      try {
+        var _certText = require('child_process')
+          .execSync('openssl x509 -in "' + CERT_FILE + '" -noout -text', {
+            stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000
+          }).toString();
+        for (var _k = 0; _k < _curAllIps.length; _k++) {
+          if (_certText.indexOf('IP Address:' + _curAllIps[_k]) === -1) {
+            _needRebuild = true;
+            console.log('🔐 证书 SAN 缺少 ' + _curAllIps[_k] + '，将重建证书');
+            break;
+          }
+        }
+      } catch (_e3) { /* openssl 不可用则跳过校验 */ }
+      if (!_needRebuild) return true;
+      try { fs.unlinkSync(CERT_FILE); } catch (e) {}
+      try { fs.unlinkSync(KEY_FILE); } catch (e) {}
+    } catch (_e4) {
+      return true;
+    }
+  }
   try {
+    var _allIps2 = ['127.0.0.1'];
+    try {
+      var _if3 = require('os').networkInterfaces();
+      for (var _n3 in _if3) {
+        if (!_if3.hasOwnProperty(_n3)) continue;
+        var _l3 = _if3[_n3] || [];
+        for (var _i3 = 0; _i3 < _l3.length; _i3++) {
+          var _o3 = _l3[_i3];
+          if (_o3 && _o3.family === 'IPv4' && !_o3.internal &&
+              _o3.address && _allIps2.indexOf(_o3.address) === -1) {
+            _allIps2.push(_o3.address);
+          }
+        }
+      }
+    } catch (_e5) {}
+    var _san2 = 'DNS:localhost,IP:' + _allIps2.join(',IP:');
     var cmd = 'openssl req -x509 -newkey rsa:2048 -keyout "' + KEY_FILE +
       '" -out "' + CERT_FILE + '" -days 365 -nodes -subj "/CN=LAN-Chat"' +
-      ' -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"';
-    execSync(cmd, { stdio: 'ignore' });
+      ' -addext "subjectAltName=' + _san2 + '"';
+    /* ★ v0.32.0：加 3 秒超时，防止 openssl 卡死阻塞启动 */
+    execSync(cmd, { stdio: 'ignore', timeout: 3000 });
     return fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE);
   } catch (e) {
     console.warn('⚠️ 无法生成自签名证书（未安装 openssl？）：' + e.message);
@@ -480,6 +715,7 @@ var F_USER_DATA = path.join(DATA_DIR, 'user_data.json');
 var F_BURN = path.join(DATA_DIR, 'burn.json');
 var F_RISK_EVENTS = path.join(DATA_DIR, 'risk_events.json');
 var F_RISK_CONFIG = path.join(DATA_DIR, 'risk_control.json');
+var F_REPORTS = path.join(DATA_DIR, 'reports.json');
 
 var MAX_TEXT_LEN = 10000;                     /* 单条文本消息字符上限 */
 var MAX_FILE_DATA_LEN = 1.2e8;                /* base64 fileData 字符上限（≈ 90MB 原始） */
@@ -524,19 +760,117 @@ function _agNormIp(ip) {
   return ip || 'unknown';
 }
 
-function _extractIpFromHeaders(headers, fallback) {
-  try {
-    if (headers && typeof headers === 'object') {
-      var xff = headers['x-forwarded-for'];
-      if (xff && typeof xff === 'string') {
-        var first = xff.split(',')[0].trim();
-        if (first) return _agNormIp(first);
-      }
-      var cfIp = headers['cf-connecting-ip'];
-      if (cfIp && typeof cfIp === 'string') return _agNormIp(cfIp.trim());
+/* ★ v0.32.0 安全修复：仅当请求来自受信代理时才信任转发头，防止 IP 伪造绕过封禁 */
+var TRUSTED_PROXIES = (function () {
+  var env = String(process.env.TRUSTED_PROXIES || '').trim();
+  if (!env) return null;   /* null = 不信任任何代理，只用 socket 层 IP */
+  return env.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+})();
+
+function _isLoopbackIp(ip) {
+  var s = _agNormIp(ip);
+  if (!s) return false;
+  if (s === '127.0.0.1' || s === '::1') return true;
+  if (s.indexOf('127.') === 0) return true;
+  if (s === '0:0:0:0:0:0:0:1') return true;
+  return false;
+}
+
+function _isTrustedProxy(remoteIp) {
+  if (!TRUSTED_PROXIES || !TRUSTED_PROXIES.length) return false;
+  var ip = _agNormIp(remoteIp);
+  for (var i = 0; i < TRUSTED_PROXIES.length; i++) {
+    if (TRUSTED_PROXIES[i] === ip) return true;
+    /* 支持 CIDR 前缀：192.168.0.0/16 */
+    if (TRUSTED_PROXIES[i].indexOf('/') !== -1) {
+      try {
+        if (_ipInCidr(ip, TRUSTED_PROXIES[i])) return true;
+      } catch (e) {}
     }
+  }
+  return false;
+}
+
+function _ipInCidr(ip, cidr) {
+  var parts = cidr.split('/');
+  var base = parts[0];
+  var bits = parseInt(parts[1], 10);
+  if (isNaN(bits) || bits < 0 || bits > 32) return false;
+  function toLong(s) {
+    var p = s.split('.');
+    if (p.length !== 4) return null;
+    var n = 0;
+    for (var i = 0; i < 4; i++) {
+      var v = parseInt(p[i], 10);
+      if (isNaN(v) || v < 0 || v > 255) return null;
+      n = (n << 8) | v;
+    }
+    return n >>> 0;
+  }
+  var a = toLong(_agNormIp(ip));
+  var b = toLong(base);
+  if (a === null || b === null) return false;
+  var mask = bits === 0 ? 0 : (0xFFFFFFFF << (32 - bits)) >>> 0;
+  return (a & mask) === (b & mask);
+}
+
+function _extractIpFromHeaders(headers, fallback, remoteIp) {
+  try {
+    var directIp = _agNormIp(remoteIp || fallback || 'unknown');
+
+    if (headers && typeof headers === 'object') {
+      /* ★ 优先级 1：请求来自 loopback 且带 cf-ray → 必是 cloudflared 转发
+         此时 cf-connecting-ip 由 Cloudflare 边缘注入，客户端无法伪造 */
+      var _cfRay = headers['cf-ray'];
+      var _cfIpH = headers['cf-connecting-ip'];
+      if (_cfRay && typeof _cfRay === 'string' &&
+          _cfIpH && typeof _cfIpH === 'string' &&
+          _isLoopbackIp(directIp)) {
+        var _cfNorm = _agNormIp(String(_cfIpH).trim());
+        if (_cfNorm && _cfNorm !== 'unknown') return _cfNorm;
+      }
+
+      /* ★ 优先级 2：请求来自受信代理（TRUSTED_PROXIES）时信任转发头 */
+      if (TRUSTED_PROXIES && _isTrustedProxy(directIp)) {
+        var xff = headers['x-forwarded-for'];
+        if (xff && typeof xff === 'string') {
+          var parts = String(xff).split(',');
+          for (var i = 0; i < parts.length; i++) {
+            var cand = _agNormIp(parts[i].trim());
+            if (cand && cand !== 'unknown' && !_isTrustedProxy(cand)) return cand;
+          }
+        }
+        if (_cfIpH && typeof _cfIpH === 'string') {
+          var _cfNorm2 = _agNormIp(String(_cfIpH).trim());
+          if (_cfNorm2 && _cfNorm2 !== 'unknown') return _cfNorm2;
+        }
+      }
+    }
+    return directIp;
   } catch (e) {}
   return _agNormIp(fallback || 'unknown');
+}
+
+function _getRealIp(req) {
+  try {
+    if (!req) return 'unknown';
+    var _remote = req.ip || (req.connection && req.connection.remoteAddress) ||
+                  (req.socket && req.socket.remoteAddress);
+    return _extractIpFromHeaders(req.headers, _remote, _remote);
+  } catch (e) {
+    return 'unknown';
+  }
+}
+
+function _getRealIpFromSocket(socket) {
+  try {
+    if (!socket) return 'unknown';
+    var hs = socket.handshake || {};
+    var _remote = hs.address || (socket.conn && socket.conn.remoteAddress) || 'unknown';
+    return _extractIpFromHeaders(hs.headers, _remote, _remote);
+  } catch (e) {
+    return 'unknown';
+  }
 }
 
 function _getRealIp(req) {
@@ -558,6 +892,192 @@ function _getRealIpFromSocket(socket) {
   } catch (e) {
     return 'unknown';
   }
+}
+
+/* ===== IP 归属地查询（ip2region 离线库） ===== */
+var _ip2RegionQuery = null;
+var _ipGeoCache = Object.create(null);
+var _IP_GEO_CACHE_TTL = 60 * 60 * 1000;
+var _IP_GEO_CACHE_MAX = 5000;
+
+(function _initIp2region() {
+  try {
+    var IPDB = require('ipdb');
+    var qqwry = require('qqwry.ipdb');
+    var _ipdb = new IPDB(qqwry);
+
+    _ip2RegionQuery = {
+      search: function (ip) {
+        try {
+          var r = _ipdb.find(ip);
+          if (!r || !r.data) return null;
+          var d = r.data;
+          return {
+            country: d.country_name || '',
+            province: d.region_name || '',
+            city: d.city_name || '',
+            isp: d.isp_domain || ''
+          };
+        } catch (e) { return null; }
+      }
+    };
+
+    /* 自检 */
+    var _v4 = null, _v6 = null;
+    try { _v4 = _ip2RegionQuery.search('114.114.114.114'); } catch (e) {}
+    try { _v6 = _ip2RegionQuery.search('240e:47d:c20:1627:30a3:ba0d:a5e6:ec19'); } catch (e) {}
+    if (_v4 && _v4.province) {
+      console.log('🌍 IP 归属地库已加载（qqwry.ipdb，IPv4 + IPv6）');
+    } else {
+      console.warn('⚠️ qqwry.ipdb IPv4 自检未通过:', _v4);
+    }
+    if (!_v6 || !_v6.country) {
+      console.warn('⚠️ qqwry.ipdb IPv6 自检未通过:', _v6);
+    }
+  } catch (e) {
+    console.warn('⚠️ qqwry.ipdb 加载失败:', e && e.message);
+    _ip2RegionQuery = null;
+  }
+})();
+
+function _isIPv4(s) {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(String(s || ''));
+}
+
+/* IPv6 静态前缀表：覆盖中国大陆主要 ISP + 常见海外段
+   精度到运营商级，局域网段由 _isLanIp 单独处理，不走此表 */
+var _IPV6_STATIC = [
+  /* 中国大陆 ISP 段（240e/2408/2409 是三大运营商主段） */
+  { p: '240e',  c: '中国', i: '中国电信' },
+  { p: '2408',  c: '中国', i: '中国联通' },
+  { p: '2409',  c: '中国', i: '中国移动' },
+  { p: '2400',  c: '中国', i: '阿里云' },
+  { p: '2401',  c: '中国', i: '腾讯云' },
+  { p: '2402',  c: '中国', i: '' },
+  { p: '2403',  c: '中国', i: '' },
+  { p: '2404',  c: '中国', i: '' },
+  { p: '2405',  c: '中国', i: '' },
+  { p: '2406',  c: '中国', i: '' },
+  { p: '2407',  c: '中国', i: '' },
+  { p: '240a',  c: '中国', i: '' },
+  { p: '240b',  c: '中国', i: '' },
+  { p: '240c',  c: '中国', i: '' },
+  { p: '240d',  c: '中国', i: '' },
+  { p: '240f',  c: '中国', i: '' },
+  /* 常见海外段 */
+  { p: '2001:4860', c: '美国', i: 'Google' },
+  { p: '2606:4700', c: '美国', i: 'Cloudflare' },
+  { p: '2607:f8b0', c: '美国', i: 'Google' },
+  { p: '2001:db8',  c: '保留', i: '文档用' },
+  { p: '2001:0',    c: '保留', i: 'Teredo' }
+];
+
+function _lookupIpv6Static(ip) {
+  var _norm = String(ip || '').toLowerCase().replace(/^::ffff:/, '');
+  if (!_norm || _norm.indexOf(':') === -1) return null;
+
+  var _firstGroup = _norm.split(':')[0];
+  for (var i = 0; i < _IPV6_STATIC.length; i++) {
+    var item = _IPV6_STATIC[i];
+    var p = item.p.toLowerCase();
+    var matched = false;
+    if (p.indexOf(':') === -1) {
+      /* 单段前缀，如 "240e" */
+      matched = (_firstGroup === p);
+    } else {
+      /* 多段前缀，如 "2001:4860" */
+      matched = (_norm === p || _norm.indexOf(p + ':') === 0 ||
+                 _norm.indexOf(p + '::') === 0);
+    }
+    if (matched) {
+      return {
+        country: item.c,
+        province: '',
+        city: '',
+        isp: item.i,
+        regionText: item.i ? (item.c + ' ' + item.i) : item.c
+      };
+    }
+  }
+  return null;
+}
+
+function getIpLocation(ip, cfCountry) {
+  if (!ip) return null;
+  var _norm = _agNormIp(ip);
+  if (!_norm || _norm === 'unknown') return null;
+
+  /* 内网 / loopback（IPv4 + IPv6）直接标注，不查库 */
+  if (_isLanIp(_norm)) {
+    return { country: '局域网', province: '', city: '', isp: '', regionText: '局域网' };
+  }
+
+  var _cached = _ipGeoCache[_norm];
+  if (_cached && (Date.now() - _cached.ts) < _IP_GEO_CACHE_TTL) {
+    return _cached.data;
+  }
+
+  var data = null;
+
+  /* Cloudflare 场景：先用 CF-IPCountry 粗判（拿不到省市） */
+  if (cfCountry && typeof cfCountry === 'string') {
+    var _cf = String(cfCountry).trim().toUpperCase();
+    if (_cf && _cf !== 'XX' && _cf !== 'T1') {
+      var _cfMap = {
+        CN: '中国', HK: '中国香港', TW: '中国台湾', MO: '中国澳门',
+        US: '美国', JP: '日本', KR: '韩国', SG: '新加坡',
+        GB: '英国', DE: '德国', FR: '法国', RU: '俄罗斯',
+        CA: '加拿大', AU: '澳大利亚', IN: '印度'
+      };
+      data = {
+        country: _cfMap[_cf] || _cf,
+        province: '', city: '', isp: '',
+        regionText: _cfMap[_cf] || _cf
+      };
+    }
+  }
+
+  /* qqwry.ipdb 同时支持 IPv4 和 IPv6 */
+  if (!data && _ip2RegionQuery) {
+    try {
+      var res = _ip2RegionQuery.search(_norm);
+      if (res && (res.country || res.province || res.city)) {
+        var _clean = function (v) {
+          v = String(v == null ? '' : v).trim();
+          return (v === '0' || v === '') ? '' : v;
+        };
+        var country  = _clean(res.country);
+        var province = _clean(res.province);
+        var city     = _clean(res.city);
+        var isp      = _clean(res.isp);
+        data = {
+          country: country,
+          province: province,
+          city: city,
+          isp: isp,
+          regionText: [province, city].filter(Boolean).join(' ') ||
+                      country || '未知'
+        };
+      }
+    } catch (e) {}
+  }
+
+  if (!data) {
+    data = { country: '', province: '', city: '', isp: '', regionText: '未知' };
+  }
+
+  _ipGeoCache[_norm] = { data: data, ts: Date.now() };
+
+  /* 超量清理最老的 30% */
+  var _keys = Object.keys(_ipGeoCache);
+  if (_keys.length > _IP_GEO_CACHE_MAX) {
+    _keys.sort(function (a, b) { return _ipGeoCache[a].ts - _ipGeoCache[b].ts; });
+    for (var i = 0; i < Math.floor(_keys.length * 0.3); i++) {
+      delete _ipGeoCache[_keys[i]];
+    }
+  }
+
+  return data;
 }
 
 /* ★ 判断是否为局域网 IP（10.x / 172.16-31.x / 192.168.x / 127.x / ::1 / fc00:: / fe80::） */
@@ -611,7 +1131,7 @@ function _agIsValidId(s) {
 var _AG_MIME_RE = /^[a-zA-Z0-9][a-zA-Z0-9\+\-\.]{0,31}\/[a-zA-Z0-9][a-zA-Z0-9\+\-\.]{0,63}$/;
 
 var _AG_ALLOWED_TYPES = {
-  text: 1, file: 1, voice: 1, sticker: 1, redpacket: 1, image: 1
+  text: 1, file: 1, voice: 1, sticker: 1, redpacket: 1, image: 1, location: 1
 };
 
 function validateMessagePayload(data, isGroup) {
@@ -647,6 +1167,39 @@ function validateMessagePayload(data, isGroup) {
     }
     if (type !== 'text' && data.content.length > 1000) {
       return { ok: false, reason: 'payload polluted' };
+    }
+  }
+
+  if (type === 'location') {
+    var _addr = (data.address == null) ? '' : String(data.address).trim();
+    var _hasLat = (data.latitude != null && data.latitude !== '');
+    var _hasLng = (data.longitude != null && data.longitude !== '');
+
+    /* ★ 支持"自定义位置"：地址名必填，坐标可空，坐标可空也可填 */
+    if (!_addr && !_hasLat && !_hasLng) {
+      return { ok: false, reason: 'location requires address or coordinates' };
+    }
+    if (_addr.length > 120) {
+      return { ok: false, reason: 'address too long' };
+    }
+    if (_hasLat !== _hasLng) {
+      return { ok: false, reason: 'latitude and longitude must be both or neither' };
+    }
+    if (_hasLat) {
+      var _lat = Number(data.latitude);
+      var _lng2 = Number(data.longitude);
+      if (isNaN(_lat) || _lat < -90 || _lat > 90) {
+        return { ok: false, reason: 'invalid latitude' };
+      }
+      if (isNaN(_lng2) || _lng2 < -180 || _lng2 > 180) {
+        return { ok: false, reason: 'invalid longitude' };
+      }
+    }
+    if (data.accuracy != null) {
+      var _acc = Number(data.accuracy);
+      if (isNaN(_acc) || _acc < 0 || _acc > 100000) {
+        return { ok: false, reason: 'invalid accuracy' };
+      }
     }
   }
 
@@ -1042,10 +1595,17 @@ function riskCheckIp(ip, userId) {
 setInterval(function () {
   var now = Date.now();
   var cutoff = now - 30 * 60 * 1000;
+  var _removed = 0;
   for (var uid in riskProfiles) {
-    if (riskProfiles[uid].lastEventAt < cutoff && riskProfiles[uid].score <= 0) {
-      delete riskProfiles[uid];
+    if (!riskProfiles.hasOwnProperty(uid)) continue;
+    var p = riskProfiles[uid];
+    if (!p) { delete riskProfiles[uid]; _removed++; continue; }
+    if (p.lastEventAt < cutoff && p.score <= 0) {
+      delete riskProfiles[uid]; _removed++;
     }
+  }
+  if (_removed > 20) {
+    console.log('🧹 [资源清理] riskProfiles 移除 ' + _removed + ' 个陈旧档案');
   }
 }, 5 * 60 * 1000);
 
@@ -1076,43 +1636,13 @@ setInterval(function () {
   }
   if (changed) saveRedPackets();
 
-  var sizeFreed = 0;
-  var ONE_DAY = 24 * 3600 * 1000;
-  var ONE_HOUR = 3600 * 1000;
-  for (var hk in messageHistory) {
-    if (!messageHistory.hasOwnProperty(hk)) continue;
-    var arr = messageHistory[hk];
-    if (!Array.isArray(arr)) continue;
-    for (var i = 0; i < arr.length; i++) {
-      var m = arr[i];
-      if (m && m.fileData && m.fileData.length > 10 * 1024) {
-        var msgTs = Date.now();
-        if (typeof m.ts === 'number' && !isNaN(m.ts)) {
-          msgTs = m.ts;
-        } else if (m.time) {
-          var _parsedTs = Date.parse(String(m.time).replace(/-/g, '/'));
-          if (!isNaN(_parsedTs)) msgTs = _parsedTs;
-        }
-        var maxAge = (m.fileData.length > 5 * 1024 * 1024) ? ONE_HOUR : ONE_DAY;
-        if (now - msgTs > maxAge) {
-          sizeFreed += m.fileData.length;
-          m.fileData = '[历史文件已释放，以节省服务器内存]';
-          changed = true;
-        }
-      }
-    }
+  /* ★ v0.32.2：不再自动清除历史图片/视频/文件/语音的 fileData
+     历史媒体数据永久保留。>512KB 的大文件已在 saveMessage 时剥离到
+     files/filestore/ 磁盘，内存中只存 fileId，几乎不占 RAM。 */
+  if (global.gc) {
+    try { global.gc(); } catch (e) {}
   }
-  if (sizeFreed > 0) {
-    scheduleSaveHistory();
-    console.log('🧹 服务端内存释放：剥离了 ' + (sizeFreed / 1048576).toFixed(1) + 'MB 的历史文件数据');
-    if (global.gc) {
-      try {
-        global.gc();
-        console.log('♻️ 已触发全局垃圾回收 (GC)');
-      } catch(e) {}
-    }
-  }
-}, 60 * 60 * 1000); // 每小时执行一次深度清理
+}, 60 * 60 * 1000);
 
 var _memCleanupLastLog = 0;
 setInterval(function () {
@@ -1344,6 +1874,10 @@ function _flushPendingWrites() {
   }
 
   var i = 0;
+
+  /* ★ v0.32.0：异步 Brotli，主线程 0 阻塞
+   * 关键点：setImmediate(step) 只在【异步回调里】推进一次；
+   * 外层 step 定义后只启动一次，绝不重复调用，避免并发写同一文件 */
   function step() {
     if (i >= tasks.length) {
       _writeFlushing = false;
@@ -1352,34 +1886,50 @@ function _flushPendingWrites() {
       }
       return;
     }
+
     var t = tasks[i++];
+    var jsonStr;
     try {
-      var jsonStr = JSON.stringify(t.data);
-      var buf = zlib.brotliCompressSync(jsonStr, {
-        params: {
-          [zlib.constants.BROTLI_PARAM_QUALITY]: 9, // 最高压缩率
-          [zlib.constants.BROTLI_PARAM_SIZE_HINT]: jsonStr.length
-        }
-      });
-
-      var targetFile = t.file + '.br';
-      var tmp = targetFile + '.tmp';
-      fs.writeFileSync(tmp, buf);
-
-      try {
-        fs.renameSync(tmp, targetFile);
-        if (fs.existsSync(t.file)) {
-          try { fs.unlinkSync(t.file); } catch(e){}
-        }
-      } catch (renameErr) {
-        try { fs.writeFileSync(targetFile, buf); } catch (e) {}
-        try { fs.unlinkSync(tmp); } catch (e) {}
-      }
-    } catch (e) {
-      console.error('⚠️ 保存失败:', path.basename(t.file), e.message);
+      jsonStr = JSON.stringify(t.data);
+    } catch (eSer) {
+      console.error('⚠️ 序列化失败:', path.basename(t.file), eSer.message);
+      /* 序列化失败也要继续下一个任务，避免整个队列卡死 */
+      setImmediate(step);
+      return;
     }
-    setImmediate(step);
+
+    zlib.brotliCompress(Buffer.from(jsonStr, 'utf8'), {
+      params: {
+        [zlib.constants.BROTLI_PARAM_QUALITY]: 9,
+        [zlib.constants.BROTLI_PARAM_SIZE_HINT]: jsonStr.length
+      }
+    }, function (err, buf) {
+      if (err) {
+        console.error('⚠️ 压缩失败:', path.basename(t.file), err.message);
+      } else {
+        try {
+          var targetFile = t.file + '.br';
+          var tmp = targetFile + '.tmp';
+          fs.writeFileSync(tmp, buf);
+          try {
+            fs.renameSync(tmp, targetFile);
+            if (fs.existsSync(t.file)) {
+              try { fs.unlinkSync(t.file); } catch (e) {}
+            }
+          } catch (renameErr) {
+            try { fs.writeFileSync(targetFile, buf); } catch (e) {}
+            try { fs.unlinkSync(tmp); } catch (e) {}
+          }
+        } catch (we) {
+          console.error('⚠️ 写入失败:', path.basename(t.file), we.message);
+        }
+      }
+      /* ★ 唯一的推进点，无论在成功/失败分支都必须调用 */
+      setImmediate(step);
+    });
   }
+
+  /* ★ 只启动一次，后续完全由异步回调驱动 */
   setImmediate(step);
 }
 
@@ -1443,6 +1993,29 @@ function flushAllPendingWrites() {
 
 setTimeout(function() {
   try {
+    /* ★ v0.32.0 启动优化：先检测是否真的存在待迁移的旧 .json，
+       如果数据已经是 .br 格式（绝大多数情况），直接跳过，不白白阻塞 */
+    var _dir = path.join(__dirname, 'files');
+    var _needMigrate = false;
+    if (fs.existsSync(_dir)) {
+      var _files = fs.readdirSync(_dir);
+      for (var _i = 0; _i < _files.length; _i++) {
+        if (_files[_i].endsWith('.json')) {
+          var _brPath = path.join(_dir, _files[_i] + '.br');
+          if (fs.existsSync(_brPath)) {
+            _needMigrate = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!_needMigrate) {
+      console.log('🗜️ 持久化数据已是 Brotli 压缩格式，跳过迁移');
+      return;
+    }
+
+    console.log('🗜️ 检测到未压缩的旧 JSON，开始迁移到 Brotli...');
     saveJSONNow(F_HISTORY, messageHistory || {});
     saveJSONNow(F_USERS, persistentUsers || {});
     saveGroups();
@@ -1452,7 +2025,6 @@ setTimeout(function() {
     saveJSONNow(F_WALLETS, wallets || {});
     saveJSONNow(F_MUSIC, musicList || []);
 
-    var _dir = path.join(__dirname, 'files');
     if (fs.existsSync(_dir)) {
       fs.readdirSync(_dir).forEach(function(file) {
         if (file.endsWith('.json')) {
@@ -1467,7 +2039,7 @@ setTimeout(function() {
   } catch(e) {
     console.error('⚠️ 数据无损压缩迁移失败:', e.message);
   }
-}, 5000); // 启动 5 秒后（等数据加载完）自动执行一次
+}, 30000);   /* ★ v0.32.0：从 5 秒延后到 30 秒，错开用户首访高峰 */
 
 var config = loadJSON(F_CONFIG, { saveHistory: true, maxFileSize: 50 * 1024 * 1024 });
 if (typeof config.saveHistory !== 'boolean') config.saveHistory = true;
@@ -1667,6 +2239,54 @@ app.use(function readOnlyHttpGuard(req, res, next) {
 });
 
 var messageHistory = loadJSON(F_HISTORY, {});
+
+/* ★ v0.32.1：为早期没有 ts 的消息回填时间戳 */
+(function _backfillMessageTs() {
+  try {
+    var _changed = false;
+    var _keys = Object.keys(messageHistory);
+    for (var _i = 0; _i < _keys.length; _i++) {
+      var _arr = messageHistory[_keys[_i]];
+      if (!Array.isArray(_arr)) continue;
+      for (var _j = 0; _j < _arr.length; _j++) {
+        var _m = _arr[_j];
+        if (!_m || typeof _m.ts === 'number') continue;
+        var _p = Date.parse(String(_m.time || '').replace(/-/g, '/'));
+        _m.ts = (!isNaN(_p) && _p > 0) ? _p : Date.now();
+        _changed = true;
+      }
+    }
+    if (_changed) {
+      console.log('🛠️ 已为历史消息回填 ts 字段');
+      saveJSON(F_HISTORY, messageHistory);
+    }
+  } catch (e) { console.warn('⚠️ 回填消息时间戳失败:', e.message); }
+})();
+
+/* ★ v0.32.1：为早期没有 ts 的消息回填时间戳（用于统计面板） */
+(function _backfillMessageTs() {
+  try {
+    var _changed = false;
+    var _keys = Object.keys(messageHistory);
+    for (var _i = 0; _i < _keys.length; _i++) {
+      var _arr = messageHistory[_keys[_i]];
+      if (!Array.isArray(_arr)) continue;
+      for (var _j = 0; _j < _arr.length; _j++) {
+        var _m = _arr[_j];
+        if (!_m || typeof _m.ts === 'number') continue;
+        var _p = Date.parse(String(_m.time || '').replace(/-/g, '/'));
+        _m.ts = (!isNaN(_p) && _p > 0) ? _p : Date.now();
+        _changed = true;
+      }
+    }
+    if (_changed) {
+      console.log('🛠️ 已为历史消息回填 ts 字段（用于统计面板）');
+      saveJSON(F_HISTORY, messageHistory);
+    }
+  } catch (e) {
+    console.warn('⚠️ 回填消息时间戳失败:', e.message);
+  }
+})();
 var persistentUsers = loadJSON(F_USERS, {});
 
 (function cleanupTestAccounts() {
@@ -2154,6 +2774,28 @@ var riskState = {};
 var riskEvents = loadJSON(F_RISK_EVENTS, []);
 if (!Array.isArray(riskEvents)) riskEvents = [];
 var RISK_EVENTS_MAX = 1000;
+
+/* ★ 举报数据 */
+var reportsList = loadJSON(F_REPORTS, []);
+if (!Array.isArray(reportsList)) reportsList = [];
+var REPORTS_MAX = 5000;
+var reportCounter = 0;
+(function initReportCounter() {
+  for (var _rfi = 0; _rfi < reportsList.length; _rfi++) {
+    var _rfm = /^JB-(\d+)$/.exec(String(reportsList[_rfi].id || ''));
+    if (_rfm) {
+      var _rfn = parseInt(_rfm[1], 10);
+      if (_rfn > reportCounter) reportCounter = _rfn;
+    }
+  }
+})();
+function saveReports() { saveJSON(F_REPORTS, reportsList); }
+function genReportId() {
+  reportCounter++;
+  var s = String(reportCounter);
+  while (s.length < 6) s = '0' + s;
+  return 'JB-' + s;
+}
 
 function saveRiskConfig() { saveJSON(F_RISK_CONFIG, riskConfig); }
 function saveRiskEvents() { saveJSON(F_RISK_EVENTS, riskEvents); }
@@ -2977,6 +3619,15 @@ function pushExpResult(socket, expRes, reason) {
 }
 
 var _DEFAULT_PAT_TEMPLATE = { pre: '拍', mid: '拍', suf: '' };
+
+/* 服务端：判断是否系统内置账号（与客户端同名函数逻辑保持一致） */
+function isSystemUserId(id) {
+  if (id == null) return false;
+  var s = String(id);
+  if (s === 'wx_team' || s === 'wx_pay' || s === 'SYSTEM') return true;
+  if (s.toLowerCase() === 'system') return true;
+  return false;
+}
 
 var SYSTEM_USERS = {
   wx_team: {
@@ -3914,6 +4565,67 @@ function getUserByName(name) {
   userMap.forEach(function (u) { if (u.name === name && u.online) found = u; });
   return found;
 }
+
+/* ===== 账号功能限制 =====
+   restrictions 字段结构：
+   {
+     message:    { allow: true, reason: '', until: 0 },   // 发消息
+     file:       { allow: true, reason: '', until: 0 },   // 发文件/图片/视频
+     voice:      { allow: true, reason: '', until: 0 },   // 发语音
+     redpacket:  { allow: true, reason: '', until: 0 },   // 发红包/转账
+     call:       { allow: true, reason: '', until: 0 },   // 发起通话
+     moment:     { allow: true, reason: '', until: 0 },   // 发动态
+     groupCreate:{ allow: true, reason: '', until: 0 },   // 建群
+     profile:    { allow: true, reason: '', until: 0 }    // 修改资料
+   }
+   未设置则视为无限制（默认允许）
+*/
+function getUserRestriction(uid, action) {
+  if (!uid || !action) return { allow: true };
+  var rec = null;
+  var user = getUserById(uid);
+  if (user) rec = persistentUsers[user.name];
+  if (!rec || !rec.restrictions) return { allow: true };
+  var r = rec.restrictions[action];
+  if (!r) return { allow: true };
+  if (r.allow !== false) return { allow: true };
+  /* 有 until 且已过期 → 自动解除 */
+  if (r.until > 0 && r.until <= Date.now()) {
+    r.allow = true;
+    r.reason = '';
+    r.until = 0;
+    saveUsers();
+    return { allow: true };
+  }
+  return {
+    allow: false,
+    reason: r.reason || '',
+    until: r.until || 0,
+    action: action
+  };
+}
+
+function _rejectWithRestriction(socket, action, eventName) {
+  var r = getUserRestriction(socket.data && socket.data.userId, action);
+  if (r.allow) return false;
+  var untilTxt = r.until > 0
+    ? ('至 ' + new Date(r.until).toLocaleString('zh-CN', { hour12: false }))
+    : '（永久）';
+  var _labels = {
+    message: '发消息', file: '发文件', voice: '发语音',
+    redpacket: '发红包/转账', call: '发起通话', moment: '发动态',
+    groupCreate: '创建群聊', profile: '修改资料'
+  };
+  var _lbl = _labels[action] || action;
+  var _msg = '🔒 你的「' + _lbl + '」功能已被管理员限制' +
+    (r.reason ? '（原因：' + r.reason + '）' : '') +
+    ' ' + untilTxt;
+  if (eventName) {
+    try { socket.emit(eventName, _msg); } catch (e) {}
+  }
+  try { socket.emit('restriction-blocked', { action: action, message: _msg }); } catch (e) {}
+  return true;
+}
 function getGroupById(gid) { return groupMap.get(gid) || null; }
 
 function getHistoryKey(type, id1, id2) {
@@ -3928,6 +4640,12 @@ function getHistoryKey(type, id1, id2) {
 
 function saveMessage(type, key, msg) {
   if (!messageHistory[key]) messageHistory[key] = [];
+  _maybeStripFileData(msg);
+  /* ★ 统一补 ts（统计面板按天/周聚合依赖此字段） */
+  if (!msg.ts || typeof msg.ts !== 'number' || !isFinite(msg.ts) || msg.ts <= 0) {
+    var _parsed = Date.parse(String(msg.time || '').replace(/-/g, '/'));
+    msg.ts = (!isNaN(_parsed) && _parsed > 0) ? _parsed : Date.now();
+  }
   var history = messageHistory[key];
   for (var i = 0; i < history.length; i++) {
     if (history[i].msgId === msg.msgId) return;
@@ -3937,6 +4655,24 @@ function saveMessage(type, key, msg) {
   scheduleSaveHistory();
 }
 
+/* ★ v0.32.0：剥离超大 fileData，只保留元数据；客户端按需通过 history-load-more 拉取 */
+function _stripFileData(msg) {
+  if (!msg || typeof msg !== 'object') return msg;
+  if (!msg.fileData) return msg;
+  if (typeof msg.fileData !== 'string') return msg;
+  if (msg.fileData.length <= 8192) return msg;   /* 小数据（如表情包）保留 */
+  var m = {};
+  for (var k in msg) if (msg.hasOwnProperty(k)) m[k] = msg[k];
+  m.fileData = '[按需加载]';
+  m._needsFetch = true;
+  return m;
+}
+function _stripFileDataArr(arr) {
+  if (!Array.isArray(arr)) return arr;
+  var out = new Array(arr.length);
+  for (var i = 0; i < arr.length; i++) out[i] = _stripFileData(arr[i]);
+  return out;
+}
 function getUserHistory(userId) {
   var priv = {}, grp = {};
   for (var key in messageHistory) {
@@ -3949,13 +4685,14 @@ function getUserHistory(userId) {
       var a = rest.substring(0, idx);
       var b = rest.substring(idx + 1);
       if (a === userId || b === userId) {
-        priv[(a === userId) ? b : a] = arr.slice(-HISTORY_PAGE_SIZE);
+        priv[(a === userId) ? b : a] =
+          _stripFileDataArr(arr.slice(-HISTORY_PAGE_SIZE));
       }
     } else if (key.indexOf('group_') === 0) {
       var gid = key.substring(6);
       var g = groupMap.get(gid);
       if (g && g.members.has(userId)) {
-        grp[gid] = arr.slice(-HISTORY_PAGE_SIZE);
+        grp[gid] = _stripFileDataArr(arr.slice(-HISTORY_PAGE_SIZE));
       }
     }
   }
@@ -4023,9 +4760,32 @@ function sanitizeVerifiedForUser(id, verified) {
   return v;
 }
 
+/* ★ v0.32.0：广播用户列表加 100ms 去抖，避免短时间内多次全量广播 */
+var _broadcastUserListTimer = null;
 function broadcastUserList() {
+  if (_broadcastUserListTimer) return;
+  _broadcastUserListTimer = setTimeout(function () {
+    _broadcastUserListTimer = null;
+    _broadcastUserListNow();
+  }, 100);
+}
+function _broadcastUserListNow() {
   var list = [];
   var _seen = {};
+
+  /* 预计算当前在线用户 IP 归属地（缓存命中开销极低） */
+  var _userGeo = Object.create(null);
+  userMap.forEach(function (u) {
+    if (!u || !u.id) return;
+    try {
+      var _sock = u.socketId ? io.sockets.sockets.get(u.socketId) : null;
+      if (!_sock) return;
+      var _cfc = _sock.handshake && _sock.handshake.headers &&
+                 _sock.handshake.headers['cf-ipcountry'];
+      var _realIp = _getRealIpFromSocket(_sock);
+      _userGeo[u.id] = getIpLocation(_realIp, _cfc);
+    } catch (e) {}
+  });
 
   userMap.forEach(function (u) {
     _seen[u.id] = true;
@@ -4040,6 +4800,7 @@ function broadcastUserList() {
       isSystem: !!u.isSystem,
       exp: (typeof u.exp === 'number') ? u.exp : expForLevel(u.level || 1),
       banned: !!u.banned,
+      ipLocation: _userGeo[u.id] || null,
       createdAt: _rec.createdAt || 0,
       lastActive: _rec.lastActive || 0
     });
@@ -4695,7 +5456,11 @@ const html = String.raw`<!DOCTYPE html>
 <style>
 :root{
   --accent:#07c160;--accent-hover:#06ad56;--accent-rgb:7,193,96;
-  --bg-app:#fff;--bg-body:#e8e8e8;--bg-header:#2e3238;--text-header:#fff;
+  --bg-app:#fff;--bg-body:#e6e9ec;--bg-header:#2e3238;--text-header:#fff;
+  --bg-hover:rgba(0,0,0,.05);
+  --bg-surface-2:#f4f6f8;
+  --bg-surface-3:#e9edf1;
+  --border-soft:rgba(0,0,0,.06);
   --bg-sidebar:#f7f7f7;--border-sidebar:#e0e0e0;--text-primary:#333;--text-secondary:#666;
   --text-muted:#999;--bg-chat:#f8f9fa;--bg-msg-self:#95ec69;--bg-msg-other:#fff;
   --shadow-msg:0 1px 4px rgba(0,0,0,.06);--bg-input:#fff;--border-input:#ddd;
@@ -4704,12 +5469,48 @@ const html = String.raw`<!DOCTYPE html>
   --bg-modal:#fff;--border-modal:#eee;--scroll-btn-bg:rgba(0,0,0,.2);
 }
 [data-theme="dark"]{
-  --bg-app:#1e1e1e;--bg-body:#121212;--bg-header:#1a1a1a;--text-header:#eee;
-  --bg-sidebar:#2a2a2a;--border-sidebar:#3a3a3a;--text-primary:#e0e0e0;--text-secondary:#b0b0b0;
-  --text-muted:#888;--bg-chat:#252525;--bg-msg-self:#2d7d46;--bg-msg-other:#3a3a3a;
-  --shadow-msg:0 1px 4px rgba(0,0,0,.3);--bg-input:#2a2a2a;--border-input:#444;
-  --bg-btn-danger:#c0392b;--bg-overlay:rgba(0,0,0,.7);--shadow-card:0 20px 60px rgba(0,0,0,.6);
-  --bg-modal:#2a2a2a;--border-modal:#444;--scroll-btn-bg:rgba(255,255,255,.2);
+  --bg-app:#1e1e1e;--bg-body:#0e0e0e;--bg-header:#1a1a1a;--text-header:#f0f0f0;
+  --bg-sidebar:#252525;--border-sidebar:#3a3a3a;--text-primary:#ececec;--text-secondary:#c8c8c8;
+  --text-muted:#9a9a9a;--bg-chat:#1a1a1a;--bg-msg-self:#2f8049;--bg-msg-other:#333333;
+  --shadow-msg:0 1px 4px rgba(0,0,0,.55);--bg-input:#2c2c2c;--border-input:#4d4d4d;
+  --bg-btn-danger:#c0392b;--bg-overlay:rgba(0,0,0,.78);--shadow-card:0 20px 60px rgba(0,0,0,.7);
+  --bg-modal:#282828;--border-modal:#454545;--scroll-btn-bg:rgba(255,255,255,.22);
+  --bg-hover:rgba(255,255,255,.06);
+  --bg-surface-2:#2a2a2a;
+  --bg-surface-3:#343434;
+  --border-soft:rgba(255,255,255,.08);
+}
+[data-theme="dark"] input::placeholder,
+[data-theme="dark"] textarea::placeholder{
+  color:#9a9a9a;
+  opacity:1;
+}
+[data-theme="dark"] .msg .bubble{
+  border:1px solid rgba(255,255,255,.06);
+}
+[data-theme="dark"] .date-divider span{
+  background:rgba(255,255,255,.1);
+  color:#b0b0b0;
+}
+[data-theme="dark"] .msg .bubble code{
+  background:rgba(255,255,255,.1);
+  color:#f0c27c;
+}
+[data-theme="dark"] .msg .bubble a{
+  color:#64b5f6;
+}
+[data-theme="dark"] .msg .bubble .mention{
+  background:rgba(7,193,96,.22);
+  color:#81c784;
+}
+[data-theme="dark"] .input-area{
+  border-top-color:rgba(255,255,255,.08);
+}
+[data-theme="dark"] .msg .bubble blockquote,
+[data-theme="dark"] .msg .reply-block{
+  background:rgba(255,255,255,.06);
+  color:#c0c0c0;
+  border-left-color:#4ade80;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:var(--app-font-family,
@@ -6709,12 +7510,13 @@ html.is-pc .mobile-group-manage-btn{ display:none !important; }
 
 .msg{display:flex;gap:8px;max-width:var(--msg-max-width,85%);
   font-size:var(--msg-font-size,15px);line-height:var(--msg-line-height,1.5);
+  font-weight:var(--msg-font-weight,400);
   position:relative;transition:box-shadow .3s;align-items:flex-start;
   flex-shrink:0;
   width:max-content}
 .msg.self{flex-direction:row-reverse;align-self:flex-end}
 .msg.other{align-self:flex-start}
-.msg .msg-avatar{width:38px;height:38px;border-radius:50%;flex-shrink:0;
+.msg .msg-avatar{width:var(--msg-avatar-size,38px);height:var(--msg-avatar-size,38px);border-radius:50%;flex-shrink:0;
   display:flex;align-items:center;justify-content:center;font-weight:bold;
   font-size:16px;color:#fff;background:var(--accent);user-select:none;
   box-shadow:0 1px 3px rgba(0,0,0,.14);
@@ -6741,6 +7543,16 @@ html.is-pc .mobile-group-manage-btn{ display:none !important; }
   box-shadow:var(--shadow-msg);max-width:100%}
 .msg.self .bubble{background:var(--bg-msg-self);color:#000;
   border-bottom-right-radius:4px}
+[data-theme="dark"] .msg.self .bubble{
+  color:#eaffea;
+  background:linear-gradient(135deg,#2d7d46,#226338);
+  text-shadow:0 1px 0 rgba(0,0,0,.15);
+}
+[data-theme="dark"] .msg.self .bubble a{color:#b8e6c8}
+[data-theme="dark"] .msg.self .bubble .mention{
+  background:rgba(255,255,255,.18);
+  color:#eaffea;
+}
 .msg.other .bubble{border-bottom-left-radius:4px}
 .msg.msg-highlight .bubble{box-shadow:0 0 0 3px #07c160 !important;
   transition:box-shadow .2s}
@@ -6940,6 +7752,49 @@ html.is-pc .mobile-group-manage-btn{ display:none !important; }
 .msg .file-info .download-btn{background:var(--bg-btn-primary);color:#fff;border:none;
   padding:4px 14px;border-radius:16px;cursor:pointer;font-size:13px}
 .msg .file-info .download-btn:hover{background:var(--bg-btn-primary-hover)}
+.location-card{
+  display:flex;align-items:center;gap:12px;
+  padding:12px 14px;border-radius:14px;
+  background:linear-gradient(135deg,rgba(7,193,96,.10),rgba(7,193,96,.03));
+  border:1px solid rgba(7,193,96,.28);
+  min-width:220px;max-width:280px;cursor:pointer;
+  transition:transform .15s,box-shadow .15s,border-color .15s;
+}
+.location-card:hover{
+  transform:translateY(-1px);
+  border-color:#07c160;
+  box-shadow:0 6px 18px rgba(7,193,96,.22);
+}
+.location-card .loc-pin{
+  width:42px;height:42px;border-radius:50%;
+  background:linear-gradient(135deg,#07c160,#06ad56);
+  color:#fff;font-size:20px;display:flex;
+  align-items:center;justify-content:center;
+  flex-shrink:0;
+  box-shadow:0 4px 12px rgba(7,193,96,.35);
+}
+.location-card .loc-body{flex:1;min-width:0}
+.location-card .loc-title{
+  font-size:14px;font-weight:600;color:var(--text-primary);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  margin-bottom:3px;
+}
+.location-card .loc-meta{
+  font-size:11.5px;color:var(--text-muted);
+  font-variant-numeric:tabular-nums;
+}
+.location-card .loc-open{
+  flex-shrink:0;color:#07c160;font-size:16px;
+  font-weight:700;opacity:.8;
+}
+[data-theme="dark"] .location-card{
+  background:linear-gradient(135deg,rgba(7,193,96,.18),rgba(7,193,96,.06));
+  border-color:rgba(7,193,96,.4);
+}
+[data-theme="dark"] .location-card:hover{
+  border-color:#4ade80;
+  box-shadow:0 6px 18px rgba(7,193,96,.3);
+}
 .msg .image-preview{max-width:220px;max-height:220px;border-radius:10px;cursor:pointer;margin-top:6px}
 .msg .video-preview{max-width:100%;max-height:300px;border-radius:10px;margin-top:6px;background:#000}
 .msg .audio-preview{width:100%;max-width:240px;margin-top:6px}
@@ -22060,10 +22915,16 @@ html.no-sidebar-anim .date-divider {
 }
 
 body, .header, .sidebar, .chat-header, .chat-area,
-.message-list, .input-area, .modal-box {
+.message-list, .input-area, .modal-box,
+.msg .bubble, .contact-item, .settings-panel,
+.settings-nav-item, .chat-more-menu, .header-more-menu {
   transition: background-color .28s ease,
               color .28s ease,
-              border-color .28s ease;
+              border-color .28s ease,
+              box-shadow .28s ease;
+}
+html.theme-switching body * {
+  transition-duration:.35s !important;
 }
 
 @keyframes searchHitFlash {
@@ -24796,6 +25657,224 @@ html.is-tv .profile-card-actions button:focus-visible {
   }
 }
 
+/* ★ 暗色模式统一覆盖：处理散落在组件中的硬编码浅色 */
+[data-theme="dark"] .modal-box,
+[data-theme="dark"] .wallet-card,
+[data-theme="dark"] .redpacket-card,
+[data-theme="dark"] .rpg-card,
+[data-theme="dark"] .music-card,
+[data-theme="dark"] .profile-card,
+[data-theme="dark"] .app-dialog,
+[data-theme="dark"] .space-wrap,
+[data-theme="dark"] .about-box,
+[data-theme="dark"] .changelog-box,
+[data-theme="dark"] .online-users-box,
+[data-theme="dark"] .signin-cal-box,
+[data-theme="dark"] .browser-container,
+[data-theme="dark"] .settings-panel {
+  background-color: var(--bg-modal) !important;
+  color: var(--text-primary) !important;
+}
+[data-theme="dark"] .settings-content-scroll,
+[data-theme="dark"] .settings-content,
+[data-theme="dark"] .profile-card-body,
+[data-theme="dark"] .wallet-panel,
+[data-theme="dark"] .music-list,
+[data-theme="dark"] .about-content,
+[data-theme="dark"] .changelog-list,
+[data-theme="dark"] .ou-scroll,
+[data-theme="dark"] .dev-list,
+[data-theme="dark"] .storage-body,
+[data-theme="dark"] .moments-list {
+  background-color: var(--bg-sidebar) !important;
+}
+[data-theme="dark"] .msg.other .bubble {
+  background-color: var(--bg-msg-other) !important;
+  color: var(--text-primary) !important;
+}
+[data-theme="dark"] .msg.self .bubble {
+  background-color: var(--bg-msg-self) !important;
+  color: #eaffea !important;
+}
+[data-theme="dark"] input:not([type="range"]):not([type="checkbox"]),
+[data-theme="dark"] textarea,
+[data-theme="dark"] select {
+  background-color: var(--bg-input) !important;
+  color: var(--text-primary) !important;
+  border-color: var(--border-input) !important;
+}
+[data-theme="dark"] .setting-row,
+[data-theme="dark"] .member-item,
+[data-theme="dark"] .wallet-record,
+[data-theme="dark"] .music-item,
+[data-theme="dark"] .ou-user,
+[data-theme="dark"] .dev-card,
+[data-theme="dark"] .starred-item,
+[data-theme="dark"] .moment-item {
+  border-color: var(--border-soft) !important;
+}
+[data-theme="dark"] .settings-section .setting-row,
+[data-theme="dark"] .modal-box .modal-actions {
+  background-color: transparent !important;
+}
+[data-theme="dark"] .badge-lv,
+[data-theme="dark"] .lv-badge {
+  background-color: #ffca28;
+  color: #333;
+}
+[data-theme="dark"] .chat-header,
+[data-theme="dark"] .chat-area,
+[data-theme="dark"] .input-area,
+[data-theme="dark"] .message-list,
+[data-theme="dark"] .sidebar {
+  color: var(--text-primary);
+}
+[data-theme="dark"] .chat-header { background-color: var(--bg-sidebar) !important; }
+[data-theme="dark"] .chat-area,
+[data-theme="dark"] .message-list { background-color: var(--bg-chat) !important; }
+[data-theme="dark"] .input-area { background-color: var(--bg-app) !important; }
+[data-theme="dark"] .settings-panel .settings-sidebar {
+  background-color: var(--bg-surface-2) !important;
+  border-right-color: var(--border-soft) !important;
+}
+[data-theme="dark"] .settings-panel .settings-content-header {
+  background-color: var(--bg-surface-2) !important;
+  border-bottom-color: var(--border-soft) !important;
+}
+[data-theme="dark"] .about-hero .about-logo,
+[data-theme="dark"] .about-desc {
+  color: var(--text-primary) !important;
+}
+[data-theme="dark"] .rpg-open-btn { color: #5a2a00; }
+[data-theme="dark"] .rpg-total,
+[data-theme="dark"] .rpg-amount-num { color: #ffd700; }
+[data-theme="dark"] .toast-notification .toast-item {
+  background-color: #2c2c2e !important;
+  color: #f5f5f7 !important;
+}
+[data-theme="dark"] .emoji-picker,
+[data-theme="dark"] .quick-reply-panel,
+[data-theme="dark"] .mention-list,
+[data-theme="dark"] .reaction-picker,
+[data-theme="dark"] .msg-menu,
+[data-theme="dark"] .group-menu,
+[data-theme="dark"] .contact-menu,
+[data-theme="dark"] .header-more-menu,
+[data-theme="dark"] .chat-more-menu,
+[data-theme="dark"] .input-more-menu {
+  background-color: var(--bg-modal) !important;
+  color: var(--text-primary) !important;
+  border-color: var(--border-soft) !important;
+}
+[data-theme="dark"] .msg-menu .menu-item,
+[data-theme="dark"] .group-menu .menu-item,
+[data-theme="dark"] .contact-menu .menu-item {
+  color: var(--text-primary) !important;
+}
+[data-theme="dark"] .profile-field,
+[data-theme="dark"] .setting-group-title,
+[data-theme="dark"] .dev-meta .dm-k,
+[data-theme="dark"] .wallet-stats .ws-label {
+  color: var(--text-secondary) !important;
+}
+
+/* ★ v0.32.1：暗色模式统一覆盖，消除散落的硬编码浅色块 */
+[data-theme="dark"] .modal-box,
+[data-theme="dark"] .wallet-card,
+[data-theme="dark"] .redpacket-card,
+[data-theme="dark"] .rpg-card,
+[data-theme="dark"] .music-card,
+[data-theme="dark"] .profile-card,
+[data-theme="dark"] .app-dialog,
+[data-theme="dark"] .space-wrap,
+[data-theme="dark"] .about-box,
+[data-theme="dark"] .changelog-box,
+[data-theme="dark"] .online-users-box,
+[data-theme="dark"] .signin-cal-box,
+[data-theme="dark"] .browser-container,
+[data-theme="dark"] .settings-panel {
+  background-color: var(--bg-modal) !important;
+  color: var(--text-primary) !important;
+}
+[data-theme="dark"] .settings-content,
+[data-theme="dark"] .settings-content-scroll,
+[data-theme="dark"] .profile-card-body,
+[data-theme="dark"] .wallet-panel,
+[data-theme="dark"] .music-list,
+[data-theme="dark"] .about-content,
+[data-theme="dark"] .changelog-list,
+[data-theme="dark"] .ou-scroll,
+[data-theme="dark"] .dev-list,
+[data-theme="dark"] .storage-body {
+  background-color: var(--bg-sidebar) !important;
+}
+[data-theme="dark"] .msg.other .bubble {
+  background-color: var(--bg-msg-other) !important;
+  color: var(--text-primary) !important;
+}
+[data-theme="dark"] .msg.self .bubble {
+  background-color: var(--bg-msg-self) !important;
+  color: #eaffea !important;
+}
+[data-theme="dark"] input:not([type="range"]):not([type="checkbox"]),
+[data-theme="dark"] textarea,
+[data-theme="dark"] select {
+  background-color: var(--bg-input) !important;
+  color: var(--text-primary) !important;
+  border-color: var(--border-input) !important;
+}
+[data-theme="dark"] .chat-header { background-color: var(--bg-sidebar) !important; }
+[data-theme="dark"] .chat-area,
+[data-theme="dark"] .message-list { background-color: var(--bg-chat) !important; }
+[data-theme="dark"] .input-area { background-color: var(--bg-app) !important; }
+[data-theme="dark"] .settings-panel .settings-sidebar {
+  background-color: var(--bg-surface-2) !important;
+  border-right-color: var(--border-soft) !important;
+}
+[data-theme="dark"] .settings-panel .settings-content-header {
+  background-color: var(--bg-surface-2) !important;
+  border-bottom-color: var(--border-soft) !important;
+}
+[data-theme="dark"] .emoji-picker,
+[data-theme="dark"] .quick-reply-panel,
+[data-theme="dark"] .mention-list,
+[data-theme="dark"] .reaction-picker,
+[data-theme="dark"] .msg-menu,
+[data-theme="dark"] .group-menu,
+[data-theme="dark"] .contact-menu,
+[data-theme="dark"] .header-more-menu,
+[data-theme="dark"] .chat-more-menu,
+[data-theme="dark"] .input-more-menu {
+  background-color: var(--bg-modal) !important;
+  color: var(--text-primary) !important;
+  border-color: var(--border-soft) !important;
+}
+[data-theme="dark"] .msg-menu .menu-item,
+[data-theme="dark"] .group-menu .menu-item,
+[data-theme="dark"] .contact-menu .menu-item {
+  color: var(--text-primary) !important;
+}
+[data-theme="dark"] .setting-row,
+[data-theme="dark"] .member-item,
+[data-theme="dark"] .wallet-record,
+[data-theme="dark"] .music-item,
+[data-theme="dark"] .ou-user,
+[data-theme="dark"] .dev-card,
+[data-theme="dark"] .starred-item,
+[data-theme="dark"] .moment-item {
+  border-color: var(--border-soft) !important;
+}
+[data-theme="dark"] .toast-notification .toast-item {
+  background-color: #2c2c2e !important;
+  color: #f5f5f7 !important;
+}
+[data-theme="dark"] .lv-badge {
+  background-color: #ffca28;
+  color: #333;
+}
+/* ★ v0.32.2：用户关闭气泡阴影 */
+html.no-msg-shadow .msg .bubble { box-shadow: none !important; }
+html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
 </style>
 </head>
 <body>
@@ -25093,6 +26172,7 @@ html.is-tv .profile-card-actions button:focus-visible {
           <button id="emojiBtn" data-i18n-title="ttEmoji" title="表情">😊</button>
           <button id="redpacketBtn" data-i18n-title="ttRedpacket" title="发红包">🧧</button>
           <button id="fileBtn" data-i18n-title="ttFile" title="发送文件">📎</button>
+          <button id="locationBtn" title="共享位置" aria-label="共享位置">📍</button>
           <!-- ★ v0.27.11：移动端拍照按钮（仅移动端显示） -->
           <button id="captureBtn" title="拍照">📷</button>
           <button id="burnBtn" class="burn-btn" title="阅后即焚">🔥</button>
@@ -25329,6 +26409,11 @@ html.is-tv .profile-card-actions button:focus-visible {
 <div class="modal-overlay" id="adminModal">
   <div class="modal-box" style="width:500px;max-width:95%;">
     <h3 data-i18n="adminPanelTitle">⚙️ 管理员面板</h3>
+    <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;">
+      <button type="button" class="btn-cancel" id="adminTabUsers" style="padding:5px 14px;font-weight:600;">👥 用户</button>
+      <button type="button" class="btn-cancel" id="adminTabStats" style="padding:5px 14px;">📊 统计</button>
+    </div>
+    <div id="adminStatsPanel" style="display:none;margin-bottom:12px;"></div>
     <div id="adminUserList" style="max-height:300px;overflow-y:auto;margin-bottom:12px;"></div>
     <div class="announce-area">
       <div style="font-size:14px;color:var(--text-secondary);margin-bottom:6px;" data-i18n="globalAnnounceTitle">📢 全局公告</div>
@@ -25611,6 +26696,19 @@ html.is-tv .profile-card-actions button:focus-visible {
             <span>紧凑侧边栏 <small style="color:var(--text-muted);font-weight:normal;">（节省空间）</small></span>
             <label class="switch"><input type="checkbox" id="setCompactSidebar"><span class="slider"></span></label>
           </div>
+          <!-- ★ v0.32.3：强制切换布局模式（自动 / 强制电脑 / 强制手机） -->
+          <div class="setting-row">
+            <span>强制布局模式
+              <small style="color:var(--text-muted);font-weight:normal;">
+                （自动识别 / 强制电脑端 / 强制手机端）
+              </small>
+            </span>
+            <select id="setForceLayoutMode">
+              <option value="auto">自动识别</option>
+              <option value="pc">强制电脑模式</option>
+              <option value="mobile">强制手机模式</option>
+            </select>
+          </div>
           <div class="setting-row">
             <span>隐藏系统账号 <small style="color:var(--text-muted);font-weight:normal;">（微信团队 / 微信支付 / 系统）</small></span>
             <label class="switch"><input type="checkbox" id="setHideSystemUsers"><span class="slider"></span></label>
@@ -25821,6 +26919,56 @@ html.is-tv .profile-card-actions button:focus-visible {
               <input type="range" id="setMsgGap" min="0" max="20" step="1" value="6" style="width:120px;">
               <span id="setMsgGapVal" style="font-size:13px;color:var(--text-secondary);min-width:40px;text-align:right;">6px</span>
             </div>
+          </div>
+          <!-- ★ v0.32.2：新增 8 个显示类设置 -->
+          <div class="setting-row">
+            <span>消息字体粗细</span>
+            <select id="setMsgFontWeight">
+              <option value="400">正常</option>
+              <option value="500">中等</option>
+              <option value="600">粗体</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <span>消息头像大小</span>
+            <select id="setMsgAvatarSize">
+              <option value="28">小（28px）</option>
+              <option value="32">中（32px）</option>
+              <option value="38">标准（38px）</option>
+              <option value="44">大（44px）</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <span>消息气泡阴影</span>
+            <label class="switch"><input type="checkbox" id="setMsgBubbleShadow" checked><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <span>图片点击预览方式</span>
+            <select id="setImagePreviewMode">
+              <option value="modal">弹窗预览</option>
+              <option value="newtab">新窗口打开</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <span>视频消息默认静音</span>
+            <label class="switch"><input type="checkbox" id="setVideoMute" checked><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <span>复制消息时包含发送者</span>
+            <label class="switch"><input type="checkbox" id="setCopyWithSender" checked><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <span>会话列表时间格式</span>
+            <select id="setContactTimeFormat">
+              <option value="smart">智能（推荐）</option>
+              <option value="relative">相对时间</option>
+              <option value="absolute">绝对时间</option>
+              <option value="hidden">隐藏</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <span>输入框自动保存草稿</span>
+            <label class="switch"><input type="checkbox" id="setAutoSaveDraft" checked><span class="slider"></span></label>
           </div>
         </div>
 
@@ -26317,6 +27465,23 @@ html.is-tv .profile-card-actions button:focus-visible {
           <li>面板内提供「立即测速」「重置统计」「复制诊断信息」三个操作按钮。</li>
         </ul>
 
+        <h4>🎉 v0.32.0 新增功能</h4>
+        <ul>
+          <li><b>智能通话路由</b>：自动检测服务器外网状态。有外网时优先使用 <b>Cloudflare Calls TURN</b> 中继（穿透率最高）；无外网时无缝降级为 <b>PeerJS 局域网直连</b>，不浪费任何 ICE 候选收集时间。</li>
+          <li><b>通话仅限局域网</b>：通过 cloudflared 等隧道从外部访问时，通话会被服务端拒绝并弹出「📞 通话仅限局域网」明确提示，不再默默失败。</li>
+          <li><b>通话配置实时下发</b>：服务端外网状态变化时主动推送 <code>call-config-updated</code>，客户端无需重连即可切换通话模式。</li>
+          <li><b>服务端环境变量扩展</b>：支持 <code>CF_TURN_KEY_ID</code> + <code>CF_TURN_TOKEN</code>（Cloudflare TURN）、<code>ICE_SERVERS</code>（完整覆盖）、<code>TURN_URL</code> + <code>TURN_USER</code> + <code>TURN_PASS</code>（简易 TURN）。</li>
+        </ul>
+
+        <h4>🎉 v0.31.0 新增功能</h4>
+        <ul>
+          <li><b>群邀请验证</b>：关闭「允许直接拉我进群」后，被邀请人会收到弹窗，需主动同意才能入群。</li>
+          <li><b>独立音乐库页面 <code>/music</code></b>：浏览器直接访问可在线播放、下载全部曲库，支持动态签名防盗链与双通道（HTTPS / HTTP）。</li>
+          <li><b>个性化气泡</b>：设置面板新增「消息气泡圆角」「消息间距」两个可调项，圆角 0~24px、间距 0~20px。</li>
+          <li><b>手机端优化</b>：官网 <code>/gw</code> 与版本日志 <code>/log</code> 在窄屏下自动切换折叠菜单与原生下拉框选择器。</li>
+          <li><b>WebRTC 外网动态检测</b>：服务端每分钟探测一次外网状态，纯局域网环境自动切为 P2P 直连，杜绝「无外网却持续尝试 STUN」的无效等待。</li>
+        </ul>
+
         <h4>🎉 v0.27.0 新增功能</h4>
         <ul>
           <li><b>拍一拍</b>：双击他人消息头像，即可拍对方一下（3 秒内只能拍一次）。</li>
@@ -26386,6 +27551,14 @@ html.is-tv .profile-card-actions button:focus-visible {
           <li>再次点击 ☰ 或点面板内 <b>»</b> → 收起面板。</li>
         </ul>
 
+        <h4>📨 邀请验证</h4>
+        <ul>
+          <li>设置 →「个人」→「允许直接拉我进群」<b>关闭</b>后，别人邀请你入群时会先向你发送验证弹窗。</li>
+          <li>你可在弹窗中点击「同意」或「拒绝」。同意后自动加入群聊并广播 <code>group-joined</code>；拒绝则邀请作废，邀请人会在其会话中看到「已拒绝」提示。</li>
+          <li>同一邀请人被重复邀请时服务端会去重，避免刷屏。</li>
+          <li>群主 / 管理员可随时开启或关闭本群邀请验证（在群管理的「邀请新成员」区块中发起，实际是否走验证取决于被邀请人自身的隐私设置）。</li>
+        </ul>
+
         <h4>@ 提及</h4>
         <ul>
           <li>点击 <b>@</b> → 弹出成员列表，选择后自动插入 <code>@昵称</code>。</li>
@@ -26449,11 +27622,22 @@ html.is-tv .profile-card-actions button:focus-visible {
           <li><b>前置条件</b>：需 HTTPS 或 localhost 访问，浏览器才允许麦克风 / 摄像头权限。</li>
         </ul>
 
+        <h4>🌐 通话智能路由（v0.32.0）</h4>
+        <ul>
+          <li><b>外网在线</b>：服务端通过 <code>https://www.baidu.com</code> 每分钟探测一次外网状态。可用时优先使用 <b>Cloudflare Calls TURN</b> 中继，穿透率最高（尤其适合严苛 NAT 环境）。</li>
+          <li><b>外网离线</b>：自动切换为 <b>PeerJS 局域网直连</b>。此时 STUN 候选不再收集，避免无谓等待，通话几乎瞬间建立。</li>
+          <li><b>模式实时切换</b>：服务端外网状态翻转时会主动推送 <code>call-config-updated</code>，客户端无需重连即可在新通话中启用新策略（已在通话中的不会被打断）。</li>
+          <li><b>仅限局域网</b>：若通过 cloudflared / 公网代理访问，且客户端 <b>真实 IP 非局域网</b>（10.x / 172.16-31.x / 192.168.x / 127.x），发起或接听通话都会被服务端拒绝，并弹出「📞 通话仅限局域网」明确提示。</li>
+        </ul>
+
         <h4>🎵 音乐库</h4>
         <ul>
           <li>点击头部 <b>🎵 音乐</b> → 打开音乐库（曲库上限 200 首，单曲上限 80MB）。</li>
+          <li><b>独立页面 <code>/music</code></b>：浏览器直接访问可查看全曲库、在线播放、下载。播放统计与点赞数实时同步回应用内。</li>
           <li>支持上传（按「歌手 - 歌名.mp3」命名自动拆分歌手与歌名）、搜索、点赞、播放计数。</li>
           <li>播放控制：上一首 / 播放暂停 / 下一首 / 列表循环 / 单曲循环 / 不循环 / 随机播放 / 进度拖动 / 音量调节。</li>
+          <li><b>双通道下载</b>：HTTPS 按钮供浏览器直接下载；HTTP 按钮供 IDM / 迅雷等下载器使用（自签名证书会让下载器 SSL 握手失败，走 HTTP 即可）。</li>
+          <li><b>动态签名防盗链</b>：所有 <code>/dl-music/</code> 链接均携带 <code>uid + exp + sig</code>（HMAC-SHA256），签名有效期 24 小时，防止外链盗用。</li>
           <li>关闭音乐库后，左下角显示<b>迷你播放条</b>（歌名 + 歌手 + 进度 + 控制）；点 <b>»</b> 靠边收起为圆形按钮，点 <b>✕</b> 完全隐藏（切歌时重新弹出）。</li>
         </ul>
 
@@ -26780,6 +27964,7 @@ html.is-tv .profile-card-actions button:focus-visible {
   <div class="menu-item" data-action="pin">置顶</div>
   <div class="menu-item" data-action="speak">朗读</div>
   <div class="menu-item" data-action="copy">复制</div>
+  <div class="menu-item" data-action="report">🚨 举报</div>
 </div>
 <!-- 表情回应浮层：emoji 本身跨语言通用，不需要 i18n -->
 <div class="reaction-picker" id="reactionPicker">
@@ -26821,6 +28006,7 @@ html.is-tv .profile-card-actions button:focus-visible {
   <div class="menu-item" data-action="bg" id="contactMenuBg">🖼️ 设置聊天背景</div>
   <div class="menu-item" data-action="archive" id="contactMenuArchive">📦 归档会话</div>
   <div class="menu-item danger" data-action="block" id="contactMenuBlock">🚫 拉黑</div>
+  <div class="menu-item danger" data-action="report" id="contactMenuReport">🚨 举报用户</div>
   <div class="menu-item danger" data-action="clear" id="contactMenuClear">🗑️ 清空记录</div>
 </div>
 
@@ -27002,13 +28188,6 @@ html.is-tv .profile-card-actions button:focus-visible {
       </label>
       <input type="file" id="musicFileInput" accept="audio/*"
              class="visually-hidden-file" multiple>
-    </div>
-
-    <!-- ★ 新增：酷狗专属操作栏 (默认隐藏) -->
-    <div id="kugouBar" style="display:none; padding:0 20px 10px; gap:8px; align-items:center; flex-shrink:0;">
-      <input type="text" id="kugouSearchInput" placeholder="搜索酷狗音乐..." style="flex:1; padding:7px 14px; border-radius:20px; border:1px solid var(--border-input); background:var(--bg-input); color:var(--text-primary); font-size:13px; outline:none;">
-      <button id="kugouSearchBtn" style="padding:7px 14px; border-radius:20px; background:var(--accent); color:#fff; border:none; cursor:pointer; font-size:13px;">搜索</button>
-      <button id="kugouLoginBtn" style="padding:7px 14px; border-radius:20px; background:rgba(255,152,0,.15); color:#ff9800; border:1px solid #ff9800; cursor:pointer; font-size:13px;">登录</button>
     </div>
 
     <!-- 播放器 -->
@@ -28527,6 +29706,15 @@ var MBTI_TYPES = {
 };
 
 var state = {
+  /* ★ v0.32.2：新增消息显示类设置默认值（会被 localStorage 覆盖） */
+  imagePreviewMode: 'modal',       /* 图片预览：modal | newtab */
+  videoMute: true,                 /* 视频消息默认静音 */
+  copyWithSender: true,            /* 复制消息时带发送者 */
+  contactTimeFormat: 'smart',      /* 会话列表时间：smart | relative | absolute | hidden */
+  autoSaveDraft: true,             /* 输入自动保存草稿 */
+  msgFontWeight: 400,              /* 消息字体粗细 */
+  msgAvatarSize: 38,               /* 消息头像大小 */
+  msgBubbleShadow: true,           /* 消息气泡阴影 */
   callConfig: {
     iceServers: [],
     usePeerJS: false,
@@ -28680,6 +29868,13 @@ window.state = state;
 
 try { state.lang = localStorage.getItem('lang') || 'zh'; } catch (e) {}
 if (['zh', 'zh-TW', 'zh-wenyan', 'en'].indexOf(state.lang) === -1) state.lang = 'zh';
+
+/* ★ v0.32.3：强制布局模式（auto / pc / mobile），localStorage 持久化 */
+try {
+  var _flm = localStorage.getItem('set_forceLayoutMode') || 'auto';
+  if (['auto', 'pc', 'mobile'].indexOf(_flm) === -1) _flm = 'auto';
+  state.forceLayoutMode = _flm;
+} catch (e) { state.forceLayoutMode = 'auto'; }
 try { state.pinnedMsgs = JSON.parse(localStorage.getItem('pinned_msgs') || '{}'); } catch (e) { state.pinnedMsgs = {}; }
 if (!state.pinnedMsgs || typeof state.pinnedMsgs !== 'object') state.pinnedMsgs = {};
 try { state.mutedChats = JSON.parse(localStorage.getItem('muted_chats') || '{}'); } catch (e) { state.mutedChats = {}; }
@@ -34723,6 +35918,17 @@ function formatChatListTime(ts) {
   var dayDiff = Math.round((todayMid - thatMid) / 86400000);
   var _en = state.lang === 'en';
 
+  /* ★ v0.32.2：会话列表时间格式可自定义 */
+  var _fmt = state.contactTimeFormat || 'smart';
+  if (_fmt === 'hidden') return '';
+  if (_fmt === 'relative') {
+    try { return formatRelative(ts); } catch (e) { /* fall through */ }
+  }
+  if (_fmt === 'absolute') {
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
+      ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+
   if (dayDiff <= 0) {
     return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
   }
@@ -35329,6 +36535,9 @@ function renderOnlineUsers() {
     }
     if (isSys) sub += ' · ' + (_en ? 'Official' : '官方');
     if (isSelf) sub += ' · ' + (_en ? 'Me' : '我');
+    if (u.ipLocation && u.ipLocation.regionText) {
+      sub += ' · 📍' + u.ipLocation.regionText;
+  }
 
     var cls = 'ou-user';
     if (!u.online) cls += ' ou-offline';
@@ -35771,7 +36980,7 @@ function _updateToastBottom() {
 
   var base = 20;
 
-  if (window.innerWidth <= 768) {
+  if (!getIsPC()) {
     var tabbar = document.getElementById('mobileTabBar');
     if (tabbar) {
       var s = window.getComputedStyle(tabbar);
@@ -36551,6 +37760,12 @@ setInterval(updateClock, 1000); updateClock();
 
 function setTheme(tm, silent) {
   var root = document.documentElement;
+  try {
+    root.classList.add('theme-switching');
+    setTimeout(function () {
+      try { root.classList.remove('theme-switching'); } catch (e) {}
+    }, 420);
+  } catch (e) {}
   if (tm === 'dark') {
     root.setAttribute('data-theme', 'dark');
     dom.themeToggle.textContent = '☀️';
@@ -36864,7 +38079,7 @@ function toggleSidebar(show) {
   var opened = dom.sidebar.classList.contains('open');
   if (opened) dom.sidebarOverlay.classList.add('active');
   else dom.sidebarOverlay.classList.remove('active');
-  if (window.innerWidth <= 768) {
+  if (!getIsPC()) {
     document.body.style.overflow = opened ? 'hidden' : '';
     if (opened && typeof mobileSetPage === 'function') {
       if (!document.body.classList.contains('mobile-chat-detail')) {
@@ -37161,6 +38376,365 @@ function insertMention(text) {
   var pos = before.length + text.length + 1;
   inp.selectionStart = inp.selectionEnd = pos;
 }
+
+/* ★ v0.32.1：位置共享（支持自定义位置、历史地点、可选坐标） */
+var LOC_HISTORY_KEY = 'loc_history_v1';
+var LOC_HISTORY_MAX = 10;
+
+function _locGetHistory() {
+  try {
+    var raw = localStorage.getItem(LOC_HISTORY_KEY);
+    var arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return []; }
+}
+function _locSaveHistory(list) {
+  try { localStorage.setItem(LOC_HISTORY_KEY, JSON.stringify(list.slice(0, LOC_HISTORY_MAX))); } catch (e) {}
+}
+function _locPushHistory(item) {
+  if (!item || !item.name) return;
+  var arr = _locGetHistory();
+  arr = arr.filter(function (x) { return x.name !== item.name; });
+  arr.unshift({ name: item.name, lat: item.lat, lng: item.lng, ts: Date.now() });
+  _locSaveHistory(arr);
+}
+
+var _locPickerState = {
+  mode: 'gps',      /* 'gps' | 'manual' */
+  gps: null,        /* { lat, lng, accuracy, address } */
+  manual: { name: '', lat: '', lng: '' },
+  sending: false
+};
+
+function sendLocationMessage(lat, lng, acc, address) {
+  if (!state.socket || !state.socket.connected) {
+    showConnectionStatus('error', t('connServerLost'));
+    return;
+  }
+  var targetId = state.currentTarget, type = state.currentType;
+  if (!targetId) return;
+
+  var _addr = String(address || '').trim().slice(0, 120);
+  var _lat = (lat != null && lat !== '' && !isNaN(Number(lat))) ? Number(lat) : null;
+  var _lng = (lng != null && lng !== '' && !isNaN(Number(lng))) ? Number(lng) : null;
+  if (!_addr && _lat == null && _lng == null) {
+    showToast('请填写地点名称或坐标');
+    return;
+  }
+
+  state.isSending = true;
+  var msgId = generateMsgId();
+  var reply = state.replyContext ? {
+    msgId: state.replyContext.msgId,
+    content: '📍 ' + (_addr || '位置消息'),
+    sender: state.replyContext.sender
+  } : null;
+
+  var msg = {
+    from: state.myId, to: targetId, content: '',
+    time: getFullTime(), msgId: msgId,
+    type: 'location',
+    latitude: _lat, longitude: _lng,
+    accuracy: Number(acc) || 0,
+    address: _addr,
+    reply: reply, recalled: false, recalledBy: null,
+    status: 'sending', readUsers: [],
+    fromLevel: state.myLevel, fromVip: state.myVip, fromAdmin: state.isAdmin,
+    fromVerified: state.myVerified || '',
+    fromAvatar: (state.myProfile && state.myProfile.avatar) || ''
+  };
+  addMessage(targetId, msg, type);
+
+  var payload = {
+    content: '', msgId: msgId, type: 'location',
+    latitude: _lat, longitude: _lng,
+    accuracy: Number(acc) || 0,
+    address: _addr,
+    reply: reply
+  };
+  if (type === 'private') {
+    payload.to = targetId;
+    state.socket.emit('private-message', payload);
+  } else {
+    payload.groupId = targetId;
+    state.socket.emit('group-message', payload);
+  }
+  clearDraftForCurrent();
+  clearReplyContext();
+  markMessageSent(targetId, type, msgId);
+  setTimeout(function () { state.isSending = false; }, 400);
+
+  _locPushHistory({ name: _addr, lat: _lat, lng: _lng });
+}
+
+(function initLocationShare() {
+  var btn = document.getElementById('locationBtn');
+  if (!btn) return;
+
+  /* 动态创建位置选择面板（一次性） */
+  var overlay = null;
+  function _ensureOverlay() {
+    if (overlay) return overlay;
+    overlay = document.createElement('div');
+    overlay.id = 'locPickerOverlay';
+    overlay.style.cssText =
+      'position:fixed;inset:0;z-index:100025;display:none;' +
+      'align-items:center;justify-content:center;padding:20px;' +
+      'background:rgba(0,0,0,.5);-webkit-backdrop-filter:blur(6px);' +
+      'backdrop-filter:blur(6px);';
+    overlay.innerHTML =
+      '<div id="locPickerCard" style="background:var(--bg-modal);' +
+        'color:var(--text-primary);border-radius:18px;width:420px;max-width:96vw;' +
+        'max-height:90vh;overflow:auto;padding:22px 24px 18px;' +
+        'box-shadow:0 24px 80px rgba(0,0,0,.32);font-family:inherit;">' +
+        '<h3 style="font-size:17px;margin-bottom:14px;font-weight:700;">📍 共享位置</h3>' +
+        '<div style="display:flex;gap:6px;margin-bottom:14px;">' +
+          '<button type="button" data-loc-tab="gps" ' +
+            'style="flex:1;padding:8px;border:none;border-radius:10px;' +
+            'background:var(--bg-btn-primary);color:#fff;font-size:13.5px;' +
+            'font-weight:600;cursor:pointer;font-family:inherit;">📡 使用当前位置</button>' +
+          '<button type="button" data-loc-tab="manual" ' +
+            'style="flex:1;padding:8px;border:1px solid var(--border-input);' +
+            'border-radius:10px;background:transparent;color:var(--text-secondary);' +
+            'font-size:13.5px;font-weight:600;cursor:pointer;font-family:inherit;">✏️ 手动输入</button>' +
+        '</div>' +
+        '<div data-loc-body="gps">' +
+          '<div style="font-size:12.5px;color:var(--text-muted);line-height:1.6;' +
+            'margin-bottom:12px;">点击下方按钮获取 GPS，成功后可选填地点名。</div>' +
+          '<button type="button" id="locGpsBtn" ' +
+            'style="width:100%;padding:10px;border:none;border-radius:12px;' +
+            'background:linear-gradient(135deg,#07c160,#06ad56);color:#fff;' +
+            'font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;">📡 获取当前位置</button>' +
+          '<div id="locGpsResult" style="display:none;margin-top:12px;' +
+            'padding:10px 12px;background:rgba(7,193,96,.08);border-radius:10px;' +
+            'font-size:13px;line-height:1.6;word-break:break-all;"></div>' +
+          '<div style="margin-top:12px;">' +
+            '<label style="font-size:12.5px;color:var(--text-secondary);display:block;margin-bottom:4px;">' +
+            '地点名称（可选）</label>' +
+            '<input type="text" id="locGpsName" maxlength="60" placeholder="如：公司会议室 A" ' +
+              'style="width:100%;padding:8px 12px;border:1px solid var(--border-input);' +
+              'border-radius:10px;background:var(--bg-input);color:var(--text-primary);' +
+              'font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;">' +
+          '</div>' +
+        '</div>' +
+        '<div data-loc-body="manual" style="display:none;">' +
+          '<label style="font-size:12.5px;color:var(--text-secondary);display:block;' +
+            'margin-bottom:4px;">地点名称 <span style="color:#fa5151;">*</span></label>' +
+          '<input type="text" id="locManualName" maxlength="60" ' +
+            'placeholder="如：家 / 星巴克 / 公司" ' +
+            'style="width:100%;padding:8px 12px;border:1px solid var(--border-input);' +
+            'border-radius:10px;background:var(--bg-input);color:var(--text-primary);' +
+            'font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;">' +
+          '<div style="display:flex;gap:8px;margin-top:10px;">' +
+            '<div style="flex:1;">' +
+              '<label style="font-size:12.5px;color:var(--text-secondary);display:block;' +
+                'margin-bottom:4px;">纬度（可选）</label>' +
+              '<input type="text" id="locManualLat" placeholder="如 39.9042" ' +
+                'style="width:100%;padding:8px 12px;border:1px solid var(--border-input);' +
+                'border-radius:10px;background:var(--bg-input);color:var(--text-primary);' +
+                'font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;">' +
+            '</div>' +
+            '<div style="flex:1;">' +
+              '<label style="font-size:12.5px;color:var(--text-secondary);display:block;' +
+                'margin-bottom:4px;">经度（可选）</label>' +
+              '<input type="text" id="locManualLng" placeholder="如 116.4074" ' +
+                'style="width:100%;padding:8px 12px;border:1px solid var(--border-input);' +
+                'border-radius:10px;background:var(--bg-input);color:var(--text-primary);' +
+                'font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;">' +
+            '</div>' +
+          '</div>' +
+          '<div style="font-size:12px;color:var(--text-muted);margin-top:8px;line-height:1.55;">' +
+            '💡 不填经纬度也可发送，接收方点卡片时会按地点名搜索。' +
+          '</div>' +
+        '</div>' +
+        '<div id="locHistory" style="display:none;margin-top:14px;"></div>' +
+        '<div style="display:flex;gap:8px;margin-top:18px;">' +
+          '<button type="button" id="locPickerCancel" ' +
+            'style="flex:1;padding:9px;border:none;border-radius:20px;' +
+            'background:var(--border-input);color:var(--text-primary);font-size:14px;' +
+            'font-weight:500;cursor:pointer;font-family:inherit;">取消</button>' +
+          '<button type="button" id="locPickerSend" ' +
+            'style="flex:1;padding:9px;border:none;border-radius:20px;' +
+            'background:linear-gradient(135deg,#07c160,#06ad56);color:#fff;font-size:14px;' +
+            'font-weight:600;cursor:pointer;font-family:inherit;">发送位置</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(overlay);
+    return overlay;
+  }
+
+  function _tabBtns() {
+    return overlay.querySelectorAll('[data-loc-tab]');
+  }
+  function _tabBodies() {
+    return overlay.querySelectorAll('[data-loc-body]');
+  }
+
+  function _setMode(mode) {
+    _locPickerState.mode = mode;
+    var btns = _tabBtns();
+    for (var i = 0; i < btns.length; i++) {
+      var isActive = btns[i].getAttribute('data-loc-tab') === mode;
+      btns[i].style.background = isActive
+        ? 'var(--bg-btn-primary)' : 'transparent';
+      btns[i].style.color = isActive ? '#fff' : 'var(--text-secondary)';
+      btns[i].style.border = isActive ? 'none' : '1px solid var(--border-input)';
+    }
+    var bodies = _tabBodies();
+    for (var j = 0; j < bodies.length; j++) {
+      bodies[j].style.display =
+        (bodies[j].getAttribute('data-loc-body') === mode) ? '' : 'none';
+    }
+  }
+
+  function _renderHistory() {
+    var box = overlay.querySelector('#locHistory');
+    if (!box) return;
+    var arr = _locGetHistory();
+    if (!arr.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+    var html = '<div style="font-size:12px;color:var(--text-muted);' +
+      'margin-bottom:6px;font-weight:600;letter-spacing:.3px;">🕒 最近使用</div>';
+    for (var i = 0; i < arr.length; i++) {
+      var h = arr[i];
+      var coord = (h.lat != null && h.lng != null)
+        ? (Number(h.lat).toFixed(4) + ', ' + Number(h.lng).toFixed(4))
+        : '自定义';
+      html += '<div data-loc-hist="' + i + '" ' +
+        'style="padding:7px 10px;border-radius:8px;font-size:13px;' +
+        'cursor:pointer;display:flex;justify-content:space-between;gap:10px;' +
+        'color:var(--text-primary);transition:background .12s;">' +
+        '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+        'white-space:nowrap;">📍 ' + escapeHtml(h.name) + '</span>' +
+        '<span style="color:var(--text-muted);font-size:11.5px;' +
+        'flex-shrink:0;font-variant-numeric:tabular-nums;">' + escapeHtml(coord) + '</span>' +
+        '</div>';
+    }
+    box.innerHTML = html;
+    box.style.display = '';
+    var items = box.querySelectorAll('[data-loc-hist]');
+    for (var k = 0; k < items.length; k++) {
+      (function (el) {
+        el.addEventListener('mouseenter', function () { el.style.background = 'rgba(7,193,96,.1)'; });
+        el.addEventListener('mouseleave', function () { el.style.background = ''; });
+        el.addEventListener('click', function () {
+          var idx = parseInt(el.getAttribute('data-loc-hist'), 10);
+          var h = arr[idx];
+          if (!h) return;
+          _setMode('manual');
+          overlay.querySelector('#locManualName').value = h.name || '';
+          overlay.querySelector('#locManualLat').value =
+            (h.lat != null) ? String(h.lat) : '';
+          overlay.querySelector('#locManualLng').value =
+            (h.lng != null) ? String(h.lng) : '';
+        });
+      })(items[k]);
+    }
+  }
+
+  function _openPicker() {
+    if (state.isSending) { showToast(t('toastSending')); return; }
+    if (!state.currentTarget) { showToast(t('toastPickContact')); return; }
+    _ensureOverlay();
+    _locPickerState.gps = null;
+    _locPickerState.manual = { name: '', lat: '', lng: '' };
+
+    overlay.querySelector('#locGpsResult').style.display = 'none';
+    overlay.querySelector('#locGpsName').value = '';
+    overlay.querySelector('#locManualName').value = '';
+    overlay.querySelector('#locManualLat').value = '';
+    overlay.querySelector('#locManualLng').value = '';
+
+    _setMode('gps');
+    _renderHistory();
+    overlay.style.display = 'flex';
+  }
+
+  function _closePicker() {
+    if (overlay) overlay.style.display = 'none';
+  }
+
+  function _gpsFetch() {
+    if (!navigator.geolocation) { showToast('当前浏览器不支持定位'); return; }
+    var gpsBtn = overlay.querySelector('#locGpsBtn');
+    gpsBtn.disabled = true;
+    gpsBtn.textContent = '⏳ 定位中…';
+    navigator.geolocation.getCurrentPosition(function (pos) {
+      gpsBtn.disabled = false;
+      gpsBtn.textContent = '📡 重新获取位置';
+      var lat = pos.coords.latitude;
+      var lng = pos.coords.longitude;
+      var acc = Math.round(pos.coords.accuracy || 0);
+      _locPickerState.gps = { lat: lat, lng: lng, accuracy: acc };
+      var res = overlay.querySelector('#locGpsResult');
+      res.innerHTML =
+        '<div>✅ 定位成功</div>' +
+        '<div style="margin-top:4px;font-family:Consolas,monospace;font-size:12px;' +
+        'color:var(--text-secondary);">' +
+        lat.toFixed(6) + ', ' + lng.toFixed(6) +
+        (acc > 0 ? ' · ±' + acc + 'm' : '') +
+        '</div>';
+      res.style.display = '';
+    }, function (err) {
+      gpsBtn.disabled = false;
+      gpsBtn.textContent = '📡 重试获取位置';
+      var msg = '❌ 定位失败';
+      if (err && err.code === 1) msg = '定位权限被拒绝，请到浏览器设置中允许，或改用手动输入';
+      else if (err && err.code === 2) msg = '无法获取位置，请改用手动输入';
+      else if (err && err.code === 3) msg = '定位超时，请重试或改用手动输入';
+      showToast(msg);
+    }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
+  }
+
+  function _doSend() {
+    if (_locPickerState.sending) return;
+    if (_locPickerState.mode === 'gps') {
+      if (!_locPickerState.gps) { showToast('请先点击「获取当前位置」'); return; }
+      var name = String(overlay.querySelector('#locGpsName').value || '').trim();
+      _locPickerState.sending = true;
+      sendLocationMessage(
+        _locPickerState.gps.lat,
+        _locPickerState.gps.lng,
+        _locPickerState.gps.accuracy,
+        name || '我的位置'
+      );
+      setTimeout(function () { _locPickerState.sending = false; _closePicker(); }, 300);
+    } else {
+      var mName = String(overlay.querySelector('#locManualName').value || '').trim();
+      var mLat = String(overlay.querySelector('#locManualLat').value || '').trim();
+      var mLng = String(overlay.querySelector('#locManualLng').value || '').trim();
+      if (!mName) { showToast('请填写地点名称'); return; }
+      var nLat = mLat ? Number(mLat) : null;
+      var nLng = mLng ? Number(mLng) : null;
+      if (mLat && (isNaN(nLat) || nLat < -90 || nLat > 90)) { showToast('纬度无效（-90 ~ 90）'); return; }
+      if (mLng && (isNaN(nLng) || nLng < -180 || nLng > 180)) { showToast('经度无效（-180 ~ 180）'); return; }
+      if ((nLat != null) !== (nLng != null)) {
+        showToast('纬度与经度需同时填写或同时留空'); return;
+      }
+      _locPickerState.sending = true;
+      sendLocationMessage(nLat, nLng, 0, mName);
+      setTimeout(function () { _locPickerState.sending = false; _closePicker(); }, 300);
+    }
+  }
+
+  btn.addEventListener('click', _openPicker);
+
+  document.addEventListener('click', function (e) {
+    if (!overlay || overlay.style.display === 'none') return;
+    var el = e.target;
+    /* 点遮罩关闭 */
+    if (el === overlay) { _closePicker(); return; }
+    if (!el || !el.getAttribute) return;
+    /* Tab 切换 */
+    var tab = el.getAttribute('data-loc-tab');
+    if (tab) { _setMode(tab); return; }
+    /* 按钮 */
+    if (el.id === 'locPickerCancel') { _closePicker(); return; }
+    if (el.id === 'locPickerSend') { _doSend(); return; }
+    if (el.id === 'locGpsBtn') { _gpsFetch(); return; }
+  });
+
+  window.__sendLocationMessage = sendLocationMessage;
+})();
 
 dom.fileBtn.addEventListener('click', function () {
   if (state.isSending) { showToast(t('toastSending')); return; }
@@ -37948,9 +39522,19 @@ function renderProfileCard(userId) {
     (u.vip ? '<span style="font-size:12px;">👑</span>' : '') +
     (u.isAdmin ? '<span style="font-size:11px;background:#1e90ff;color:#fff;padding:1px 7px;border-radius:8px;">' + escapeHtml(t('tagAdminShort')) + '</span>' : '') +
     '</div>';
+
+  var _geoText = '';
+  try {
+    var _geo = u.ipLocation || (isSelf && state.myIpLocation) || null;
+    if (_geo && _geo.regionText) _geoText = _geo.regionText;
+  } catch (e) {}
+
   html += '<div class="profile-card-sub">' +
     '<span>LV' + (u.level || 0) + '</span>' +
     '<span>' + (u.online ? t('online') : t('offline')) + '</span>' +
+    (_geoText
+      ? '<span style="opacity:.85;">📍' + escapeHtml(_geoText) + '</span>'
+      : '') +
     '</div>';
 
   if (prof.mood) {
@@ -39261,13 +40845,16 @@ function clearReplyContext() {
 }
 dom.replyHint.addEventListener('click', clearReplyContext);
 
-dom.msgInput.addEventListener('input', saveDraftDebounced);
+dom.msgInput.addEventListener('input', function () {
+  /* ★ v0.32.2：用户可关闭自动保存草稿 */
+  if (state.autoSaveDraft !== false) saveDraftDebounced();
+});
 
 (function initMobileKeyboardAdapt() {
   if (!dom.msgInput) return;
 
   dom.msgInput.addEventListener('focus', function() {
-    if (window.innerWidth <= 768) {
+    if (!getIsPC()) {
       document.body.classList.add('keyboard-open');
       setTimeout(function() {
         if (dom.messageList) {
@@ -39474,6 +41061,15 @@ function showMsgMenu(x, y, msgId, from) {
     }
   }
 
+  var _reportItem = menu.querySelector('.menu-item[data-action="report"]');
+  if (_reportItem) {
+    if (msg.from !== state.myId && !isSystemUserId(msg.from)) {
+      _reportItem.style.display = 'block';
+    } else {
+      _reportItem.style.display = 'none';
+    }
+  }
+
   positionMenuInViewport(menu, x, y);
   menu.dataset.msgid = msgId;
   menu.dataset.from = from;
@@ -39541,6 +41137,9 @@ document.addEventListener('click', function (e) {
         } else { fallbackCopy(url); }
       }
     }
+    else if (action === 'report') {
+      handleReport(msgId);
+    }
   });
 })();
 function findMessageById(msgId) {
@@ -39596,6 +41195,12 @@ function handleDelete(msgId) {
     var arr = state.messages[k];
     for (var i = 0; i < arr.length; i++) {
       if (arr[i].msgId === msgId) {
+        /* ★ v0.32.0：同步清理 burn 索引与定时器，避免内存泄漏 */
+        if (typeof _burnIndexDel === 'function') _burnIndexDel(msgId);
+        if (typeof burnTimers !== 'undefined' && burnTimers[msgId]) {
+          try { clearTimeout(burnTimers[msgId]); } catch (e) {}
+          delete burnTimers[msgId];
+        }
         arr.splice(i, 1);
         if (state.currentTarget === k && state.currentType === 'private') renderMessages();
         renderContacts();
@@ -39815,6 +41420,16 @@ function handleCopy(msgId) {
   var msg = findMessageById(msgId);
   if (!msg) return;
   var text = msgPreviewText(msg, 99999);
+  /* ★ v0.32.2：复制时可选是否带发送者 */
+  if (state.copyWithSender !== false &&
+      msg.from !== 'SYSTEM' && msg.from !== 'system' &&
+      !isSystemUserId(msg.from)) {
+    var _sender = (msg.from === state.myId)
+      ? state.myName
+      : ((state.users[msg.from] && state.users[msg.from].name) ||
+         msg.fromName || msg.from);
+    text = '[' + _sender + '] ' + text;
+  }
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(function () {
       showToast(t('toastCopied'));
@@ -39823,6 +41438,84 @@ function handleCopy(msgId) {
     fallbackCopy(text);
   }
 }
+function handleReport(msgId) {
+  var msg = findMessageById(msgId);
+  if (!msg) return;
+  if (msg.from === state.myId) { showToast('不能举报自己的消息'); return; }
+  if (isSystemUserId(msg.from)) { showToast('系统账号不可举报'); return; }
+  showReportDialog(msg.from, 'message', msgId, msgPreviewText(msg, 200));
+}
+
+function showReportDialog(targetUserId, targetType, msgId, msgContent) {
+  var targetUser = state.users[targetUserId];
+  var targetName = targetUser ? targetUser.name : targetUserId;
+  var reasons = [
+    '垃圾信息 / 广告',
+    '辱骂 / 人身攻击',
+    '色情 / 低俗内容',
+    '违法违规内容',
+    '诈骗 / 虚假信息',
+    '侵犯隐私',
+    '其他'
+  ];
+
+  var html = '<div style="padding:2px 0;">';
+  html += '<div style="font-size:13px;color:var(--text-muted);margin-bottom:10px;">';
+  html += '举报对象：<b style="color:var(--text-primary);">' +
+    escapeHtml(targetName) + '</b></div>';
+
+  if (msgContent) {
+    html += '<div style="font-size:12px;color:var(--text-muted);' +
+      'margin-bottom:14px;padding:8px 12px;' +
+      'background:rgba(0,0,0,.03);border-radius:8px;' +
+      'max-height:80px;overflow:hidden;word-break:break-word;' +
+      'line-height:1.5;">' + escapeHtml(msgContent) + '</div>';
+  }
+
+  html += '<div style="font-size:13px;color:var(--text-secondary);' +
+    'margin-bottom:8px;">请选择举报理由：</div>';
+  html += '<div id="reportReasons" style="display:flex;flex-direction:column;gap:6px;">';
+  for (var i = 0; i < reasons.length; i++) {
+    html += '<label style="display:flex;align-items:center;gap:8px;' +
+      'padding:8px 12px;border-radius:8px;background:rgba(0,0,0,.03);' +
+      'cursor:pointer;font-size:14px;">' +
+      '<input type="radio" name="reportReason" value="' +
+      escapeHtml(reasons[i]) + '"' + (i === 0 ? ' checked' : '') + '>' +
+      '<span>' + escapeHtml(reasons[i]) + '</span></label>';
+  }
+  html += '</div>';
+
+  html += '<div style="font-size:13px;color:var(--text-secondary);' +
+    'margin:12px 0 6px;">补充说明（可选）：</div>';
+  html += '<textarea id="reportDetail" maxlength="500" ' +
+    'placeholder="请详细描述举报原因..." ' +
+    'style="width:100%;min-height:70px;padding:8px 12px;' +
+    'border:1px solid var(--border-input);border-radius:10px;' +
+    'background:var(--bg-input);color:var(--text-primary);' +
+    'font-family:inherit;font-size:13px;outline:none;' +
+    'resize:vertical;box-sizing:border-box;"></textarea>';
+  html += '</div>';
+
+  showModal('🚨 举报', html, function () {
+    var sel = document.querySelector('input[name="reportReason"]:checked');
+    var reason = sel ? sel.value : '';
+    var detailEl = document.getElementById('reportDetail');
+    var detail = detailEl ? detailEl.value.trim() : '';
+    if (!reason) { showToast('请选择举报理由'); return; }
+    if (!state.socket || !state.socket.connected) {
+      showToast('网络未连接'); return;
+    }
+    state.socket.emit('report-submit', {
+      targetUserId: targetUserId,
+      targetType: targetType,
+      msgId: msgId || '',
+      msgContent: msgContent || '',
+      reason: reason,
+      detail: detail
+    });
+  }, { width: '440px', confirmText: '提交举报' });
+}
+
 function fallbackCopy(text) {
   try {
     var ta = document.createElement('textarea');
@@ -39895,11 +41588,21 @@ dom.groupMenuLeave.addEventListener('click', function () {
   });
 })();
 
+/* ★ v0.32.0：renderContacts 加 80ms 去抖，把连续多次调用合并为一次渲染 */
+var _renderContactsTimer = null;
 function renderContacts() {
+  if (_renderContactsTimer) clearTimeout(_renderContactsTimer);
+  _renderContactsTimer = setTimeout(function () {
+    _renderContactsTimer = null;
+    _renderContactsNow();
+  }, 80);
+}
+function _renderContactsNow() {
   var privHtml = '';
   var ids = [];
   var k;
-  var _isMobileView = window.innerWidth <= 768;
+  /* ★ v0.32.0 修复：判据统一为 !getIsPC()，避免 960×540 等尺寸下渲染样式与 CSS 不一致 */
+  var _isMobileView = !getIsPC();
   for (k in state.users) {
     if (!state.users.hasOwnProperty(k)) continue;
     if (k === state.myId) continue;
@@ -40285,7 +41988,7 @@ function renderContacts() {
         var exists = (tp === 'private') ? state.users[id] : state.groups[id];
         if (!exists) return;
 
-        var isMobile = window.innerWidth <= 768;
+        var isMobile = !getIsPC();
         var isSelected = (state.currentTarget === id && state.currentType === tp);
 
         if (!isMobile) {
@@ -40356,15 +42059,27 @@ function selectContact(id, type) {
   if (state.currentTarget && dom.msgInput && !dom.msgInput.disabled) saveDraftNow();
 
   try {
-    var _pt = state.currentTarget, _pty = state.currentType;
-    if (_pt && _pty === 'private' && state.messages[_pt]) {
-      _trimClientHistory(state.messages[_pt]);
+    /* ★ v0.32.1：只裁剪"其它"会话，避免当前目标会话刚加载的更早消息被误裁
+       阈值放大到 2× CLIENT_MAX_HISTORY，兼顾内存与"加载更早"体验 */
+    var _trimThreshold = CLIENT_MAX_HISTORY * 2;
+    var _mk;
+    for (_mk in state.messages) {
+      if (!state.messages.hasOwnProperty(_mk)) continue;
+      if (_mk === id && type === 'private') continue;  /* 跳过本次要打开的私聊 */
+      var _arr2 = state.messages[_mk];
+      if (Array.isArray(_arr2) && _arr2.length > _trimThreshold) {
+        _trimClientHistory(_arr2);
+      }
     }
-    if (_pt && _pty === 'group' && state.groups[_pt] &&
-        Array.isArray(state.groups[_pt].messages)) {
-      _trimClientHistory(state.groups[_pt].messages);
+    for (_mk in state.groups) {
+      if (!state.groups.hasOwnProperty(_mk)) continue;
+      if (_mk === id && type === 'group') continue;    /* 跳过本次要打开的群聊 */
+      var _g2 = state.groups[_mk];
+      if (_g2 && Array.isArray(_g2.messages) && _g2.messages.length > _trimThreshold) {
+        _trimClientHistory(_g2.messages);
+      }
     }
-  } catch (eTrim) {}
+  } catch (eTrim) { console.warn('[selectContact] trim 失败:', eTrim && eTrim.message); }
   if (typeof stopTypingNow === 'function') stopTypingNow();
   if (state.bulkMode && typeof exitBulkMode === 'function') exitBulkMode();
   if (typeof clearSearch === 'function') clearSearch();
@@ -40667,6 +42382,109 @@ function applyReadonlyUI() {
   }
 }
 
+var _RESTRICT_LABELS = {
+  message: '发消息', file: '发文件', voice: '发语音',
+  redpacket: '发红包/转账', call: '发起通话', moment: '发动态',
+  groupCreate: '创建群聊', profile: '修改资料'
+};
+
+function _restrictionOf(action) {
+  try {
+    var r = state.myRestrictions && state.myRestrictions[action];
+    if (!r) return null;
+    if (r.allow !== false) return null;
+    if (r.until > 0 && r.until <= Date.now()) return null;
+    return r;
+  } catch (e) { return null; }
+}
+
+/* 按钮与动作的映射（可多处同名 ID 自动跳过不存在的） */
+var _RESTRICT_BUTTON_MAP = {
+  file:        ['fileBtn', 'captureBtn'],
+  voice:       ['voiceBtn'],
+  redpacket:   ['redpacketBtn'],
+  call:        ['voiceCallBtn', 'videoCallBtn', 'groupCallBtn'],
+  moment:      ['momentPostBtn'],
+  groupCreate: ['createGroupBtn', 'sidebarNewGroupBtn'],
+  profile:     ['profileEditBtn', 'editAvatarBtn', 'chatTitleEditBtn']
+};
+
+function _applyRestrictionToInput() {
+  /* —— 发消息 —— */
+  try {
+    var m = _restrictionOf('message');
+    if (m && dom.msgInput) {
+      dom.msgInput.disabled = true;
+      dom.msgInput.setAttribute('data-restrict-saved', '1');
+      dom.msgInput.placeholder =
+        '🔒 你的「发消息」功能已被限制' +
+        (m.reason ? '（' + m.reason + '）' : '');
+      if (dom.sendBtn) dom.sendBtn.disabled = true;
+    } else if (dom.msgInput && dom.msgInput.getAttribute('data-restrict-saved')) {
+      dom.msgInput.removeAttribute('data-restrict-saved');
+      dom.msgInput.disabled = false;
+      dom.msgInput.placeholder = t('msgPlaceholder');
+      if (dom.sendBtn && state.currentTarget) dom.sendBtn.disabled = false;
+    }
+  } catch (e) {}
+
+  /* —— 其他动作按钮：置灰 + 打标记 + 全局捕获拦截 —— */
+  for (var act in _RESTRICT_BUTTON_MAP) {
+    if (!_RESTRICT_BUTTON_MAP.hasOwnProperty(act)) continue;
+    var blocked = _restrictionOf(act);
+    var ids = _RESTRICT_BUTTON_MAP[act];
+    for (var i = 0; i < ids.length; i++) {
+      var btn = document.getElementById(ids[i]);
+      if (!btn) continue;
+      if (blocked) {
+        btn.disabled = true;
+        btn.setAttribute('data-restricted', act);
+        btn.title = '🔒 你的「' + (_RESTRICT_LABELS[act] || act) +
+          '」功能已被限制' + (blocked.reason ? '（' + blocked.reason + '）' : '');
+      } else if (btn.getAttribute('data-restricted') === act) {
+        btn.disabled = false;
+        btn.removeAttribute('data-restricted');
+        btn.title = '';
+      }
+    }
+  }
+}
+
+/* 全局捕获：拦截被限制按钮的点击（避免绕过 disabled） */
+(function _bindRestrictionClickGuard() {
+  if (window.__restrictClickBound) return;
+  window.__restrictClickBound = true;
+  document.addEventListener('click', function (e) {
+    var el = e.target;
+    if (!el || !el.closest) return;
+    var hit = el.closest('[data-restricted]');
+    if (!hit) return;
+    var act = hit.getAttribute('data-restricted');
+    if (!act) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+    var r = _restrictionOf(act);
+    showToast('🔒 你的「' + (_RESTRICT_LABELS[act] || act) +
+      '」功能已被限制' + (r && r.reason ? '（' + r.reason + '）' : ''));
+  }, true);
+})();
+
+/* 每 2 秒轻量刷新一次，覆盖动态弹出的模态框（群管理、空间、红包等） */
+setInterval(function () {
+  try {
+    if (!state.isLoggedIn || !state.myRestrictions) return;
+    var hasAny = false;
+    for (var k in state.myRestrictions) {
+      if (state.myRestrictions[k] && state.myRestrictions[k].allow === false) {
+        hasAny = true; break;
+      }
+    }
+    if (!hasAny) return;
+    _applyRestrictionToInput();
+  } catch (e) {}
+}, 2000);
+
 function clearSelection() {
   if (dom.msgInput && !dom.msgInput.disabled) saveDraftNow();
   state.currentTarget = null;
@@ -40710,7 +42528,21 @@ function renderPlaceholder() {
   dom.scrollBottomBtn.classList.remove('visible');
 }
 
-function renderMessages() {
+/* ★ v0.32.0：renderMessages 去抖，连续调用合并为一次 */
+var _renderMessagesTimer = null;
+function renderMessages(immediate) {
+  if (immediate === true) {
+    if (_renderMessagesTimer) { clearTimeout(_renderMessagesTimer); _renderMessagesTimer = null; }
+    _renderMessagesNow();
+    return;
+  }
+  if (_renderMessagesTimer) clearTimeout(_renderMessagesTimer);
+  _renderMessagesTimer = setTimeout(function () {
+    _renderMessagesTimer = null;
+    _renderMessagesNow();
+  }, 120);
+}
+function _renderMessagesNow() {
   var id = state.currentTarget, type = state.currentType;
   if (!id) { renderPlaceholder(); return; }
   var msgs = [];
@@ -40774,6 +42606,7 @@ function renderMessages() {
     recalledBuf = [];
   }
   if (!state.redPacketPending) state.redPacketPending = {};
+  /* 修复：加载更早消息后必须渲染已加载数据，不能再只渲染最后 200 条 */
   for (var i = 0; i < msgs.length; i++) {
     var msg = msgs[i];
     var _ts = parseMsgTime(msg);
@@ -40971,15 +42804,71 @@ function renderMessages() {
         '<span class="reply-sender">' + escapeHtml(msg.reply.sender || '') + '</span>: ' +
         escapeHtml(msg.reply.content || '') + '</div>';
     }
-    if (msg.type === 'sticker') {
+    if (msg.type === 'location') {
+      var _rawLat = msg.latitude;
+      var _rawLng = msg.longitude;
+      var _hasCoord = (_rawLat != null && _rawLng != null &&
+                       _rawLat !== '' && _rawLng !== '' &&
+                       !isNaN(Number(_rawLat)) && !isNaN(Number(_rawLng)));
+      var _lat = _hasCoord ? Number(_rawLat) : null;
+      var _lng = _hasCoord ? Number(_rawLng) : null;
+      var _addr = String(msg.address || '').trim();
+      var _acc = Number(msg.accuracy) || 0;
+      var _gmaps;
+      if (_hasCoord) {
+        _gmaps = 'https://uri.amap.com/marker?position=' + _lng + ',' + _lat +
+          (state.lang === 'en' ? '&name=Location' : '&name=' +
+            encodeURIComponent(_addr || '位置')) + '&callnative=0';
+      } else {
+        /* 无坐标 → 按地点名搜索 */
+        _gmaps = 'https://uri.amap.com/search?keyword=' +
+          encodeURIComponent(_addr || '位置') + '&callnative=0';
+      }
+      var _locTitle = _addr || (state.lang === 'en' ? 'Location' : '位置共享');
+      var _locMeta;
+      if (_hasCoord) {
+        _locMeta = _lat.toFixed(6) + ', ' + _lng.toFixed(6) +
+          (_acc > 0 ? ' · ±' + _acc + 'm' : '');
+      } else {
+        _locMeta = (state.lang === 'en' ? 'Custom location (tap to search)' : '自定义位置（点击地图搜索）');
+      }
+      content += '<div class="location-card" data-lat="' + (_lat == null ? '' : _lat) +
+        '" data-lng="' + (_lng == null ? '' : _lng) + '" data-gmaps="' + escapeHtml(_gmaps) + '">' +
+        '<div class="loc-pin">📍</div>' +
+        '<div class="loc-body">' +
+          '<div class="loc-title">' + escapeHtml(_locTitle) + '</div>' +
+          '<div class="loc-meta">' + escapeHtml(_locMeta) + '</div>' +
+        '</div>' +
+        '<div class="loc-open">↗</div>' +
+      '</div>';
+    } else if (msg.type === 'sticker') {
       content += '<img src="' + escapeHtml(msg.fileData) + '" class="sticker-preview" alt="' +
         escapeHtml(t('tagSticker')) + '">';
     } else if (msg.type === 'redpacket') {
       var pid = msg.packetId || '';
       if (pid && pid.indexOf('local_') !== 0) {
         if (!state.redPacketCache[pid] && !state.redPacketPending[pid]) {
-          state.redPacketPending[pid] = true;
-          _rpToFetch.push(pid);
+          /* ★ v0.32.x：超过 24 小时的旧红包必然已过期，直接本地标记缺失，
+             避免加载历史消息时向服务端批量请求大量已失效红包。 */
+          var _rpAge = Date.now() - parseMsgTime(msg);
+          if (_rpAge > 24 * 3600 * 1000) {
+            state.redPacketCache[pid] = {
+              status: {
+                packetId: pid,
+                claimedCount: 0,
+                totalCount: msg.packetCount || 1,
+                claimedTotal: 0,
+                totalAmount: 0,
+                finished: true,
+                expired: true,
+                missing: true,
+                grabbers: []
+              }
+            };
+          } else {
+            state.redPacketPending[pid] = true;
+            _rpToFetch.push(pid);
+          }
         }
       }
       var rpc = state.redPacketCache[pid] || {};
@@ -41053,7 +42942,9 @@ function renderMessages() {
         content += '<img src="' + escapeHtml(msg.fileData) + '" class="image-preview" data-src="' + escapeHtml(msg.fileData) +
           '" loading="lazy" alt="' + escapeHtml(t('imagePreviewAlt')) + '">';
       } else if (ft.indexOf('video/') === 0) {
-        content += '<video src="' + escapeHtml(msg.fileData) + '" controls class="video-preview" preload="none" playsinline></video>' +
+        var _videoMute = (state.videoMute !== false) ? ' muted' : '';
+        content += '<video src="' + escapeHtml(msg.fileData) + '" controls' +
+          _videoMute + ' class="video-preview" preload="none" playsinline></video>' +
           '<div class="file-info"><span class="file-icon">🎬</span><div class="file-detail"><div class="file-name">' +
           escapeHtml(msg.fileName) + '</div><div class="file-size">' + formatFileSize(msg.fileSize) + '</div></div>' +
           '<button class="download-btn" data-url="' + escapeHtml(msg.fileData) + '" data-name="' + escapeHtml(msg.fileName) + '">' + escapeHtml(t('btnDownload')) + '</button></div>';
@@ -41404,8 +43295,14 @@ function renderMessages() {
 
   if (_rpToFetch.length) {
     if (state.socket && state.socket.connected) {
-      for (var _rfi = 0; _rfi < _rpToFetch.length; _rfi++) {
+      /* ★ v0.32.x：单次渲染最多请求 8 个红包详情，超出部分下轮再拉，
+         避免一次加载大量历史消息时短时间爆发请求。 */
+      var _rpLimit = Math.min(_rpToFetch.length, 8);
+      for (var _rfi = 0; _rfi < _rpLimit; _rfi++) {
         state.socket.emit('redpacket-info', { packetId: _rpToFetch[_rfi] });
+      }
+      for (var _rfo = _rpLimit; _rfo < _rpToFetch.length; _rfo++) {
+        delete state.redPacketPending[_rpToFetch[_rfo]];
       }
     } else {
       for (var _rfj = 0; _rfj < _rpToFetch.length; _rfj++) {
@@ -41417,7 +43314,19 @@ function renderMessages() {
   var imgs = list.querySelectorAll('.image-preview');
   for (var ii = 0; ii < imgs.length; ii++) {
     (function (im) {
-      im.addEventListener('click', function () { openImagePreview(im.dataset.src); });
+      im.addEventListener('click', function () {
+        var src = im.dataset.src || im.src || '';
+        if (!src || src.indexOf('data:') !== 0) {
+          showToast('图片正在加载，请稍候…');
+          return;
+        }
+        if (state.imagePreviewMode === 'newtab') {
+          try { window.open(src, '_blank', 'noopener,noreferrer'); }
+          catch (e) { showToast('无法打开新窗口'); }
+        } else {
+          openImagePreview(src);
+        }
+      });
     })(imgs[ii]);
   }
   var dls = list.querySelectorAll('.download-btn');
@@ -41448,6 +43357,21 @@ function renderMessages() {
         if (pid) openRedpacketDetail(pid);
       });
     })(rpBubbles[rbi]);
+  }
+
+  var _locCards = list.querySelectorAll('.location-card');
+  for (var _lci = 0; _lci < _locCards.length; _lci++) {
+    (function (el) {
+      el.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var gm = el.getAttribute('data-gmaps');
+        if (!gm) return;
+        if (typeof openBrowser === 'function') {
+          try { openBrowser(gm); return; } catch (er) {}
+        }
+        window.open(gm, '_blank', 'noopener,noreferrer');
+      });
+    })(_locCards[_lci]);
   }
 
   var wcBtns = list.querySelectorAll('.welcome-changelog-btn');
@@ -41571,132 +43495,210 @@ function renderMessages() {
     }
   })();
 
-    var mdivs = list.querySelectorAll('.msg');
-    for (var mm = 0; mm < mdivs.length; mm++) {
-      (function (el) {
-        function _isInteractiveTarget(t) {
-          if (!t) return false;
-          var node = t;
-          while (node && node !== el) {
-            if (node.nodeType === 1) {
-              var tag = (node.tagName || '').toLowerCase();
-              if (tag === 'button' || tag === 'a' || tag === 'input' ||
-                  tag === 'select' || tag === 'textarea' || tag === 'label' ||
-                  tag === 'video' || tag === 'audio') {
-                return true;
-              }
-              if (node.isContentEditable) return true;
-              if (node.classList && typeof node.classList.contains === 'function') {
-                if (node.classList.contains('welcome-changelog-btn') ||
-                    node.classList.contains('welcome-help-btn') ||
-                    node.classList.contains('download-btn') ||
-                    node.classList.contains('voice-play') ||
-                    node.classList.contains('voice-speed') ||
-                    node.classList.contains('rp-sys-tag') ||
-                    node.classList.contains('redpacket-bubble') ||
-                    node.classList.contains('reply-block') ||
-                    node.classList.contains('reaction-chip')) {
-                  return true;
-                }
-              }
+  /* ★ v0.32.2：渲染完成后自动拉取被剥离到磁盘的大文件（图片/视频/语音）
+     - 每次最多拉 5 个，避免一次性打满服务器
+     - 拉取成功后重渲染本会话；已拉取的消息带 _fetching 标记不再重复请求 */
+  (function _autoFileFetch() {
+    if (!state.socket || !state.socket.connected) return;
+    if (!msgs || !msgs.length) return;
+    var _key = (type === 'private' ? 'private_' : 'group_') + id;
+    var _need = [];
+    for (var _fi = 0; _fi < msgs.length; _fi++) {
+      var _fm = msgs[_fi];
+      if (!_fm || !_fm._needsFetch || !_fm.fileId) continue;
+      if (_fm._fetching || _fm.fileData) continue;
+      if (_fm.type !== 'file' && _fm.type !== 'voice' && _fm.type !== 'sticker') continue;
+      _need.push(_fm);
+      if (_need.length >= 5) break;
+    }
+    if (!_need.length) return;
+    var _idx = 0;
+    var _timer = setInterval(function () {
+      if (_idx >= _need.length) { clearInterval(_timer); return; }
+      var _m = _need[_idx++];
+      if (!_m || _m._fetching || _m.fileData) return;
+      _m._fetching = true;
+      try {
+        state.socket.emit('file-fetch', {
+          fileId: _m.fileId,
+          msgId: _m.msgId,
+          sessionKey: _key
+        }, function (res) {
+          _m._fetching = false;
+          if (res && res.ok && res.dataUrl) {
+            _m.fileData = res.dataUrl;
+            delete _m._needsFetch;
+            var _curKey = (state.currentType === 'private' ? 'private_' : 'group_') + state.currentTarget;
+            if (_curKey === _key) {
+              renderMessages(true);
             }
-            node = node.parentNode;
+          } else {
+            console.warn('[file-fetch] 拉取失败:', _m.fileId, res && res.error);
           }
-          return false;
-        }
-
-        var av = el.querySelector('.msg-avatar');
-        if (av) {
-          av.style.cursor = 'pointer';
-          av.title = (state.lang === 'en'
-            ? 'Click: profile · Double-click: pat · Right-click: view image'
-            : '单击看名片 · 双击拍一拍 · 右键看大图');
-
-          var _avClickTimer = null;
-          av.addEventListener('click', function (e) {
-            e.stopPropagation();
-            var fromId = el.dataset.from;
-            if (fromId === state.myId || isSystemUserId(fromId)) {
-              if (fromId && state.users[fromId]) openProfile(fromId);
-              return;
-            }
-            if (_avClickTimer) clearTimeout(_avClickTimer);
-            _avClickTimer = setTimeout(function () {
-              _avClickTimer = null;
-              if (fromId && state.users[fromId]) openProfile(fromId);
-            }, 250);
-          });
-
-          av.addEventListener('dblclick', function (e) {
-            e.stopPropagation();
-            e.preventDefault();
-            if (_avClickTimer) {
-              clearTimeout(_avClickTimer);
-              _avClickTimer = null;
-            }
-            var fromId = el.dataset.from;
-            if (fromId === state.myId) {
-              openProfileEdit();
-            } else if (fromId && fromId !== 'system' && fromId !== 'SYSTEM' &&
-                       !isSystemUserId(fromId)) {
-              if (typeof sendPatPat === 'function') {
-                var _gid = (state.currentType === 'group' && state.currentTarget)
-                  ? state.currentTarget : '';
-                sendPatPat(fromId, _gid);
-              }
-            }
-          });
-          av.addEventListener('contextmenu', function (e) {
-            e.preventDefault();
-            e.stopPropagation();
-            var fromId = el.dataset.from;
-            var url = '';
-            if (fromId === state.myId) {
-              url = (state.myProfile && state.myProfile.avatar) || '';
-            } else if (state.users[fromId] && state.users[fromId].profile) {
-              url = state.users[fromId].profile.avatar || '';
-            }
-            if (url) openImagePreview(url);
-          });
-        }
-
-        el.addEventListener('dblclick', function (e) {
-          if (_isInteractiveTarget(e.target)) return;
-          e.preventDefault();
-          showMsgMenu(e.clientX, e.clientY, el.dataset.msgid, el.dataset.from);
         });
+      } catch (e) {
+        _m._fetching = false;
+      }
+    }, 200);
+  })();
 
-        el.addEventListener('contextmenu', function (e) {
-          if (_isInteractiveTarget(e.target)) return;
+    /* ★ v0.32.0 内存优化：消息事件从「每条一绑」改为「容器一次绑」，事件监听器从 3N 降到 3 */
+    (function _bindMessageDelegateOnce() {
+      if (list._msgDelegateBound) return;
+      list._msgDelegateBound = true;
+
+      function _isInteractiveTarget(t, el) {
+        if (!t) return false;
+        var node = t;
+        while (node && node !== el) {
+          if (node.nodeType === 1) {
+            var tag = (node.tagName || '').toLowerCase();
+            if (tag === 'button' || tag === 'a' || tag === 'input' ||
+                tag === 'select' || tag === 'textarea' || tag === 'label' ||
+                tag === 'video' || tag === 'audio') return true;
+            if (node.isContentEditable) return true;
+            if (node.classList && typeof node.classList.contains === 'function') {
+              if (node.classList.contains('welcome-changelog-btn') ||
+                  node.classList.contains('welcome-help-btn') ||
+                  node.classList.contains('download-btn') ||
+                  node.classList.contains('voice-play') ||
+                  node.classList.contains('voice-speed') ||
+                  node.classList.contains('rp-sys-tag') ||
+                  node.classList.contains('redpacket-bubble') ||
+                  node.classList.contains('reply-block') ||
+                  node.classList.contains('reaction-chip')) return true;
+            }
+          }
+          node = node.parentNode;
+        }
+        return false;
+      }
+
+      function _findMsgEl(t) {
+        var n = t;
+        while (n && n !== list) {
+          if (n.nodeType === 1 && n.classList && n.classList.contains('msg')) return n;
+          n = n.parentNode;
+        }
+        return null;
+      }
+
+      /* 右键 */
+      list.addEventListener('contextmenu', function (e) {
+        var el = _findMsgEl(e.target);
+        if (!el) return;
+        if (_isInteractiveTarget(e.target, el)) return;
+        e.preventDefault();
+        showMsgMenu(e.clientX, e.clientY, el.dataset.msgid, el.dataset.from);
+      });
+
+      /* 双击 */
+      list.addEventListener('dblclick', function (e) {
+        var el = _findMsgEl(e.target);
+        if (!el) {
+          /* 上半屏 / 下半屏翻页逻辑保留 */
+          var rect = list.getBoundingClientRect();
+          if (e.clientY - rect.top < 50) {
+            try { list.scrollTo({ top: 0, behavior: 'smooth' }); }
+            catch (err) { list.scrollTop = 0; }
+            return;
+          }
+          var y = e.clientY - rect.top;
+          var half = rect.height / 2;
+          var amount = Math.max(list.clientHeight * 0.85, 200);
+          if (y < half) list.scrollTop = Math.max(0, list.scrollTop - amount);
+          else list.scrollTop = Math.min(list.scrollHeight - list.clientHeight, list.scrollTop + amount);
+          return;
+        }
+        if (_isInteractiveTarget(e.target, el)) return;
+        e.preventDefault();
+        showMsgMenu(e.clientX, e.clientY, el.dataset.msgid, el.dataset.from);
+      });
+
+      /* 长按（触摸） */
+      var _lpTimer = null;
+      var _lpTargetEl = null;
+      var _lpFired = false;
+
+      list.addEventListener('touchstart', function (e) {
+        var el = _findMsgEl(e.target);
+        if (!el) return;
+        if (_isInteractiveTarget(e.target, el)) return;
+        _lpTargetEl = el;
+        _lpFired = false;
+        var t0 = e.touches && e.touches[0];
+        var cx = t0 ? t0.clientX : 0;
+        var cy = t0 ? t0.clientY : 0;
+        _lpTimer = setTimeout(function () {
+          _lpFired = true;
+          try { if (navigator.vibrate) navigator.vibrate(20); } catch (er) {}
+          showMsgMenu(cx, cy, el.dataset.msgid, el.dataset.from);
+        }, 500);
+      }, { passive: true });
+
+      list.addEventListener('touchend', function () {
+        if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+      });
+      list.addEventListener('touchmove', function () {
+        if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+      }, { passive: true });
+      list.addEventListener('click', function (e) {
+        if (_lpFired) {
+          e.stopPropagation();
           e.preventDefault();
-          showMsgMenu(e.clientX, e.clientY, el.dataset.msgid, el.dataset.from);
-        });
-
-        var _lpTimer = null;
-        var _lpFired = false;
-        el.addEventListener('touchstart', function (e) {
           _lpFired = false;
-          if (_isInteractiveTarget(e.target)) return;
-          _lpTimer = setTimeout(function () {
-            _lpFired = true;
-            try { if (navigator.vibrate) navigator.vibrate(20); } catch (er) {}
-            var t0 = e.touches && e.touches[0];
-            var cx = t0 ? t0.clientX : 0;
-            var cy = t0 ? t0.clientY : 0;
-            showMsgMenu(cx, cy, el.dataset.msgid, el.dataset.from);
-          }, 500);
-        }, { passive: true });
-        el.addEventListener('touchend', function () {
-          if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+        }
+      }, true);
+    })();
+
+    /* 头像单独绑（数量少，且要支持「单击 / 双击 / 右键」三种操作，独立处理更清晰） */
+    var _avatars = list.querySelectorAll('.msg-avatar');
+    for (var _ai = 0; _ai < _avatars.length; _ai++) {
+      (function (av) {
+        var _msgEl = av.closest ? av.closest('.msg') : null;
+        if (!_msgEl) return;
+        av.style.cursor = 'pointer';
+        var _avClickTimer = null;
+        av.addEventListener('click', function (e) {
+          e.stopPropagation();
+          var fromId = _msgEl.dataset.from;
+          if (fromId === state.myId || isSystemUserId(fromId)) {
+            if (fromId && state.users[fromId]) openProfile(fromId);
+            return;
+          }
+          if (_avClickTimer) clearTimeout(_avClickTimer);
+          _avClickTimer = setTimeout(function () {
+            _avClickTimer = null;
+            if (fromId && state.users[fromId]) openProfile(fromId);
+          }, 250);
         });
-        el.addEventListener('touchmove', function () {
-          if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
-        }, { passive: true });
-        el.addEventListener('click', function (e) {
-          if (_isInteractiveTarget(e.target)) { _lpFired = false; return; }
-          if (_lpFired) { e.stopPropagation(); e.preventDefault(); _lpFired = false; }
-        }, true);
-      })(mdivs[mm]);
+        av.addEventListener('dblclick', function (e) {
+          e.stopPropagation();
+          e.preventDefault();
+          if (_avClickTimer) { clearTimeout(_avClickTimer); _avClickTimer = null; }
+          var fromId = _msgEl.dataset.from;
+          if (fromId === state.myId) { openProfileEdit(); }
+          else if (fromId && fromId !== 'system' && fromId !== 'SYSTEM' &&
+                   !isSystemUserId(fromId)) {
+            if (typeof sendPatPat === 'function') {
+              var _gid = (state.currentType === 'group' && state.currentTarget)
+                ? state.currentTarget : '';
+              sendPatPat(fromId, _gid);
+            }
+          }
+        });
+        av.addEventListener('contextmenu', function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          var fromId = _msgEl.dataset.from;
+          var url = '';
+          if (fromId === state.myId) url = (state.myProfile && state.myProfile.avatar) || '';
+          else if (state.users[fromId] && state.users[fromId].profile) {
+            url = state.users[fromId].profile.avatar || '';
+          }
+          if (url) openImagePreview(url);
+        });
+      })(_avatars[_ai]);
     }
   var _shouldScrollBottom = state.autoScroll && !state._userScrolledUp;
   if (_shouldScrollBottom && state._refreshStayBottom) {
@@ -41786,7 +43788,14 @@ function loadMoreHistory() {
   if (!targetId) return;
   var key = (type === 'private' ? 'private_' : 'group_') + targetId;
   if (state.historyHasMore[key] === false) return;
-  if (state.historyLoading[key]) return;
+
+  /* ★ v0.32.1：超时复位（避免某次异常无响应导致按钮永久失效） */
+  if (state.historyLoading[key]) {
+    var _ts0 = (state._historyLoadTs && state._historyLoadTs[key]) || 0;
+    if (Date.now() - _ts0 < 8000) return;
+    console.warn('[history-load-more] 上次请求超时，强制复位并重试');
+    state.historyLoading[key] = false;
+  }
 
   var arr;
   if (type === 'private') {
@@ -41799,6 +43808,8 @@ function loadMoreHistory() {
   if (!oldestId) return;
 
   state.historyLoading[key] = true;
+  if (!state._historyLoadTs) state._historyLoadTs = {};
+  state._historyLoadTs[key] = Date.now();
 
   (function _setLoaderLoading() {
     var btn = document.getElementById('historyLoader');
@@ -42185,10 +44196,13 @@ function ensureAuthSocket(cb) {
     return;
   }
   _authSocket = io({
-    transports: ['websocket', 'polling'],
+    /* ★ v0.32.3：polling 优先，兼容自签证书 */
+    transports: ['polling', 'websocket'],
     reconnection: true,
-    reconnectionAttempts: 3,
-    timeout: 8000,
+    reconnectionAttempts: 5,
+    reconnectionDelay: 1000,
+    timeout: 10000,
+    upgrade: true,
     forceNew: true
   });
   _authSocket.on('connect', function () { _authSocketReady = true; cb(_authSocket); });
@@ -42659,10 +44673,14 @@ function doLogin() {
   var socket;
   try {
     socket = io({
-      transports: ['websocket', 'polling'],
+      /* ★ v0.32.3：polling 优先，自签证书局域网 IP 访问下 wss 被拒时仍可连接 */
+      transports: ['polling', 'websocket'],
       reconnection: true,
-      reconnectionAttempts: 5,
-      timeout: 8000,
+      reconnectionAttempts: 8,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 10000,
+      upgrade: true,
       forceNew: true
     });
   } catch (e) {
@@ -42853,7 +44871,16 @@ function doLogin() {
     if (data.feedbackToken && typeof data.feedbackToken === 'string') {
       state.feedbackToken = data.feedbackToken;
       try { localStorage.setItem('feedback_token', data.feedbackToken); } catch (e) {}
-      try { document.cookie = 'gw_session=' + data.feedbackToken + '; path=/; max-age=' + (7*24*3600); } catch (e) {}
+      try {
+        document.cookie = 'gw_session=' + data.feedbackToken +
+          '; path=/; max-age=' + (7 * 24 * 3600) + '; SameSite=Lax';
+      } catch (e) {}
+    } else {
+      /* ★ v0.32.2：若 login-success 没带 token，尝试从 localStorage 恢复 */
+      try {
+        var _cachedTk = localStorage.getItem('feedback_token');
+        if (_cachedTk) state.feedbackToken = _cachedTk;
+      } catch (e) {}
     }
 
     state.myId = data.id;
@@ -42882,10 +44909,19 @@ function doLogin() {
     state.myProfile = data.profile || {};
     state.myExp = (typeof data.exp === 'number') ? data.exp : 0;
     state.myLastSignin = String(data.lastSignin || '');
+    /* ★ 保存自己的 IP 归属地（用于名片显示） */
+    state.myIpLocation = data.ipLocation || null;
+    state.myRestrictions = null;
+    try {
+      state.myRestrictions = JSON.parse(
+        localStorage.getItem('my_restrictions') || 'null');
+    } catch (e) {}
+    setTimeout(function () { try { _applyRestrictionToInput(); } catch (e) {} }, 500);
 
     if (!state.users[state.myId]) state.users[state.myId] = {};
     state.users[state.myId].createdAt = data.createdAt || Date.now();
     state.users[state.myId].lastActive = data.lastActive || Date.now();
+    state.users[state.myId].ipLocation = data.ipLocation || null;
     state.mySigninHistory = Array.isArray(data.signinHistory)
       ? data.signinHistory.slice()
       : [];
@@ -42996,14 +45032,14 @@ function doLogin() {
       }, 600);
     }
 
-    // ★ 初始化 PeerJS 实例（使用自己的 userId 作为 Peer ID）
-    if (window.Peer && !window.__myPeer) {
+    // ★ v0.32.3：仅在外网离线时才初始化 PeerJS（有外网走 WebRTC + TURN，无需 PeerJS）
+    if (window.Peer && !window.__myPeer && data.usePeerJS === true) {
       window.__myPeer = new Peer(state.myId, {
         host: location.hostname,
         port: location.port || (location.protocol === 'https:' ? 443 : 80),
         path: '/peerjs',
         secure: location.protocol === 'https:',
-        config: { iceServers: data.iceServers || [] } // 复用服务端下发的动态 ICE 配置
+        config: { iceServers: data.iceServers || [] }
       });
       
       window.__myPeer.on('open', function(id) {
@@ -43074,7 +45110,7 @@ function doLogin() {
       setTimeout(function () {
         if (state.currentTarget) return;
 
-        if (window.innerWidth <= 768) {
+        if (!getIsPC()) {
           if (typeof mobileSetPage === 'function') {
             mobileSetPage('chat');
           }
@@ -43607,18 +45643,30 @@ updateSecurityBadge();
 
 function getIsPC() {
   try {
+    /* ★ v0.32.3：用户强制指定的模式优先级最高 */
+    if (typeof state === 'object' && state) {
+      if (state.forceLayoutMode === 'pc') return true;
+      if (state.forceLayoutMode === 'mobile') return false;
+    }
+
     var w = window.innerWidth || 0;
     var h = window.innerHeight || 0;
     var ua = navigator.userAgent || '';
 
-    /* ★ v0.33.2：CSS 逻辑屏幕本身就很小（电视 / 机顶盒 / 嵌入式浏览器
-       常见 960×540、1024×600），无论是否触摸都不该用 PC 三栏布局。
-       正常 PC 显示器 screen.width 不会 ≤1024，所以不会误伤
-       "把浏览器窗口缩小" 的桌面用户（屏幕宽度仍 ≥1920）。 */
+    /* ★ v0.32.0 修复：极小视口（≤768px）无论 screen 尺寸 / 触摸 / UA 如何，
+       一律强制走 mobile。覆盖 320×374 收银机、小窗口调试、
+       老旧嵌入设备、Chrome 59 鼠标环境等场景。
+       必须在任何 screen 检查之前，否则会被下面的 screen<=1024x600 抢走。 */
+    if (w > 0 && w < 769) return false;
+
+    /* ★ v0.32.0 修复：screen 逻辑尺寸 ≤1024×600 → 走 mobile（不是 PC！）
+       原代码此处误写 return true，导致 960×540 电视 / 1024×600 小笔记本
+       / 320×374 嵌入式屏幕全部走了 PC 三栏布局，联系人栏被挤爆或消失。
+       与上方注释「不该用 PC 三栏布局」的意图保持一致。 */
     try {
       var sw = (typeof screen !== 'undefined' && screen.width)  || 0;
       var sh = (typeof screen !== 'undefined' && screen.height) || 0;
-      if (sw > 0 && sh > 0 && sw <= 1024 && sh <= 600) return true;
+      if (sw > 0 && sh > 0 && sw <= 1024 && sh <= 600) return false;
     } catch (eScreen) {}
 
     /* ★ 电视浏览器 UA（BrowserHere / BRAVIA / FireTV / Roku 等） */
@@ -43642,9 +45690,10 @@ function getIsPC() {
       /iPad|iPhone|iPod|Android|Mobile/i.test(ua);
 
     if (touch) return w >= 950;
-    return w >= 769;
   } catch (e) {
-    return (window.innerWidth || 0) >= 769;
+    /* ★ v0.32.0：异常兜底放宽。屏幕 ≤1024px 一律 mobile，
+       保证哪怕所有探测 API 都挂掉，联系人栏也一定看得见。 */
+    return (window.innerWidth || 0) > 1024;
   }
 }
 window.__getIsPC = getIsPC;
@@ -43705,13 +45754,26 @@ window.__getIsPC = getIsPC;
       root.classList.remove('is-pc');
       try {
         var body = document.body;
-        var inChatList = body && body.classList.contains('mobile-page-chat');
-        if (!inChatList && dom && dom.sidebar) {
-          dom.sidebar.classList.remove('open');
-          if (dom.sidebarOverlay) dom.sidebarOverlay.classList.remove('active');
-          if (body) body.classList.remove('mobile-sidebar-open');
+        if (body) {
+          var _hasPage = body.classList.contains('mobile-page-chat') ||
+                         body.classList.contains('mobile-page-discover') ||
+                         body.classList.contains('mobile-page-me') ||
+                         body.classList.contains('mobile-chat-detail');
+          /* ★ v0.32.0 修复：从 PC 缩到窄屏或电视时，主动进入 mobile 页面，
+             否则 sidebar 会因为 transform: translateX(-100%) 而不可见 */
+          if (!_hasPage) {
+            var _hasChat = (typeof state === 'object' && state &&
+                            state.currentTarget && state.currentType);
+            if (_hasChat && typeof mobileEnterChatDetail === 'function') {
+              mobileEnterChatDetail();
+            } else if (typeof mobileSetPage === 'function') {
+              mobileSetPage('chat');
+            }
+          }
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn('[layout] mobile 切换处理失败:', e && e.message);
+      }
     }
 
     try {
@@ -43760,6 +45822,9 @@ window.__getIsPC = getIsPC;
     try { window.__uiGuardSuppressUntil = Date.now() + 2000; } catch (e) {}
     setTimeout(updateLayoutMode, 200);
   });
+
+  /* ★ v0.32.4：暴露给外部（强制布局模式切换需要动态重渲染） */
+  window.__updateLayoutMode = updateLayoutMode;
 })();
 
 (function initObserverSocket() {
@@ -44028,6 +46093,24 @@ function setupSocketEvents(socket) {
       if (dom.sendBtn) dom.sendBtn.disabled = true;
       if (dom.msgInput) dom.msgInput.placeholder = _msg;
     } catch (e) { console.warn('risk-banned handler:', e); }
+  });
+
+  socket.on('restriction-blocked', function (d) {
+    if (!d || !d.message) return;
+    showToast(d.message);
+  });
+
+  socket.on('restrictions-updated', function (d) {
+    if (!d || !d.restrictions) return;
+    state.myRestrictions = d.restrictions;
+    try { localStorage.setItem('my_restrictions',
+      JSON.stringify(d.restrictions)); } catch (e) {}
+    /* 若当前正在聊天，刷新输入区禁用状态 */
+    try { _applyRestrictionToInput(); } catch (e) {}
+  });
+
+  socket.on('restrictions-saved', function (d) {
+    if (d && d.ok) showToast('✅ 已保存限制：' + d.targetName);
   });
 
   socket.on('risk-warning', function (d) {
@@ -44343,6 +46426,42 @@ function setupSocketEvents(socket) {
     }
   });
 
+  socket.on('report-success', function (d) {
+    if (!d || !d.id) return;
+    showToast('✅ 举报已提交：' + d.id + '，管理员会尽快处理');
+  });
+  socket.on('report-error', function (msg) {
+    if (!msg) return;
+    showToast('⚠️ ' + msg);
+  });
+  socket.on('report-new', function (d) {
+    if (!d || !d.id) return;
+    if (!state.isAdmin) return;
+    try {
+      showToast('🚨 收到新举报：' + d.id + ' · ' + d.reason);
+    } catch (e) {}
+  });
+
+  socket.on('feedback-replied', function (d) {
+    if (!d || !d.id) return;
+    try {
+      showToast('💬 你的反馈 ' + d.id + ' 收到了官方回复');
+      showMessagePopup({
+        chatKey: '',
+        targetId: '', targetType: '',
+        title: '📮 反馈回复 · ' + d.id,
+        content: d.text || '',
+        sender: d.by || '管理员',
+        senderId: '',
+        avatar: '',
+        verified: '',
+        isMention: false
+      });
+    } catch (e) {
+      console.warn('feedback-replied handler error:', e && e.message);
+    }
+  });
+
   function mergeIncomingMessage(localArr, incoming) {
     if (!incoming || !incoming.msgId) return false;
     for (var i = 0; i < localArr.length; i++) {
@@ -44416,12 +46535,18 @@ function setupSocketEvents(socket) {
     }
     if (state.myId) {
       var _myOld = state.users[state.myId] || {};
+      /* ★ 优先保留服务端下发的 ipLocation，其次取旧值 / state.myIpLocation */
+      var _myIpLoc = (nu[state.myId] && nu[state.myId].ipLocation) ||
+                     _myOld.ipLocation ||
+                     state.myIpLocation ||
+                     null;
       nu[state.myId] = {
         id: state.myId, name: state.myName, online: true,
         level: state.myLevel, vip: state.myVip, isAdmin: state.isAdmin, muted: state.muted,
         verified: state.myVerified || '',
         profile: state.myProfile || {},
         exp: state.myExp || 0,
+        ipLocation: _myIpLoc,
         createdAt: _myOld.createdAt || 0,
         lastActive: _myOld.lastActive || 0
       };
@@ -44523,6 +46648,17 @@ function setupSocketEvents(socket) {
     if (state.groupInvites) {
       state.groupInvites = state.groupInvites.filter(function(i) { return i.id !== d.inviteId; });
     }
+  });
+
+  /* ★ 服务端下发全站功能限制缓存（仅管理员请求时） */
+  socket.on('admin-all-restrictions', function (d) {
+    try {
+      state._adminRestrictions = (d && d.restrictions) || {};
+      if (state.isAdmin && dom.adminModal &&
+          dom.adminModal.classList.contains('open')) {
+        try { renderAdminPanel(); } catch (e) {}
+      }
+    } catch (e) { console.warn('admin-all-restrictions handler:', e); }
   });
 
   socket.on('user-updated', function (u) {
@@ -44763,12 +46899,22 @@ function setupSocketEvents(socket) {
     if (state.currentTarget === targetId && state.currentType === type) renderMessages();
   });
 
-  socket.on('history-more', function (payload) {
+socket.on('history-more', function (payload) {
     if (!payload || !payload.targetId) return;
     var targetId = payload.targetId;
     var type = (payload.type === 'group') ? 'group' : 'private';
     var hk = (type === 'private' ? 'private_' : 'group_') + targetId;
     state.historyLoading[hk] = false;
+
+    /* ★ v0.32.1：游标丢失 → 触发一次 get-history 重建本地缓存 */
+    if (payload.cursorMissing) {
+      console.warn('[history-more] 游标丢失，重新拉取最近一页以重建游标', payload);
+      state.historyHasMore[hk] = true;
+      if (state.socket && state.socket.connected) {
+        state.socket.emit('get-history', { targetId: targetId, type: type });
+      }
+      return;
+    }
 
     var msgs = payload.messages || [];
     if (!msgs.length) {
@@ -44801,6 +46947,29 @@ function setupSocketEvents(socket) {
 
     toAdd.sort(function (a, b) { return parseMsgTime(a) - parseMsgTime(b); });
 
+    if (!toAdd.length) {
+      /* ★ v0.32.1：本批全是本地已有的消息
+         - 若服务端已明确无更多（hasMore === false）→ 正式置 false
+         - 否则保留 true，用户再次点击时可继续尝试（可能是边界情况下 beforeMsgId 落后） */
+      if (payload.hasMore === false) {
+        state.historyHasMore[hk] = false;
+      } else {
+        state.historyHasMore[hk] = true;
+        console.warn('[history-more] 本批全部重复，服务端 hasMore=true，保留可重试', {
+          targetId: targetId, count: msgs.length
+        });
+        try {
+          showToast(state.lang === 'en'
+            ? 'No new messages loaded, tap again'
+            : '本批未加载到新消息，可再次点击重试');
+        } catch (e) {}
+      }
+      if (state.currentTarget === targetId && state.currentType === type) {
+        renderMessages(true);
+      }
+      return;
+    }
+
     var _isVisible = (state.currentTarget === targetId && state.currentType === type);
     var _prevHeight = 0, _prevTop = 0;
     if (_isVisible) {
@@ -44815,11 +46984,26 @@ function setupSocketEvents(socket) {
     }
 
     if (_isVisible) {
-      renderMessages();
+      /* ★ v0.32.1：立即渲染，避免 120ms 去抖造成的高度差计算失效 */
+      renderMessages(true);
+
+      /* ★ 三层 RAF + 50ms 兜底：覆盖 iOS Safari / 慢设备布局延迟 */
+      var _applyScrollKeep = function () {
+        if (!state.currentTarget) return;
+        var _newHeight = dom.messageList.scrollHeight;
+        var _target = _prevTop + (_newHeight - _prevHeight);
+        dom.messageList.scrollTop = _target;
+        /* ★ 再次校验：部分浏览器布局异步，最终滚动位置可能偏小 */
+        setTimeout(function () {
+          var _h2 = dom.messageList.scrollHeight;
+          if (Math.abs(_h2 - _newHeight) > 5 && state.currentTarget) {
+            dom.messageList.scrollTop = _prevTop + (_h2 - _prevHeight);
+          }
+        }, 60);
+      };
       requestAnimationFrame(function () {
         requestAnimationFrame(function () {
-          var _newHeight = dom.messageList.scrollHeight;
-          dom.messageList.scrollTop = _prevTop + (_newHeight - _prevHeight);
+          requestAnimationFrame(_applyScrollKeep);
         });
       });
     }
@@ -44899,12 +47083,25 @@ function setupSocketEvents(socket) {
     var msg = {
       from: fromId, to: state.myId,
       content: data.content || '',
+      latitude: (data.latitude != null && data.latitude !== '') ? Number(data.latitude) : null,
+      longitude: (data.longitude != null && data.longitude !== '') ? Number(data.longitude) : null,
+      accuracy: (data.accuracy != null) ? Number(data.accuracy) : 0,
+      address: String(data.address || ''),
       time: data.time || getFullTime(),
       msgId: data.msgId || generateMsgId(),
       type: data.type || 'text',
       fileName: data.fileName, fileSize: data.fileSize, fileType: data.fileType,
       fileData: data.fileData, duration: data.duration || null,
-      reply: data.reply || null,
+      reply: (function () {
+        if (!data.reply || !data.reply.msgId) return null;
+        /* ★ v0.32.0：校验被引用消息是否真实存在，防止伪造 reply */
+        var _srcKey = getHistoryKey('private', fromUser.id, toUser.id);
+        var _srcArr = messageHistory[_srcKey] || [];
+        for (var _i = 0; _i < _srcArr.length; _i++) {
+          if (_srcArr[_i].msgId === data.reply.msgId) return data.reply;
+        }
+        return null;
+      })(),
       recalled: false, recalledBy: null, status: 'sent', readUsers: [],
       fromLevel: data.fromLevel || 0, fromVip: !!data.fromVip, fromAdmin: !!data.fromAdmin,
       fromVerified: data.fromVerified || '',
@@ -45272,12 +47469,25 @@ function setupSocketEvents(socket) {
     var msg = {
       from: data.from, to: gid,
       content: data.content || '',
+      latitude: (data.latitude != null && data.latitude !== '') ? Number(data.latitude) : null,
+      longitude: (data.longitude != null && data.longitude !== '') ? Number(data.longitude) : null,
+      accuracy: (data.accuracy != null) ? Number(data.accuracy) : 0,
+      address: String(data.address || ''),
       time: data.time || getFullTime(),
       msgId: data.msgId || generateMsgId(),
       type: data.type || 'text',
       fileName: data.fileName, fileSize: data.fileSize, fileType: data.fileType,
       fileData: data.fileData, duration: data.duration || null,
-      reply: data.reply || null,
+      reply: (function () {
+        if (!data.reply || !data.reply.msgId) return null;
+        /* ★ v0.32.0：校验被引用消息是否真实存在，防止伪造 reply */
+        var _srcKey = getHistoryKey('private', fromUser.id, toUser.id);
+        var _srcArr = messageHistory[_srcKey] || [];
+        for (var _i = 0; _i < _srcArr.length; _i++) {
+          if (_srcArr[_i].msgId === data.reply.msgId) return data.reply;
+        }
+        return null;
+      })(),
       recalled: false, recalledBy: null, status: 'sent',
       readUsers: data.readUsers || [],
       fromLevel: data.fromLevel || 0, fromVip: !!data.fromVip, fromAdmin: !!data.fromAdmin,
@@ -45746,6 +47956,13 @@ function setupSocketEvents(socket) {
   socket.on('call-signal', function (data) {
     var uid = socket.data && socket.data.userId;
     if (!uid || !data || !data.to || !data.signal) return;
+    /* ★ v0.32.0：只允许向当前已登记的通话对端推送信令 */
+    var _rec = ACTIVE_CALLS[uid];
+    if (!_rec || _rec.peerId !== data.to) {
+      console.warn('[Call] 丢弃非当前对端的信令：' +
+        uid + ' → ' + data.to);
+      return;
+    }
     emitToUser(data.to, 'call-signal', {
       from: uid,
       signal: data.signal
@@ -45755,6 +47972,8 @@ function setupSocketEvents(socket) {
   socket.on('call-media-state', function (data) {
     var uid = socket.data && socket.data.userId;
     if (!uid || !data || !data.to) return;
+    var _rec = ACTIVE_CALLS[uid];
+    if (!_rec || _rec.peerId !== data.to) return;
     emitToUser(data.to, 'call-media-state', {
       from: uid,
       muted: !!data.muted,
@@ -46771,8 +48990,8 @@ function setupSocketEvents(socket) {
   });
 
   socket.on('shortcuts-data', function (d) {
-    if (d && d.shortcuts) {
-      state.customShortcuts = d.shortcuts || {};
+    if (d && d.shortcuts && typeof d.shortcuts === 'object') {
+      state.customShortcuts = d.shortcuts;
       try {
         localStorage.setItem('custom_shortcuts',
           JSON.stringify(state.customShortcuts));
@@ -46789,15 +49008,38 @@ function setupSocketEvents(socket) {
   });
 
   socket.on('time-theme-data', function (d) {
-    if (d && d.timeTheme) {
-      state.timeTheme = d.timeTheme;
+    /* ★ 加类型与字段校验：防止畸形数据让 applyTimeBasedTheme 崩溃 */
+    var tt = d && d.timeTheme;
+    if (tt && typeof tt === 'object' && !Array.isArray(tt)) {
+      var _clampHM = function (v, dft) {
+        var s = String(v || dft);
+        var m = /^(\d{1,2}):(\d{1,2})$/.exec(s);
+        if (!m) return dft;
+        var h = parseInt(m[1], 10), mi = parseInt(m[2], 10);
+        if (isNaN(h) || h < 0 || h > 23) return dft;
+        if (isNaN(mi) || mi < 0 || mi > 59) return dft;
+        return (h < 10 ? '0' : '') + h + ':' + (mi < 10 ? '0' : '') + mi;
+      };
+      state.timeTheme = {
+        enabled: !!tt.enabled,
+        dayStart: _clampHM(tt.dayStart, '08:00'),
+        dayEnd: _clampHM(tt.dayEnd, '20:00')
+      };
       applyTimeBasedTheme();
     }
   });
 }
 
 function globalRefresh() {
-  if (!state.socket || !state.isLoggedIn) { showToast(t('toastLoginFirst')); return; }
+  if (!state.isLoggedIn) { showToast(t('toastLoginFirst')); return; }
+  if (!state.socket || !state.socket.connected) {
+    if (typeof showConnectionStatus === 'function') {
+      showConnectionStatus('error', t('connServerLost'));
+    } else {
+      showToast(t('connServerLost'));
+    }
+    return;
+  }
   showToast(t('toastRefreshing'));
   state.socket.emit('refresh-request');
 }
@@ -47207,8 +49449,171 @@ dom.inviteMembersBtn.addEventListener('click', function () {
   showToast(t('toastInvited'));
 });
 
+(function initAdminStats() {
+  var tabUsers = document.getElementById('adminTabUsers');
+  var tabStats = document.getElementById('adminTabStats');
+  var panel = document.getElementById('adminStatsPanel');
+  var listEl = document.getElementById('adminUserList');
+  if (!tabUsers || !tabStats || !panel) return;
+
+  function loadStats() {
+    panel.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:20px;">加载中…</div>';
+    var _tk = (state && state.feedbackToken) || '';
+    var _url = '/api/stats?force=1' + (_tk ? ('&t=' + encodeURIComponent(_tk)) : '');
+    fetch(_url, { credentials: 'same-origin' })
+      .then(function (r) {
+        if (r.status === 401) {
+          return { ok: false, error: '未登录（请刷新页面后重试）', _needAuth: true };
+        }
+        if (r.status === 403) {
+          return { ok: false, error: '无权访问（仅管理员）' };
+        }
+        return r.json();
+      })
+      .then(function (d) {
+        if (!d || !d.ok || !d.stats) {
+          panel.innerHTML = '<div style="color:#c62828;text-align:center;padding:20px;">' +
+            '⚠️ 加载失败：' + ((d && d.error) || '未知') + '</div>';
+          return;
+        }
+        renderStats(d.stats);
+      })
+      .catch(function () {
+        panel.innerHTML = '<div style="color:#c62828;text-align:center;padding:20px;">⚠️ 网络错误</div>';
+      });
+  }
+
+  function _fmtSize(b) {
+    if (!b) return '0 B';
+    if (b < 1024) return b + ' B';
+    if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+    if (b < 1073741824) return (b / 1048576).toFixed(2) + ' MB';
+    return (b / 1073741824).toFixed(2) + ' GB';
+  }
+
+  function renderStats(s) {
+    var html = '';
+
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px;margin-bottom:14px;">';
+    var cards = [
+      { n: s.users.total,   l: '总用户', c: '#07c160' },
+      { n: s.users.online,  l: '在线',   c: '#4ade80' },
+      { n: s.messages.total,l: '消息总数', c: '#1976d2' },
+      { n: s.messages.today,l: '今日消息', c: '#ff9800' },
+      { n: s.groups,        l: '群组',   c: '#9c27b0' },
+      { n: s.music,         l: '音乐',   c: '#e91e63' },
+      { n: s.reports.pending,l:'待处理举报',c:'#c62828' },
+      { n: s.messages.sessions,l:'会话',  c: '#607d8b' }
+    ];
+    for (var i = 0; i < cards.length; i++) {
+      var cc = cards[i];
+      html += '<div style="background:rgba(0,0,0,.03);padding:10px 8px;border-radius:10px;text-align:center;">' +
+        '<div style="font-size:20px;font-weight:800;color:' + cc.c + ';font-variant-numeric:tabular-nums;">' +
+        cc.n + '</div>' +
+        '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">' + cc.l + '</div></div>';
+    }
+    html += '</div>';
+
+    html += '<div style="background:rgba(0,0,0,.03);padding:12px;border-radius:10px;margin-bottom:14px;">';
+    html += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;font-weight:600;">📈 近 7 天消息量</div>';
+    var maxCount = 1;
+    for (var di = 0; di < s.daily.length; di++) {
+      if (s.daily[di].count > maxCount) maxCount = s.daily[di].count;
+    }
+    html += '<div style="display:flex;align-items:flex-end;gap:4px;height:80px;">';
+    for (var dj = 0; dj < s.daily.length; dj++) {
+      var d = s.daily[dj];
+      var h = Math.max(4, Math.round(d.count / maxCount * 70));
+      html += '<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;">' +
+        '<div style="font-size:10px;color:var(--text-muted);">' + d.count + '</div>' +
+        '<div style="width:100%;height:' + h + 'px;background:linear-gradient(180deg,#07c160,#06ad56);' +
+        'border-radius:4px 4px 0 0;"></div>' +
+        '<div style="font-size:10px;color:var(--text-muted);">' + d.day + '</div>' +
+        '</div>';
+    }
+    html += '</div></div>';
+
+    if (s.activeUsers && s.activeUsers.length) {
+      html += '<div style="background:rgba(0,0,0,.03);padding:12px;border-radius:10px;margin-bottom:14px;">';
+      html += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;font-weight:600;">🏆 本周活跃用户 TOP 10</div>';
+      for (var ai = 0; ai < s.activeUsers.length; ai++) {
+        var ua = s.activeUsers[ai];
+        html += '<div style="display:flex;justify-content:space-between;padding:4px 0;' +
+          'border-bottom:1px dashed rgba(0,0,0,.06);font-size:13px;">' +
+          '<span>' + (ai + 1) + '. ' + escapeHtml(ua.name) + '</span>' +
+          '<span style="color:var(--accent);font-weight:600;">' + ua.count + ' 条</span></div>';
+      }
+      html += '</div>';
+    }
+
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;">';
+    html += '<div style="background:rgba(0,0,0,.03);padding:10px;border-radius:10px;">' +
+      '<div style="font-size:11px;color:var(--text-muted);">💾 存储占用</div>' +
+      '<div style="font-size:15px;font-weight:700;margin-top:4px;">' + _fmtSize(s.storage.bytes) +
+      ' <span style="font-size:11px;font-weight:400;color:var(--text-muted);">(' +
+      s.storage.files + ' 个文件)</span></div></div>';
+    html += '<div style="background:rgba(0,0,0,.03);padding:10px;border-radius:10px;">' +
+      '<div style="font-size:11px;color:var(--text-muted);">🧠 服务端内存</div>' +
+      '<div style="font-size:15px;font-weight:700;margin-top:4px;">' + _fmtSize(s.memory.rss) +
+      ' <span style="font-size:11px;font-weight:400;color:var(--text-muted);">RSS</span></div></div>';
+    html += '<div style="background:rgba(0,0,0,.03);padding:10px;border-radius:10px;">' +
+      '<div style="font-size:11px;color:var(--text-muted);">⏱ 运行时长</div>' +
+      '<div style="font-size:15px;font-weight:700;margin-top:4px;">' +
+      _fmtUptime(s.memory.uptime) + '</div></div>';
+    html += '<div style="background:rgba(0,0,0,.03);padding:10px;border-radius:10px;">' +
+      '<div style="font-size:11px;color:var(--text-muted);">📮 反馈总数</div>' +
+      '<div style="font-size:15px;font-weight:700;margin-top:4px;">' + s.feedback + '</div></div>';
+    html += '</div>';
+
+    html += '<div style="text-align:right;margin-top:10px;">' +
+      '<button type="button" class="btn-cancel" id="adminStatsRefresh" ' +
+      'style="padding:4px 14px;font-size:12px;">🔄 刷新</button></div>';
+
+    panel.innerHTML = html;
+    var _rb = document.getElementById('adminStatsRefresh');
+    if (_rb) _rb.addEventListener('click', loadStats);
+  }
+
+  function _fmtUptime(sec) {
+    sec = Math.max(0, Math.round(sec || 0));
+    var d = Math.floor(sec / 86400);
+    var h = Math.floor((sec % 86400) / 3600);
+    var m = Math.floor((sec % 3600) / 60);
+    if (d > 0) return d + '天 ' + h + '小时';
+    if (h > 0) return h + '小时 ' + m + '分钟';
+    return m + '分钟';
+  }
+
+  function showUsers() {
+    panel.style.display = 'none';
+    if (listEl) listEl.style.display = '';
+    tabUsers.style.background = 'var(--bg-btn-primary)';
+    tabUsers.style.color = '#fff';
+    tabStats.style.background = '';
+    tabStats.style.color = '';
+  }
+  function showStats() {
+    panel.style.display = 'block';
+    if (listEl) listEl.style.display = 'none';
+    tabStats.style.background = 'var(--bg-btn-primary)';
+    tabStats.style.color = '#fff';
+    tabUsers.style.background = '';
+    tabUsers.style.color = '';
+    loadStats();
+  }
+  tabUsers.addEventListener('click', showUsers);
+  tabStats.addEventListener('click', showStats);
+  showUsers();
+})();
+
 dom.adminBtn.addEventListener('click', function () {
   if (!state.isAdmin) { showToast(t('toastNotAdmin')); return; }
+  /* ★ 打开面板前先请求一次全站 restrictions 缓存 */
+  try {
+    if (state.socket && state.socket.connected) {
+      state.socket.emit('admin-get-all-restrictions');
+    }
+  } catch (e) {}
   try {
     renderAdminPanel();
   } catch (err) {
@@ -47223,6 +49628,11 @@ dom.adminBtn.addEventListener('click', function () {
     dom.adminModal.classList.add('open');
     return;
   }
+  /* 每次打开面板，默认显示用户 Tab */
+  try {
+    var _tu = document.getElementById('adminTabUsers');
+    if (_tu) _tu.click();
+  } catch (e) {}
   dom.adminModal.classList.add('open');
 });
 dom.closeAdminModal.addEventListener('click', function () { dom.adminModal.classList.remove('open'); });
@@ -47455,6 +49865,12 @@ function renderAdminPanel() {
         : '') +
       '</div>';
 
+    var restrictRow = '<div class="admin-actions" style="width:100%;margin-top:4px;align-items:center;">' +
+      '<span style="font-size:12px;color:var(--text-secondary);flex-shrink:0;">🔒 功能限制</span>' +
+      '<button class="btn-setvip" data-uid="' + uid + '" data-action="restrictions"' +
+        ' style="background:#7b1fa2;color:#fff;">设置</button>' +
+      '</div>';
+
     var moneyRow = '<div class="admin-actions" style="width:100%;margin-top:4px;align-items:center;">' +
       '<span style="font-size:12px;color:var(--text-secondary);flex-shrink:0;">' +
         escapeHtml(t('adminWalletBalance')) + '</span>' +
@@ -47496,7 +49912,7 @@ function renderAdminPanel() {
       vInput + presetHtml + verifyBtns +
       '</div>';
 
-          item.innerHTML = info + timeRow + actions + moneyRow + verifyRow;
+          item.innerHTML = info + timeRow + actions + restrictRow + moneyRow + verifyRow;
     list.appendChild(item);
   }
 
@@ -47563,6 +49979,68 @@ function renderAdminPanel() {
             if (!ok) return;
             state.socket.emit('admin-delete-user', { targetName: u.name });
           });
+        } else if (act === 'restrictions') {
+          /* ★ 客户端无权直接读 persistentUsers → 用服务端下发的缓存 */
+          var _allR = (state._adminRestrictions && state._adminRestrictions[uid]) || {};
+          var _getR = function (k) {
+            var v = _allR[k];
+            return (v && v.allow === false)
+              ? { allow: false, reason: v.reason || '', until: v.until || 0 }
+              : { allow: true, reason: '', until: 0 };
+          };
+          var _keys = [
+            { k: 'message',     n: '发消息' },
+            { k: 'file',        n: '发文件/图片' },
+            { k: 'voice',       n: '发语音' },
+            { k: 'redpacket',   n: '发红包/转账' },
+            { k: 'call',        n: '发起通话' },
+            { k: 'moment',      n: '发动态' },
+            { k: 'groupCreate', n: '创建群聊' },
+            { k: 'profile',     n: '修改资料' }
+          ];
+          var _html = '<div style="padding:4px 0 12px;">' +
+            '<div style="font-size:13px;color:var(--text-muted);margin-bottom:12px;">' +
+            '为 <b style="color:var(--text-primary);">' + escapeHtml(u.name) +
+            '</b> 设置功能限制。取消勾选即禁用该功能。</div>';
+          for (var _ki = 0; _ki < _keys.length; _ki++) {
+            var _kk = _keys[_ki];
+            var _cur = _getR(_kk.k);
+            _html += '<div style="display:flex;align-items:center;gap:10px;' +
+              'padding:8px 12px;border-radius:8px;background:rgba(0,0,0,.03);' +
+              'margin-bottom:6px;">' +
+              '<label style="flex:1;display:flex;align-items:center;gap:8px;' +
+              'cursor:pointer;font-size:14px;">' +
+              '<input type="checkbox" data-restrict-key="' + _kk.k + '" ' +
+              (_cur.allow ? 'checked' : '') + '>' +
+              '<span>' + _kk.n + '</span></label>' +
+              '<input type="text" placeholder="原因（可选）" maxlength="60" ' +
+              'data-restrict-reason="' + _kk.k + '" value="' +
+              escapeHtml(_cur.reason) + '" ' +
+              'style="width:120px;padding:4px 8px;border:1px solid var(--border-input);' +
+              'border-radius:6px;background:var(--bg-input);color:var(--text-primary);' +
+              'font-size:12px;font-family:inherit;outline:none;">' +
+              '</div>';
+          }
+          _html += '</div>';
+
+          showModal('🔒 功能限制 · ' + escapeHtml(u.name), _html, function () {
+            var _out = {};
+            for (var _oi = 0; _oi < _keys.length; _oi++) {
+              var _ok = _keys[_oi].k;
+              var _cb = document.querySelector(
+                'input[data-restrict-key="' + _ok + '"]');
+              var _rs = document.querySelector(
+                'input[data-restrict-reason="' + _ok + '"]');
+              _out[_ok] = {
+                allow: !!(_cb && _cb.checked),
+                reason: _rs ? String(_rs.value || '').slice(0, 60) : '',
+                until: 0
+              };
+            }
+            state.socket.emit('admin-set-restrictions', {
+              targetName: u.name, restrictions: _out
+            });
+          }, { width: '480px', confirmText: '保存' });
         } else if (act === 'setmoney') {
           var mInp = document.getElementById('money_' + uid);
           var mVal = parseFloat(mInp && mInp.value);
@@ -48473,6 +50951,7 @@ function syncSettingsUI() {
   _safe(function () { _chk('setShowNetworkStatus', _lsBool('set_showNetworkStatus', !!state.showNetworkStatus)); });
   _safe(function () { _val('setMotionLevel', _ls('set_motionLevel') || 'full'); });
   _safe(function () { _chk('setCompactSidebar', _lsBool('set_compactSidebar', false)); });
+  _safe(function () { _val('setForceLayoutMode', state.forceLayoutMode || 'auto'); });
   _safe(function () { _chk('setHideSystemUsers', _lsBool('set_hideSystemUsers', !!state.hideSystemUsers)); });
   _safe(function () { _val('setFontFamily', _ls('fontFamily') || 'system'); });
   _safe(function () {
@@ -55625,10 +58104,12 @@ function showContactMenu(x, y, id, type) {
   var _remark = dom.contactMenu.querySelector('[data-action="remark"]');
   var _tag = dom.contactMenu.querySelector('[data-action="tag"]');
   var _sound = dom.contactMenu.querySelector('[data-action="sound"]');
+  var _report = dom.contactMenu.querySelector('[data-action="report"]');
   if (type !== 'private') {
     if (_remark) _remark.style.display = 'none';
     if (_tag) _tag.style.display = 'none';
     if (_sound) _sound.style.display = 'none';
+    if (_report) _report.style.display = 'none';
   } else {
     if (_remark) _remark.style.display = '';
     if (_tag) _tag.style.display = '';
@@ -55636,6 +58117,16 @@ function showContactMenu(x, y, id, type) {
     if (_remark) { _remark.dataset.id = id; _remark.dataset.type = type; }
     if (_tag)    { _tag.dataset.id = id;    _tag.dataset.type = type; }
     if (_sound)  { _sound.dataset.id = id;  _sound.dataset.type = type; }
+    if (_report) {
+      var _targetUser = state.users[id];
+      if (_targetUser && !isSystemUserId(id)) {
+        _report.style.display = '';
+        _report.dataset.id = id;
+        _report.dataset.type = type;
+      } else {
+        _report.style.display = 'none';
+      }
+    }
   }
   dom.contactMenuPin.dataset.id = id;
   dom.contactMenuPin.dataset.type = type;
@@ -56023,6 +58514,14 @@ if (dom.contactMenuPin) {
     dom.contactMenuArchive.addEventListener('click', function () {
       toggleArchiveChat(this.dataset.id, this.dataset.type);
       dom.contactMenu.style.display = 'none';
+    });
+  }
+  var _reportEl = dom.contactMenu.querySelector('[data-action="report"]');
+  if (_reportEl) {
+    _reportEl.addEventListener('click', function () {
+      dom.contactMenu.style.display = 'none';
+      var _rid = this.dataset.id || dom.contactMenuPin.dataset.id;
+      if (_rid) showReportDialog(_rid, 'user', '', '');
     });
   }
   var _bgEl = document.getElementById('contactMenuBg');
@@ -59456,6 +61955,11 @@ function renderGroupSidePanel() {
             lvHtmlM +
             _dragonBadge +
             roleHtml +
+            (u.ipLocation && u.ipLocation.regionText
+              ? '<span style="font-size:10px;color:var(--text-muted);' +
+                'margin-left:2px;flex-shrink:0;">📍' +
+                escapeHtml(u.ipLocation.regionText) + '</span>'
+              : '') +
           '</div>' +
         '</div>' +
       '</div>';
@@ -62076,7 +64580,13 @@ function mobileSetPage(page, opts) {
       body.classList.add('mobile-chat-detail');
     } else {
       body.classList.add('mobile-page-chat');
-      if (dom.sidebar) dom.sidebar.classList.add('open');
+      if (dom.sidebar) {
+        dom.sidebar.classList.add('open');
+        /* ★ v0.32.0 加固：在极窄视口下（≤480px）也要确保 sidebar 显示 */
+        try {
+          dom.sidebar.style.transform = '';
+        } catch (eSt) {}
+      }
       body.classList.add('mobile-sidebar-open');
       try {
         if (dom.msgInput && document.activeElement === dom.msgInput) dom.msgInput.blur();
@@ -62437,7 +64947,7 @@ window.updateMobileMePage = updateMobileMePage;
   setInterval(function () {
     if (state.isLoggedIn !== _lastLoginState) {
       _lastLoginState = state.isLoggedIn;
-      if (window.innerWidth <= 768) {
+      if (!getIsPC()) {
         mobileSetPage('chat');
         setTimeout(updateMobileMePage, 200);
       }
@@ -62806,19 +65316,19 @@ function updateChatAnnouncementDisplay(g) {
         }
       }
 
-      var now = Date.now();
+      /* ★ v0.32.2：不再抹除客户端消息里的 fileData（图片/视频/语音等）
+         内存优化只做：清理空的会话键 */
+      var _emptyKeys = [];
       for (var _ck in state.messages) {
         if (!state.messages.hasOwnProperty(_ck)) continue;
-        var arr = state.messages[_ck];
-        if (!Array.isArray(arr)) continue;
-        for (var j = 0; j < arr.length; j++) {
-          var m = arr[j];
-          if (m && m.fileData && m.fileData.length > 5 * 1024 * 1024) {
-            if (now - parseMsgTime(m) > 3600000) {
-              m.fileData = '[已释放本地内存以节省空间]';
-            }
-          }
+        var _arr0 = state.messages[_ck];
+        if (Array.isArray(_arr0) && _arr0.length === 0 &&
+            !(_ck === state.currentTarget && state.currentType === 'private')) {
+          _emptyKeys.push(_ck);
         }
+      }
+      for (var _ei2 = 0; _ei2 < _emptyKeys.length; _ei2++) {
+        delete state.messages[_emptyKeys[_ei2]];
       }
     } catch (e) { }
   }, 10 * 60 * 1000); // 每 10 分钟清理一次本地内存
@@ -63158,190 +65668,639 @@ setInterval(function () {
   } catch (e) {}
 }, 5 * 60 * 1000);
 
+/* ★ v0.32.2：新增 8 个显示类设置的读取、绑定与应用 */
+(function _initV0322DisplaySettings() {
+  var _LS = {
+    msgFontWeight: 'set_msgFontWeight',
+    msgAvatarSize: 'set_msgAvatarSize',
+    msgBubbleShadow: 'set_msgBubbleShadow',
+    imagePreviewMode: 'set_imagePreviewMode',
+    videoMute: 'set_videoMute',
+    copyWithSender: 'set_copyWithSender',
+    contactTimeFormat: 'set_contactTimeFormat',
+    autoSaveDraft: 'set_autoSaveDraft'
+  };
+
+  function _apply() {
+    var root = document.documentElement;
+
+    var fw = parseInt(localStorage.getItem(_LS.msgFontWeight) || '400', 10);
+    if ([400, 500, 600].indexOf(fw) === -1) fw = 400;
+    state.msgFontWeight = fw;
+    root.style.setProperty('--msg-font-weight', String(fw));
+
+    var as = parseInt(localStorage.getItem(_LS.msgAvatarSize) || '38', 10);
+    if ([28, 32, 38, 44].indexOf(as) === -1) as = 38;
+    state.msgAvatarSize = as;
+    root.style.setProperty('--msg-avatar-size', as + 'px');
+
+    var shadow = localStorage.getItem(_LS.msgBubbleShadow) !== '0';
+    state.msgBubbleShadow = shadow;
+    root.classList.toggle('no-msg-shadow', !shadow);
+
+    state.imagePreviewMode = localStorage.getItem(_LS.imagePreviewMode) || 'modal';
+    state.videoMute = localStorage.getItem(_LS.videoMute) !== '0';
+    state.copyWithSender = localStorage.getItem(_LS.copyWithSender) !== '0';
+    state.contactTimeFormat = localStorage.getItem(_LS.contactTimeFormat) || 'smart';
+    state.autoSaveDraft = localStorage.getItem(_LS.autoSaveDraft) !== '0';
+  }
+  _apply();
+
+  function _bind() {
+    var el;
+    el = document.getElementById('setMsgFontWeight');
+    if (el && !el._v0322) {
+      el._v0322 = true;
+      el.value = String(state.msgFontWeight);
+      el.addEventListener('change', function () {
+        localStorage.setItem(_LS.msgFontWeight, el.value);
+        _apply();
+        if (state.currentTarget) renderMessages(true);
+      });
+    }
+    el = document.getElementById('setMsgAvatarSize');
+    if (el && !el._v0322) {
+      el._v0322 = true;
+      el.value = String(state.msgAvatarSize);
+      el.addEventListener('change', function () {
+        localStorage.setItem(_LS.msgAvatarSize, el.value);
+        _apply();
+        if (state.currentTarget) renderMessages(true);
+      });
+    }
+    el = document.getElementById('setMsgBubbleShadow');
+    if (el && !el._v0322) {
+      el._v0322 = true;
+      el.checked = state.msgBubbleShadow;
+      el.addEventListener('change', function () {
+        localStorage.setItem(_LS.msgBubbleShadow, el.checked ? '1' : '0');
+        _apply();
+      });
+    }
+    el = document.getElementById('setImagePreviewMode');
+    if (el && !el._v0322) {
+      el._v0322 = true;
+      el.value = state.imagePreviewMode;
+      el.addEventListener('change', function () {
+        localStorage.setItem(_LS.imagePreviewMode, el.value);
+        _apply();
+      });
+    }
+    el = document.getElementById('setVideoMute');
+    if (el && !el._v0322) {
+      el._v0322 = true;
+      el.checked = state.videoMute;
+      el.addEventListener('change', function () {
+        localStorage.setItem(_LS.videoMute, el.checked ? '1' : '0');
+        _apply();
+        if (state.currentTarget) renderMessages(true);
+      });
+    }
+    el = document.getElementById('setCopyWithSender');
+    if (el && !el._v0322) {
+      el._v0322 = true;
+      el.checked = state.copyWithSender;
+      el.addEventListener('change', function () {
+        localStorage.setItem(_LS.copyWithSender, el.checked ? '1' : '0');
+        _apply();
+      });
+    }
+    el = document.getElementById('setContactTimeFormat');
+    if (el && !el._v0322) {
+      el._v0322 = true;
+      el.value = state.contactTimeFormat;
+      el.addEventListener('change', function () {
+        localStorage.setItem(_LS.contactTimeFormat, el.value);
+        _apply();
+        renderContacts();
+      });
+    }
+    el = document.getElementById('setAutoSaveDraft');
+    if (el && !el._v0322) {
+      el._v0322 = true;
+      el.checked = state.autoSaveDraft;
+      el.addEventListener('change', function () {
+        localStorage.setItem(_LS.autoSaveDraft, el.checked ? '1' : '0');
+        _apply();
+      });
+    }
+  }
+  _bind();
+  setTimeout(_bind, 600);
+  setTimeout(_bind, 2000);
+})();
+
+/* ★ v0.32.4：Windows 风格警告对话框（支持自动关闭倒计时） */
+function showWinAlert(opts) {
+  opts = opts || {};
+  return new Promise(function (resolve) {
+    var old = document.getElementById('__winAlertOverlay');
+    if (old) old.remove();
+
+    var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    var c = {
+      bg:        isDark ? '#2b2b2b' : '#ffffff',
+      fg:        isDark ? '#e8e8e8' : '#202020',
+      fgSub:     isDark ? '#b0b0b0' : '#606060',
+      titleBg:   isDark ? '#1f1f1f' : '#f3f3f3',
+      titleFg:   isDark ? '#e8e8e8' : '#1a1a1a',
+      titleBorder: isDark ? '#3a3a3a' : '#e0e0e0',
+      boxBorder:   isDark ? '#4a4a4a' : '#a0a0a0',
+      btnBg:       isDark ? '#3a3a3a' : '#f3f3f3',
+      btnFg:       isDark ? '#e8e8e8' : '#202020',
+      btnBorder:   isDark ? '#555' : '#c0c0c0',
+      btnBgHover:  isDark ? '#4a4a4a' : '#e8e8e8',
+      primaryBg:   isDark ? '#1a6fc4' : '#0067c0',
+      primaryBgHover: isDark ? '#2a7fd4' : '#0078d4',
+      primaryBorder:  isDark ? '#0e5aa0' : '#005aa8',
+      dangerBg:    '#c42b1c',
+      dangerBgHover: '#d93324',
+      dangerBorder: '#a7261a'
+    };
+
+    var overlay = document.createElement('div');
+    overlay.id = '__winAlertOverlay';
+    overlay.style.cssText =
+      'position:fixed;top:0;right:0;bottom:0;left:0;z-index:2147483646;' +
+      'background:rgba(0,0,0,.35);display:flex;align-items:center;' +
+      'justify-content:center;padding:20px;box-sizing:border-box;' +
+      'font-family:"Segoe UI",-apple-system,"Microsoft YaHei",sans-serif;' +
+      'opacity:0;transition:opacity .15s ease;';
+
+    var box = document.createElement('div');
+    box.style.cssText =
+      'background:' + c.bg + ';color:' + c.fg + ';' +
+      'border:1px solid ' + c.boxBorder + ';border-radius:8px;' +
+      'width:480px;max-width:100%;overflow:hidden;' +
+      'box-shadow:0 16px 48px rgba(0,0,0,.4), 0 2px 8px rgba(0,0,0,.15);' +
+      'transform:scale(.96);transition:transform .18s cubic-bezier(.16,1,.3,1);';
+
+    /* 标题栏：左侧标题，右侧倒计时 */
+    var titleBar = document.createElement('div');
+    titleBar.style.cssText =
+      'background:' + c.titleBg + ';color:' + c.titleFg + ';' +
+      'padding:10px 14px;border-bottom:1px solid ' + c.titleBorder + ';' +
+      'font-size:13px;font-weight:600;letter-spacing:.2px;' +
+      'display:flex;align-items:center;justify-content:space-between;gap:8px;';
+    var titleText = document.createElement('span');
+    titleText.textContent = opts.title || '警告';
+    titleBar.appendChild(titleText);
+
+    /* 倒计时徽章 */
+    var countdownEl = null;
+    var countdownTimer = null;
+    var totalSec = Math.ceil((opts.autoCloseMs || 0) / 1000);
+    if (totalSec > 0) {
+      countdownEl = document.createElement('span');
+      countdownEl.style.cssText =
+        'font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:10px;' +
+        'background:rgba(250,81,81,.16);color:#ff8a80;' +
+        'font-variant-numeric:tabular-nums;letter-spacing:.2px;' +
+        'flex-shrink:0;line-height:16px;' +
+        'transition:background .15s,color .15s,transform .15s;';
+      countdownEl.textContent = totalSec + 's 后自动还原';
+      titleBar.appendChild(countdownEl);
+    }
+
+    /* 主体 */
+    var body = document.createElement('div');
+    body.style.cssText =
+      'padding:22px 24px 20px;display:flex;gap:16px;align-items:flex-start;';
+
+    var icon = document.createElement('div');
+    icon.style.cssText = 'flex-shrink:0;font-size:36px;line-height:1;user-select:none;';
+    icon.textContent = opts.icon || '⚠️';
+
+    var msg = document.createElement('div');
+    msg.style.cssText =
+      'flex:1;min-width:0;font-size:13.5px;line-height:1.7;' +
+      'color:' + c.fg + ';white-space:pre-wrap;word-break:break-word;';
+    msg.textContent = opts.message || '';
+
+    body.appendChild(icon);
+    body.appendChild(msg);
+
+    /* 按钮栏 */
+    var footer = document.createElement('div');
+    footer.style.cssText =
+      'padding:12px 18px 16px;display:flex;justify-content:flex-end;gap:8px;';
+
+    function _mkBtn(text, kind) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = text;
+      var baseStyle =
+        'padding:6px 22px;border-radius:4px;font-size:13px;' +
+        'font-family:inherit;cursor:pointer;min-width:88px;' +
+        'transition:background .12s,border-color .12s;' +
+        'box-sizing:border-box;line-height:1.5;';
+      if (kind === 'primary') {
+        b.style.cssText = baseStyle + 'background:' + c.primaryBg +
+          ';color:#fff;border:1px solid ' + c.primaryBorder + ';font-weight:600;';
+        b.addEventListener('mouseenter', function () { b.style.background = c.primaryBgHover; });
+        b.addEventListener('mouseleave', function () { b.style.background = c.primaryBg; });
+      } else if (kind === 'danger') {
+        b.style.cssText = baseStyle + 'background:' + c.dangerBg +
+          ';color:#fff;border:1px solid ' + c.dangerBorder + ';font-weight:600;';
+        b.addEventListener('mouseenter', function () { b.style.background = c.dangerBgHover; });
+        b.addEventListener('mouseleave', function () { b.style.background = c.dangerBg; });
+      } else {
+        b.style.cssText = baseStyle + 'background:' + c.btnBg +
+          ';color:' + c.btnFg + ';border:1px solid ' + c.btnBorder + ';';
+        b.addEventListener('mouseenter', function () { b.style.background = c.btnBgHover; });
+        b.addEventListener('mouseleave', function () { b.style.background = c.btnBg; });
+      }
+      return b;
+    }
+
+    var cancelBtn = null;
+    if (opts.cancelText !== null) {
+      cancelBtn = _mkBtn(opts.cancelText || '取消', 'normal');
+      cancelBtn.addEventListener('click', function () { _close(false); });
+    }
+    var confirmBtn = _mkBtn(
+      opts.confirmText || '确定',
+      opts.danger ? 'danger' : 'primary'
+    );
+    confirmBtn.addEventListener('click', function () { _close(true); });
+
+    if (cancelBtn) footer.appendChild(cancelBtn);
+    footer.appendChild(confirmBtn);
+
+    box.appendChild(titleBar);
+    box.appendChild(body);
+    box.appendChild(footer);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        overlay.style.opacity = '1';
+        box.style.transform = 'scale(1)';
+      });
+    });
+    setTimeout(function () { confirmBtn.focus(); }, 60);
+
+    var _closed = false;
+    function _close(ok) {
+      if (_closed) return;
+      _closed = true;
+      if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+      overlay.style.opacity = '0';
+      box.style.transform = 'scale(.96)';
+      document.removeEventListener('keydown', _keyHandler);
+      setTimeout(function () {
+        try { overlay.remove(); } catch (e) {}
+        resolve(ok);
+      }, 160);
+    }
+
+    function _keyHandler(e) {
+      if (e.key === 'Escape') { e.preventDefault(); _close(false); }
+      else if (e.key === 'Enter') { e.preventDefault(); _close(true); }
+    }
+    document.addEventListener('keydown', _keyHandler);
+
+    overlay.addEventListener('click', function (e) {
+      if (e.target === overlay) _close(false);
+    });
+
+    /* ★ 启动倒计时 */
+    if (totalSec > 0 && countdownEl) {
+      var remaining = totalSec;
+      countdownTimer = setInterval(function () {
+        remaining--;
+        if (remaining <= 0) {
+          clearInterval(countdownTimer);
+          countdownTimer = null;
+          /* 默认 autoCloseAction = 'cancel'（还原） */
+          var action = (opts.autoCloseAction === 'confirm');
+          _close(action);
+          return;
+        }
+        countdownEl.textContent = remaining + 's 后自动还原';
+        if (remaining <= 3) {
+          countdownEl.style.background = 'rgba(250,81,81,.32)';
+          countdownEl.style.color = '#fff';
+          countdownEl.style.transform = 'scale(1.08)';
+          setTimeout(function () {
+            if (countdownEl) countdownEl.style.transform = 'scale(1)';
+          }, 150);
+        }
+      }, 1000);
+    }
+  });
+}
+window.showWinAlert = showWinAlert;
+
+/* ★ v0.32.4：强制布局模式切换（立即应用 + 10 秒倒计时自动还原，Windows 风格） */
+(function _initForceLayoutMode() {
+  function _bind() {
+    var sel = document.getElementById('setForceLayoutMode');
+    if (!sel || sel._forceLayoutBound) return;
+    sel._forceLayoutBound = true;
+    sel.value = (state.forceLayoutMode || 'auto');
+
+    function _label(v) {
+      return v === 'pc' ? '强制电脑模式'
+        : v === 'mobile' ? '强制手机模式'
+        : '自动识别';
+    }
+    function _actualLabel(mode) {
+      if (mode === 'pc') return '电脑布局';
+      if (mode === 'mobile') return '手机布局';
+      return getIsPC() ? '电脑布局' : '手机布局';
+    }
+    function _applyLayout() {
+      try {
+        if (typeof window.__updateLayoutMode === 'function') {
+          window.__updateLayoutMode();
+        }
+      } catch (e) {
+        console.warn('[forceLayoutMode] 应用布局失败:', e && e.message);
+      }
+    }
+    function _writeLS(v) {
+      try { localStorage.setItem('set_forceLayoutMode', v); } catch (e) {}
+    }
+    function _clearLS() {
+      try { localStorage.removeItem('set_forceLayoutMode'); } catch (e) {}
+    }
+
+    var _pending = false;   /* 弹窗确认中标记 */
+
+    sel.addEventListener('change', function () {
+      if (_pending) {
+        /* 确认中不允许再次切换 */
+        sel.value = state.forceLayoutMode || 'auto';
+        return;
+      }
+      var newMode = String(sel.value || 'auto');
+      var oldMode = String(state.forceLayoutMode || 'auto');
+      if (newMode === oldMode) return;
+
+      _pending = true;
+
+      /* ★ 立即应用新模式（不刷新页面） */
+      state.forceLayoutMode = newMode;
+      _writeLS(newMode);
+      _applyLayout();
+
+      showWinAlert({
+        icon: '⚠️',
+        title: '切换布局模式',
+        message:
+          '已应用「' + _label(newMode) + '」（实际渲染：' + _actualLabel(newMode) + '）。\n\n' +
+          '原设置：' + _label(oldMode) + '（' + _actualLabel(oldMode) + '）\n' +
+          '新设置：' + _label(newMode) + '（' + _actualLabel(newMode) + '）\n\n' +
+          '是否保留此设置？\n' +
+          '10 秒内不确认将自动还原到「' + _label(oldMode) + '」。',
+        confirmText: '确定',
+        cancelText: '取消',
+        autoCloseMs: 10000,
+        autoCloseAction: 'cancel'
+      }).then(function (ok) {
+        _pending = false;
+        if (ok) {
+          /* 保留：localStorage 已是新值 */
+          try {
+            showToast('✅ 布局模式已切换到「' + _label(newMode) + '」');
+          } catch (e) {}
+        } else {
+          /* 取消 / 超时：还原 */
+          state.forceLayoutMode = oldMode;
+          if (oldMode === 'auto') _clearLS();
+          else _writeLS(oldMode);
+          _applyLayout();
+          sel.value = oldMode;
+          try {
+            showToast('已还原到「' + _label(oldMode) + '」');
+          } catch (e) {}
+        }
+      });
+    });
+  }
+
+  _bind();
+  setTimeout(_bind, 500);
+  setTimeout(_bind, 1500);
+  setTimeout(_bind, 3000);
+})();
+
 console.log('🚀 客户端已加载，等待登录');
 </script>
 </body>
 </html>`;
 
 var CHANGELOG_DATA = [
-  { v: '0.31.0', d: '2026-10-25', t: '群邀请验证 · 独立音乐库 · 多端适配与体验优化',
+  {
+    v: '0.32.0', d: '2026-10-26', t: '智能通话 · 小屏修复 · 内存与安全加固',
     s: {
       Added: [
-        '新增群邀请验证机制（关闭直接拉群后，需被邀请人同意）',
-        '新增独立音乐库页面 /music，支持在线播放、动态签名防盗链与双通道下载',
-        '新增“消息气泡圆角”、“消息间距”等个性化外观设置',
-        '官网 /gw 与版本日志 /log 增加手机端响应式折叠与原生下拉框切换'
+        '智能通话路由：外网走 TURN，断网自动切 PeerJS 直连',
+        '通话仅限局域网，外部网络直接拒绝并提示',
+        '举报功能与 /jb 管理页（仅管理员可见）',
+        '在线用户列表 / 名片 / 群成员显示 IP 归属地'
       ],
       Changed: [
-        'WebRTC 通话增加外网动态检测，纯局域网环境自动秒切 P2P 直连'
+        '大 fileData 自动剥离到 files/filestore/，条数不变',
+        '消息事件由"每条一绑"改为"容器一次绑"，监听器由 1500 降至 6'
       ],
       Fixed: [
-        '修复特定尺寸（如 960×540 电视）下名片弹窗排版挤压的问题',
-        '修复 PC 端群侧栏悬停时因名字过长出现横向滚动条的问题',
-        '修复测试管理员输入验证码后卡在“连接中”、以及音乐下载被拦截的问题'
+        '修复 320×374 / 960×540 等小屏下联系人栏消失',
+        '修复历史消息批量拉取过期红包误触发封禁',
+        '修复多个 DoS 与前端语法错误导致的白屏'
       ],
       Security: [
-        '彻底移除看视频功能及相关代理接口，精简系统体积'
+        '引入 TRUSTED_PROXIES，杜绝伪造 X-Forwarded-For 绕过封禁',
+        'reply 增加原消息存在性校验，阻止伪造引用',
+        '移除酷狗音乐代理接口，杜绝未鉴权外链'
       ]
     }
   },
-  { v: '0.30.0', d: '2026-10-22', t: '只读模式 · 多语言反馈中心 · 扩展命令行',
+  {
+    v: '0.31.0', d: '2026-10-25', t: '群邀请验证 · 独立音乐库 · 多端适配',
     s: {
       Added: [
-        '全新「只读模式」：仅允许登录与查看，所有写操作 / /api/* / 下载 / 音乐一律禁用',
-        '命令行新增 readonly on | off | status | reset-login',
-        '只读模式下单 IP 10 分钟最多登录 5 次',
-        '新增 /readonly-check 状态查询接口',
-        '反馈中心多语言支持（简中 / 繁中 / English / 文言文）',
-        '新增 12 条命令行指令（反馈管理 / 用户查询 / 消息管理 / 系统运维）',
-        '设置新增 3 项：侧边栏消息预览、侧边栏悬停动画、提示音音量'
+        '群邀请需被邀请人同意才能入群',
+        '独立音乐库页面 /music，支持在线播放与防盗链',
+        '气泡圆角 / 消息间距可调；官网 /log 手机端适配'
+      ],
+      Changed: ['纯局域网环境自动切 P2P 直连'],
+      Fixed: [
+        '修复 960×540 名片弹窗排版挤压',
+        '修复群侧栏名字过长出现横向滚动条',
+        '修复测试管理员卡"连接中"'
+      ],
+      Security: ['移除看视频功能及相关代理接口']
+    }
+  },
+  {
+    v: '0.30.0', d: '2026-10-22', t: '只读模式 · 多语言反馈中心 · 扩展命令行',
+    s: {
+      Added: [
+        '只读模式（readonly on/off/status）',
+        '反馈中心多语言（简中/繁中/English/文言文）',
+        '新增 12 条命令行指令；只读下单 IP 登录限流 5 次/10 分钟'
       ],
       Changed: [
-        '只读模式下 /api/* 统一返回 JSON 403（X-Readonly-Mode: 1）',
-        '顶栏音乐 / 登录页更新日志按钮在只读模式下禁用',
-        '提示音音量滑块接入 playBeep（0% 静音）'
+        '只读下 /api/* 统一返回 JSON 403',
+        '顶栏音乐与更新日志按钮只读下禁用'
       ],
       Fixed: [
-        '修复群公告删除确认框被弹窗遮挡（对话框层级动态提升）',
-        '修复只读模式下 socket 生命周期事件被拦截导致部分设备白屏',
-        '修复只读白名单过窄导致登录页 / 只读查询被误拦',
-        '修复只读横幅插入位置错误导致布局异常'
+        '修复群公告确认框被弹窗遮挡',
+        '修复只读下部分设备白屏'
       ],
       Security: [
-        '只读模式下 /dl/* 与 /music/* 返回 HTML 403',
-        '只读模式下移除注册事件，无法注册新账号',
-        '单 IP 登录限流 5 次 / 10 分钟'
+        '只读下 /dl/* 与 /music/* 返回 HTML 403',
+        '只读下移除注册事件'
       ]
     }
   },
-  { v: '0.29.0', d: '2026-10-20', t: '多行输入 · 群公告 2.0 · 专属红包 · 全面修复',
+  {
+    v: '0.29.0', d: '2026-10-20', t: '多行输入 · 群公告 2.0 · 专属红包',
     s: {
       Added: [
-        '群专属转账（指定收款人，非指定成员无法领取）',
-        '全屏输入框 + 移动端快捷换行',
-        '群公告 2.0（多公告 / 置顶 / 历史 / 系统消息）',
-        '群成员智能搜索、@ 自动调起提及列表',
-        '「允许直接拉我进群」隐私设置',
-        '右键菜单支持存为表情 / @提及发送者'
+        '群专属转账（指定收款人）',
+        '群公告 2.0（多公告 / 置顶 / 历史）',
+        '全屏输入框；群成员搜索与 @ 提及'
       ],
-      Changed: [
-        '连续撤回自动合并、系统提示居中',
-        '导出设置项扩充至 60+ 项',
-        '深度优化服务端与客户端内存占用'
-      ],
+      Changed: ['连续撤回自动合并；导出设置扩充至 60+ 项'],
       Fixed: [
-        '修复离线消息上线后不显示未读红点',
+        '修复离线消息不显示红点',
         '修复群专属红包指定失效',
-        '修复火花错误分配、撤回语法错误导致白屏',
-        '修复加载更早消息卡死、群公告刷新丢失',
-        '修复右键菜单重叠 / 移动端设置错位'
+        '修复撤回语法错误导致白屏'
       ]
     }
   },
-  { v: '0.28.0', d: '2026-10-18', t: '看视频 · 1000 级 · 互动标识',
+  {
+    v: '0.28.0', d: '2026-10-18', t: 'B站看视频 · 1000 级 · 互动标识',
     s: {
       Added: [
-        'B站看视频面板（推荐 / 热门 / 排行榜 / 搜索 / 相关推荐 / 历史）',
+        'B站看视频面板（推荐 / 热门 / 排行 / 搜索）',
         '等级上限扩展到 1000 级',
-        '私聊 / 群聊互动标识（🔥 火花 / 🐲 龙王）',
-        '新增 6 项设置（互动标识 / 时间秒级 / 清空输入历史 / B站清晰度 / 弹幕 / 自动播放）'
+        '火花 🔥 / 龙王 🐲 互动标识'
       ],
-      Changed: ['系统账号统一 LV1000', '最后活跃时间登录与离线均刷新'],
-      Fixed: ['修复无法从服务器恢复设置', '修复管理员面板无法打开', '修复设置项点击无反应', '播放器关闭后占用资源']
+      Changed: ['系统内置账号统一 LV1000'],
+      Fixed: ['修复无法从服务器恢复设置', '修复管理面板打不开']
     }
   },
-  { v: '0.27.0', d: '2026-10-10', t: '拍一拍 · 翻译 · 会话背景',
+  {
+    v: '0.27.0', d: '2026-10-10', t: '拍一拍 · 翻译 · 会话背景',
     s: {
-      Added: ['拍一拍、消息翻译、会话独立背景、免打扰快捷开关、自动登录倒计时、Alt+J 消息跳转'],
-      Changed: ['内置账号资料升级、右键菜单自适应屏幕'],
-      Fixed: ['老用户首次设置密码失败等一批问题']
+      Added: ['拍一拍、消息翻译、会话独立背景、Alt+J 消息跳转'],
+      Changed: ['右键菜单自适应屏幕边缘'],
+      Fixed: ['老用户首次设密码失败']
     }
   },
-  { v: '0.26.0', d: '2026-10-06', t: '阅后即焚 · 源码保护',
+  {
+    v: '0.26.0', d: '2026-10-06', t: '阅后即焚 · 源码保护',
     s: {
       Added: ['阅后即焚消息、源码保护、顶栏收纳'],
-      Fixed: ['管理员 F12 被拦截、阅后消息不销毁等']
+      Fixed: ['管理员 F12 被拦截、阅后消息不销毁']
     }
   },
-  { v: '0.25.0', d: '2026-10-05', t: '风控 · 审核 · 安全加固',
+  {
+    v: '0.25.0', d: '2026-10-05', t: '风控 · 审核 · 安全加固',
     s: {
       Added: ['风控评分系统、内容审核、?dev=1 管理员调试通道'],
       Security: ['修复 CSRF、IDOR、消息与文件长度无上限']
     }
   },
-  { v: '0.24.0', d: '2026-09-28', t: '界面保护 · 多设备登录 · 设置云同步',
+  {
+    v: '0.24.0', d: '2026-09-28', t: '界面保护 · 多设备登录 · 设置云同步',
     s: {
-      Added: ['界面保护、多设备登录、设置云同步、官网 / 版本日志 / 下载中心 / 反馈中心 / Web 终端'],
+      Added: [
+        '界面保护、多设备登录、设置云同步',
+        '新增 /gw /log /download /kf /root 独立页面'
+      ],
       Changed: ['弹窗动画与右键菜单重构']
     }
   },
-  { v: '0.23.0', d: '2026-09-27', t: '命令行 TUI · 限时封禁 · 设备管理',
+  {
+    v: '0.23.0', d: '2026-09-27', t: '命令行 TUI · 限时封禁 · 设备管理',
     s: {
       Added: ['命令行 TUI、限时封禁、登录设备管理、多语言官网、Web 终端'],
       Changed: ['撤回消息仅保留文案，名字可点击']
     }
   },
-  { v: '0.22.0', d: '2026-09-26', t: '全部用户 · 自带对话框 · SYSTEM 账号',
+  {
+    v: '0.22.0', d: '2026-09-26', t: '全部用户 · 自带对话框 · SYSTEM 账号',
     s: {
       Added: ['全部用户弹窗、自带对话框、SYSTEM 内置账号'],
-      Changed: ['主布局 grid 通栏、聊天头部 QQ 风格']
+      Changed: ['主布局 grid 通栏；聊天头部 QQ 风格']
     }
   },
-  { v: '0.21.0', d: '2026-09-22', t: '等级与经验 · 签到日历',
+  {
+    v: '0.21.0', d: '2026-09-22', t: '等级与经验 · 签到日历',
     s: {
-      Added: ['等级与经验系统、签到日历、通话记录'],
+      Added: ['等级与经验、签到日历、通话记录'],
       Fixed: ['无法自动登录']
     }
   },
-  { v: '0.20.0', d: '2026-09-21', t: '注册密码 · 音乐库 · 通话优化',
+  {
+    v: '0.20.0', d: '2026-09-21', t: '注册密码 · 音乐库 · 通话优化',
     s: {
-      Added: ['独立注册 / 密码 / 密保 / 找回、客户端预哈希、设备令牌免密、音乐库、通话质量指示器'],
+      Added: ['独立注册/密码/密保/找回、客户端预哈希、设备令牌免密、音乐库、通话质量指示'],
       Fixed: ['老用户密码未保存、微信团队消息按钮无法点击']
     }
   },
-  { v: '0.19.0', d: '2026-09-19', t: '断线遮罩 · 微信支付 · 离线用户',
+  {
+    v: '0.19.0', d: '2026-09-19', t: '断线遮罩 · 微信支付 · 离线用户',
     s: {
       Added: ['全屏断线遮罩、微信支付 / 微信团队服务号、离线用户全量显示'],
       Changed: ['系统账号禁用输入与工具栏']
     }
   },
-  { v: '0.18.0', d: '2026-09-18', t: '群侧栏 · 存储空间 · 横屏适配',
+  {
+    v: '0.18.0', d: '2026-09-18', t: '群侧栏 · 存储空间 · 横屏适配',
     s: {
       Added: ['群聊右侧信息栏、存储空间管理、消息免打扰、横屏适配、大屏三栏弹窗'],
-      Changed: ['用户 ID 改为 10 位纯数字，新增改名功能']
+      Changed: ['用户 ID 改为 10 位纯数字']
     }
   },
-  { v: '0.17.0', d: '2026-09-18', t: 'CSS 回归主样式块',
+  {
+    v: '0.17.0', d: '2026-09-18', t: 'CSS 回归主样式块',
     s: { Changed: ['撤销 CSS 懒加载，修复窄屏布局崩塌'] }
   },
-  { v: '0.16.0', d: '2026-09-15', t: 'HTTPS · 群通话 · 红包算法 · 关于面板',
+  {
+    v: '0.16.0', d: '2026-09-15', t: 'HTTPS · 群通话 · 红包算法 · 关于面板',
     s: {
-      Added: ['HTTPS 支持、群语音 / 视频通话、个人名片编辑、关于面板与更新日志、红包混合算法'],
-      Changed: ['更新日志按需加载']
+      Added: ['HTTPS、群语音/视频通话、名片编辑、关于面板与更新日志、红包混合算法']
     }
   },
-  { v: '0.15.0', d: '2026-09-13', t: '钱包 · 红包 · 液态玻璃',
-    s: { Added: ['钱包 / 红包 / 空间动态 / 访客记录 / 双向拉黑、液态玻璃主题 / 内置浏览器 / 官方认证 / 行内编辑'] }
+  {
+    v: '0.15.0', d: '2026-09-13', t: '钱包 · 红包 · 液态玻璃',
+    s: {
+      Added: ['钱包、红包、空间动态、访客记录、双向拉黑、液态玻璃主题、内置浏览器、官方认证']
+    }
   },
-  { v: '0.14.0', d: '2026-09-12', t: '空间 · 拉黑 · 用户档案',
+  {
+    v: '0.14.0', d: '2026-09-12', t: '空间 · 拉黑 · 用户档案',
     s: { Added: ['朋友圈、访客记录、双向拉黑、用户档案持久化'] }
   },
-  { v: '0.13.0', d: '2026-09-05', t: '稳定分支',
-    s: { Changed: ['锁定精简日志 + 完整暗色 CSS + 前端 String.raw'] }
+  {
+    v: '0.13.0', d: '2026-09-05', t: '稳定分支',
+    s: { Changed: ['锁定精简日志 + 完整暗色 CSS'] }
   },
-  { v: '0.12.0', d: '2026-09-04', t: '日志瘦身 · 暗色可用',
-    s: { Changed: ['日志 typeMap 裁剪，暗色模式正式可用'] }
+  {
+    v: '0.12.0', d: '2026-09-04', t: '日志瘦身 · 暗色可用',
+    s: { Changed: ['日志裁剪，暗色模式正式可用'] }
   },
-  { v: '0.11.0', d: '2026-09-01', t: '数据持久化落地',
-    s: { Added: ['files/ 目录 + 5 个 JSON 持久化文件、防抖保存、登录全量恢复历史、群结构序列化'] }
+  {
+    v: '0.11.0', d: '2026-09-01', t: '数据持久化落地',
+    s: { Added: ['files/ 目录 + 5 个 JSON 持久化、防抖保存、登录全量恢复'] }
   },
-  { v: '0.10.0', d: '2026-08-27', t: '功能冻结快照',
+  {
+    v: '0.10.0', d: '2026-08-27', t: '功能冻结快照',
     s: { Added: ['联系人右键菜单、置顶 / 拉黑、静音、关于对话框、语音录制、图片压缩'] }
   },
-  { v: '0.9.0', d: '2026-08-26', t: 'UI 稳定基线',
-    s: { Added: ['微信风格三栏布局、深色模式、已读回执、群聊骨架、交互式命令行'] }
+  {
+    v: '0.9.0', d: '2026-08-26', t: 'UI 稳定基线',
+    s: { Added: ['微信风格三栏布局、深色模式、已读回执、群聊骨架'] }
   },
-  { v: '0.1.0', d: '2026-08-25', t: '项目创建',
+  {
+    v: '0.1.0', d: '2026-08-25', t: '项目创建',
     s: { Added: ['项目初始化'] }
   }
 ];
@@ -63887,6 +66846,22 @@ async function buildHtml() {
   return skeleton;
 }
 
+/* ★ v0.32.0 启动优化：原始 HTML 回退版本（仅做版本号替换，同步完成，10ms 内） */
+var HTML_RAW_FALLBACK = (function () {
+  try {
+    var raw = String(html);
+    var _ver = (Array.isArray(CHANGELOG_DATA) && CHANGELOG_DATA.length)
+      ? String(CHANGELOG_DATA[0].v) : '0.0.0';
+    return raw.replace(/__CHANGELOG_VERSION__/g, 'v' + _ver);
+  } catch (e) {
+    console.error('⚠️ HTML 原始回退版本生成失败:', e.message);
+    return '<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+      '<meta http-equiv="refresh" content="1"></head><body>' +
+      '<h1 style="font-family:sans-serif;text-align:center;padding:80px 20px">' +
+      'Server starting, please refresh in a moment.</h1></body></html>';
+  }
+})();
+
 var HTML_PENDING = [];            /* 等待中的 { req, res } */
 var HTML_BUILD_DONE = false;
 
@@ -64038,6 +67013,7 @@ function serveHtml(req, res) {
     if (_q === '1' || _q === 'true') _wantStream = true;
   } catch (e) {}
 
+  /* ★ 优先使用已构建好的压缩版本 */
   if (HTML_BUILD_DONE && HTML_BY_DEVICE && HTML_BY_DEVICE.full && HTML_BY_DEVICE.full.raw) {
     var _dev = _detectDevice(req);
     var _ver = HTML_BY_DEVICE[_dev];
@@ -64058,13 +67034,18 @@ function serveHtml(req, res) {
     }
     return;
   }
-  HTML_PENDING.push({ req: req, res: res });
-  setTimeout(function () {
-    var idx = HTML_PENDING.findIndex(function (p) { return p.res === res; });
-    if (idx === -1) return;
-    HTML_PENDING.splice(idx, 1);
-    res.type('html').send(html);
-  }, 30000);
+
+  /* ★ v0.32.0 启动优化：构建未完成时，直接返回原始未压缩 HTML（局域网毫秒级），
+     后台继续构建压缩版；用户首屏 0 等待，压缩版构建好后续请求自然升级 */
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Uncompressed', '1');
+  res.setHeader('Vary', 'Accept-Encoding, User-Agent');
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+  res.end(HTML_RAW_FALLBACK);
 }
 
 var READONLY_HTTP_OK = {
@@ -64072,7 +67053,9 @@ var READONLY_HTTP_OK = {
   '/gw': 1, '/log': 1, '/gy': 1, '/privacy': 1,
   '/login': 1, '/download': 1, '/download/login': 1, '/download/logout': 1,
   '/readonly-check': 1,
-  '/favicon.ico': 1
+  '/favicon.ico': 1,
+  '/jb': 1,
+  '/jb/api/list': 1
 };
 function _readonlyHttpAllowed(req) {
   var p = String(req.path || '');
@@ -64569,6 +67552,24 @@ var GW_LANG = {
   }
 };
 
+/* ★ 判断“浏览器→Cloudflare 边缘”这一段的真实协议（https / http） */
+function _getForwardedProto(req) {
+  try {
+    var _h = (req && req.headers) || {};
+    var xfp = _h['x-forwarded-proto'];
+    if (xfp && typeof xfp === 'string') {
+      var p = String(xfp).split(',')[0].trim().toLowerCase();
+      if (p === 'http' || p === 'https') return p;
+    }
+    return _useHttps ? 'https' : 'http';
+  } catch (e) { return _useHttps ? 'https' : 'http'; }
+}
+
+function _cookieSecureSuffix(req) {
+  try { return _getForwardedProto(req) === 'https' ? '; Secure' : ''; }
+  catch (e) { return ''; }
+}
+
 var gwSessions = {};
 var GW_SESSION_TTL = 7 * 24 * 3600 * 1000;  /* 7 天 */
 var gwLoginAttempts = {};
@@ -64882,6 +67883,13 @@ app.get('/gw', function (req, res) {
 
   var _gwSess = gwGetSession(req);
   var _gwUser = _gwSess ? String(_gwSess.userName || '') : '';
+  var _gwIsAdmin = false;
+  try {
+    if (_gwUser && persistentUsers[_gwUser] &&
+        persistentUsers[_gwUser].isAdmin) {
+      _gwIsAdmin = true;
+    }
+  } catch (_eAdmin) {}
   var _gwEsc = function (s) {
     return String(s == null ? '' : s)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -65164,6 +68172,9 @@ app.get('/gw', function (req, res) {
     '      <a href="/kf" data-lk="nav_feedback">反馈中心</a>',
     '      <a href="/download" data-lk="nav_download">下载中心</a>',
     '      <a href="/music">🎵 音乐库</a>',
+    (_gwIsAdmin
+      ? '      <a href="/jb" data-lk="nav_jb" style="color:#c62828;font-weight:600;">🚨 举报管理</a>'
+      : ''),
     '    </nav>',
     '    <button type="button" class="nav-btn gw-hamburger" id="gwMenuBtn" style="display:none; padding:6px; border:none; background:transparent; cursor:pointer;">',
     '      <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none"><path d="M3 12h18M3 6h18M3 18h18"></path></svg>',
@@ -65195,6 +68206,9 @@ app.get('/gw', function (req, res) {
     '        <a class="btn btn-primary" href="/" data-lk="hero_use">立即使用</a>',
     '        <a class="btn btn-ghost" href="/download" data-lk="hero_dl">下载中心</a>',
     '        <a class="btn btn-ghost" href="/root" data-lk="hero_term">Web 终端</a>',
+    (_gwIsAdmin
+      ? '        <a class="btn btn-ghost" href="/jb" style="border-color:#c62828;color:#c62828;">🚨 举报管理</a>'
+      : ''),
     '      </div>',
     '    </div>',
     '    <div class="hero-visual">',
@@ -65312,6 +68326,9 @@ app.get('/gw', function (req, res) {
     '    <a href="/download">下载中心</a>',
     '    <a href="/root">Web 终端</a>',
     '    <a href="/privacy">隐私政策</a>',
+    (_gwIsAdmin
+      ? '<a href="/jb" style="color:#f87171;">举报管理</a>'
+      : ''),
     '    ' + (_gwUser
       ? ('<a href="/download/logout?returnTo=' +
         encodeURIComponent('/gw') + '" style="color:#f87171;">退出登录</a>')
@@ -67471,10 +70488,17 @@ app.get('/download', function (req, res) {
 function _handleDlRequest(req, res) {
   try {
     var raw = String(req.params.fileName || '');
-    var safe = path.basename(raw);
-    if (!safe || safe === '.' || safe === '..' || safe.charAt(0) === '.') {
+    /* ★ v0.32.0 安全修复：解码 + 拒绝 null 字节 + basename + 绝对路径检查 */
+    try { raw = decodeURIComponent(raw); } catch (e) {}
+    if (raw.indexOf('\x00') !== -1) {
       res.status(400).end('bad name'); return;
     }
+    var safe = path.basename(raw);
+    if (!safe || safe === '.' || safe === '..' || safe.charAt(0) === '.' ||
+        safe.indexOf('/') !== -1 || safe.indexOf('\\') !== -1) {
+      res.status(400).end('bad name'); return;
+    }
+    if (path.isAbsolute(safe)) { res.status(400).end('bad name'); return; }
 
     var uid = String((req.query && req.query.uid) || '');
     var exp = String((req.query && req.query.exp) || '');
@@ -67600,7 +70624,8 @@ app.post('/download/login', function (req, res) {
     delete gwLoginAttempts[ip];
     var token = gwCreateSession(userRec.id, userRec.name);
     res.setHeader('Set-Cookie',
-      'gw_session=' + token + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=' +
+      'gw_session=' + token + '; Path=/; HttpOnly; SameSite=Lax' +
+      _cookieSecureSuffix(req) + '; Max-Age=' +
       Math.floor(GW_SESSION_TTL / 1000));
     console.log('🔓 下载中心登录成功：' + userRec.name + ' @ ' + ip +
       (returnTo !== '/download' ? (' → ' + returnTo) : ''));
@@ -67612,7 +70637,8 @@ app.get('/download/logout', function (req, res) {
   var s = gwGetSession(req);
   gwDestroySession(req);
   res.setHeader('Set-Cookie',
-    'gw_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+    'gw_session=; Path=/; HttpOnly; SameSite=Lax' +
+    _cookieSecureSuffix(req) + '; Max-Age=0');
   if (s) console.log('🔒 下载中心退出：' + s.userName);
   var returnTo = String((req.query && req.query.returnTo) || '/download');
   if (returnTo.charAt(0) !== '/' || returnTo.charAt(1) === '/') {
@@ -69927,7 +72953,8 @@ app.get('/kf', function (req, res) {
   if (sess && t) {
     try {
       res.setHeader('Set-Cookie',
-        'gw_session=' + t + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=' +
+        'gw_session=' + t + '; Path=/; HttpOnly; SameSite=Lax' +
+        _cookieSecureSuffix(req) + '; Max-Age=' +
         Math.floor(GW_SESSION_TTL / 1000));
     } catch (e) {}
   }
@@ -70645,6 +73672,262 @@ app.get('/kf/api/export', function (req, res) {
   res.end(json);
 });
 
+app.get('/jb', function (req, res) {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache');
+
+  var sess = gwGetSession(req);
+  if (!sess) {
+    res.redirect(302, '/login?returnTo=' + encodeURIComponent('/jb'));
+    return;
+  }
+  var userRec = persistentUsers[sess.userName] || {};
+  if (!userRec.isAdmin) {
+    res.end('<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>无权限</title><style>body{font-family:-apple-system,sans-serif;background:#f6fef9;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}.c{background:#fff;padding:48px 40px;border-radius:20px;text-align:center;box-shadow:0 20px 60px rgba(198,40,40,.15)}h2{color:#c62828;margin-bottom:16px}p{color:#666;margin-bottom:24px}a{color:#07c160;text-decoration:none;font-weight:600}</style></head><body><div class="c"><div style="font-size:64px;">🚫</div><h2>无权限访问</h2><p>举报管理仅限管理员访问。</p><a href="/gw">返回官网</a></div></body></html>');
+    return;
+  }
+
+  var _jbData = reportsList.slice(0, 500);
+  var _pending = 0, _handled = 0;
+  for (var _ji = 0; _ji < reportsList.length; _ji++) {
+    if (reportsList[_ji].status === 'pending') _pending++;
+    else _handled++;
+  }
+  var _safeName = String(sess.userName).replace(/[<>&"]/g, '');
+
+  res.end([
+    '<!DOCTYPE html>',
+    '<html lang="zh-CN">',
+    '<head>',
+    '<meta charset="UTF-8">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<title>举报管理 · 微信 · 局域网</title>',
+    '<style>',
+    '*{box-sizing:border-box;margin:0;padding:0}',
+    'body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:#f6fef9;color:#1a1a1a;min-height:100vh;line-height:1.6}',
+    '.nav{background:#fff;border-bottom:1px solid #eaeaea;padding:14px 24px;display:flex;align-items:center;gap:14px;position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(198,40,40,.05)}',
+    '.logo{font-weight:700;font-size:18px;color:#c62828;text-decoration:none}',
+    '.nav-spacer{flex:1}',
+    '.nav-btn{padding:7px 16px;border-radius:20px;font-size:13.5px;font-weight:600;border:1px solid #d5d5d5;background:transparent;color:#444;text-decoration:none;transition:all .15s}',
+    '.nav-btn:hover{border-color:#c62828;color:#c62828}',
+    '.wrap{max-width:1100px;margin:0 auto;padding:32px 24px 60px}',
+    '.head{margin-bottom:20px}',
+    '.head h1{font-size:26px;font-weight:800;color:#0a2918;margin-bottom:6px}',
+    '.head p{color:#666;font-size:14px}',
+    '.stats{display:flex;gap:16px;margin-top:16px;font-size:14px;flex-wrap:wrap}',
+    '.stats span b{color:#c62828;font-weight:700;margin-left:4px;font-variant-numeric:tabular-nums}',
+    '.filters{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center}',
+    '.chip{padding:6px 14px;border-radius:16px;border:1px solid #e5e7eb;background:#fff;color:#666;font-size:13px;cursor:pointer;font-family:inherit;transition:all .15s}',
+    '.chip:hover{border-color:#c62828;color:#c62828}',
+    '.chip.active{background:#c62828;color:#fff;border-color:#c62828}',
+    '.list{display:flex;flex-direction:column;gap:8px}',
+    '.item{background:#fff;border:1px solid #eaeaea;border-radius:10px;padding:14px 16px;display:grid;grid-template-columns:78px 1fr auto;gap:14px;align-items:start}',
+    '.item.pending{border-left:4px solid #c62828}',
+    '.item.handled{border-left:4px solid #9e9e9e;opacity:.85}',
+    '.item-id{font-family:Consolas,Monaco,monospace;font-size:12.5px;font-weight:700;color:#576b95;text-align:center;padding-top:2px}',
+    '.item-body{min-width:0}',
+    '.item-title{font-size:14px;font-weight:600;color:#1a1a1a;margin-bottom:4px;word-break:break-word}',
+    '.item-detail{font-size:13px;color:#666;margin-top:4px;word-break:break-word}',
+    '.item-quote{font-size:12.5px;color:#888;margin-top:6px;padding:6px 10px;background:#f5f5f5;border-radius:6px;max-height:60px;overflow:hidden;text-overflow:ellipsis;word-break:break-word}',
+    '.item-section{margin-top:10px}',
+    '.item-label{font-size:11.5px;font-weight:700;color:#999;letter-spacing:.5px;margin-bottom:4px;text-transform:uppercase}',
+    '.item-value{font-size:13px;color:#333;line-height:1.6;word-break:break-word;white-space:pre-wrap}',
+    '.item-quote-full{font-size:13px;color:#333;padding:10px 12px;background:#fafafa;border-left:3px solid #c62828;border-radius:0 6px 6px 0;line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:220px;overflow-y:auto}',
+    '.item-msgid{font-family:Consolas,Monaco,monospace;font-size:11.5px;color:#576b95;margin-top:6px;word-break:break-all}',
+    '.item-handled{font-size:12.5px;color:#888;margin-top:10px;padding-top:8px;border-top:1px dashed #eaeaea}',
+    '.item-handled b{color:#555}',
+    '.item-meta{font-size:12.5px;color:#888;margin-top:6px;display:flex;gap:12px;flex-wrap:wrap}',
+    '.item-meta b{color:#555}',
+    '.item-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}',
+    '.btn{padding:5px 12px;border:none;border-radius:14px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;transition:filter .15s}',
+    '.btn:hover{filter:brightness(.94)}',
+    '.btn-ok{background:#07c160;color:#fff}',
+    '.btn-del{background:#f5f5f5;color:#c62828}',
+    '.btn-del:hover{background:rgba(198,40,40,.12)}',
+    '.empty{text-align:center;padding:60px 20px;color:#999;font-size:14px}',
+    '.empty .icon{font-size:48px;display:block;margin-bottom:12px;opacity:.5}',
+    '.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0a2918;color:#fff;padding:10px 20px;border-radius:12px;font-size:13.5px;opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;z-index:9999}',
+    '.toast.show{opacity:1;transform:translateX(-50%) translateY(-6px)}',
+    '.toast.err{background:#c62828}',
+    '@media (max-width:640px){',
+    '.item{grid-template-columns:1fr;gap:8px}',
+    '.item-actions{justify-content:flex-start}',
+    '.wrap{padding:20px 14px}',
+    '.head h1{font-size:22px}',
+    '.nav{padding:12px 14px;gap:10px}',
+    '}',
+    '</style>',
+    '</head>',
+    '<body>',
+    '<header class="nav">',
+    '<a class="logo" href="/gw">🚨 举报管理</a>',
+    '<div class="nav-spacer"></div>',
+    '<span style="font-size:13px;color:#666;">👤 ' + _safeName + '</span>',
+    '<a class="nav-btn" href="/" style="background:#c62828;color:#fff;border-color:#c62828;">进入应用</a>',
+    '<a class="nav-btn" href="/download/logout?returnTo=' + encodeURIComponent('/jb') + '" style="color:#c62828;border-color:#f5b5b5;">退出</a>',
+    '</header>',
+    '<div class="wrap">',
+    '<div class="head">',
+    '<h1>🚨 举报管理</h1>',
+    '<p>查看并处理用户举报</p>',
+    '<div class="stats">',
+    '<span>全部：<b>' + reportsList.length + '</b></span>',
+    '<span>待处理：<b style="color:#c62828;">' + _pending + '</b></span>',
+    '<span>已处理：<b style="color:#9e9e9e;">' + _handled + '</b></span>',
+    '</div>',
+    '</div>',
+    '<div class="filters">',
+    '<button class="chip active" data-f="all" type="button">全部</button>',
+    '<button class="chip" data-f="pending" type="button">待处理</button>',
+    '<button class="chip" data-f="handled" type="button">已处理</button>',
+    '</div>',
+    '<div class="list" id="jbList"></div>',
+    '</div>',
+    '<div class="toast" id="jbToast"></div>',
+    '<script>',
+    'window.__UI_GUARD_IDS = ["jbList","jbToast"];',
+    'var JB_DATA = ' + JSON.stringify(_jbData) + ';',
+    'var CUR = "all";',
+    'function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}',
+    'function toast(msg,err){var el=document.getElementById("jbToast");el.textContent=msg;el.className="toast show"+(err?" err":"");clearTimeout(el._t);el._t=setTimeout(function(){el.className="toast"+(err?" err":"");},2200);}',
+    'function fmt(ts){try{return new Date(ts).toLocaleString("zh-CN",{hour12:false});}catch(e){return "";}}',
+    'function render(){',
+    '  var list=document.getElementById("jbList");',
+    '  var arr=JB_DATA.filter(function(r){',
+    '    if(CUR==="all")return true;',
+    '    if(CUR==="pending")return r.status==="pending";',
+    '    return r.status!=="pending";',
+    '  });',
+    '  if(!arr.length){list.innerHTML=\'<div class="empty"><span class="icon">📭</span>暂无举报记录</div>\';return;}',
+    '  var html="";',
+    '  for(var i=0;i<arr.length;i++){',
+    '    var r=arr[i];',
+    '    var status=r.status==="pending"?"待处理":"已处理";',
+    '    var cls=r.status==="pending"?"pending":"handled";',
+    '    html+=\'<div class="item \'+cls+\'" data-id="\'+esc(r.id)+\'">\'+',
+    '      \'<div class="item-id">\'+esc(r.id)+\'</div>\'+',
+    '      \'<div class="item-body">\'+',
+    '        \'<div class="item-title">🚨 \'+esc(r.reason)+\'</div>\'+',
+    '        (r.detail',
+    '          ? \'<div class="item-section"><div class="item-label">详细说明</div>\'+',
+    '            \'<div class="item-value">\'+esc(r.detail)+\'</div></div>\'',
+    '          : \'\')+',
+    '        (r.msgContent',
+    '          ? \'<div class="item-section"><div class="item-label">消息原文</div>\'+',
+    '            \'<div class="item-quote-full">\'+esc(r.msgContent)+\'</div></div>\'',
+    '          : \'\')+',
+    '        (r.msgId ? \'<div class="item-msgid">消息 ID: \'+esc(r.msgId)+\'</div>\' : \'\')+',
+    '        \'<div class="item-meta">\'+',
+    '          \'<span>举报人：<b>\'+esc(r.reporterName)+\'</b></span>\'+',
+    '          \'<span>被举报：<b>\'+esc(r.targetName)+\'</b></span>\'+',
+    '          \'<span>类型：\'+(({user:"用户",group:"群组",message:"消息"})[r.targetType]||"消息")+\'</span>\'+',
+    '          \'<span>举报时间：\'+fmt(r.createdAt)+\'</span>\'+',
+    '          \'<span>状态：\'+status+\'</span>\'+',
+    '        \'</div>\'+',
+    '        (r.status!=="pending" && r.handledAt',
+    '          ? \'<div class="item-handled">✅ 由 <b>\'+esc(r.handledBy||"管理员")+\'</b> 于 \'+fmt(r.handledAt)+\' 处理</div>\'',
+    '          : \'\')+',
+    '      \'</div>\'+',
+    '      \'<div class="item-actions">\'+',
+    '        (r.status==="pending"?\'<button class="btn btn-ok" data-act="ok" data-id="\'+esc(r.id)+\'">标记已处理</button>\':\'\')+',
+    '        \'<button class="btn btn-del" data-act="del" data-id="\'+esc(r.id)+\'">删除</button>\'+',
+    '      \'</div>\'+',
+    '    \'</div>\';',
+    '  }',
+    '  list.innerHTML=html;',
+    '}',
+    'document.querySelectorAll(".chip").forEach(function(c){',
+    '  c.addEventListener("click",function(){',
+    '    document.querySelectorAll(".chip").forEach(function(x){x.classList.remove("active");});',
+    '    c.classList.add("active");',
+    '    CUR=c.getAttribute("data-f");',
+    '    render();',
+    '  });',
+    '});',
+    'document.addEventListener("click",function(e){',
+    '  var btn=e.target;if(!btn||!btn.getAttribute)return;',
+    '  var act=btn.getAttribute("data-act");if(!act)return;',
+    '  var id=btn.getAttribute("data-id");if(!id)return;',
+    '  if(act==="del"){',
+    '    if(!confirm("确定删除举报 "+id+" 吗？"))return;',
+    '    fetch("/jb/api/delete",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(d){',
+    '      if(d&&d.ok){toast("✅ 已删除");JB_DATA=JB_DATA.filter(function(x){return x.id!==id;});render();}',
+    '      else{toast((d&&d.error)||"删除失败",true);}',
+    '    }).catch(function(){toast("网络错误",true);});',
+    '  } else if(act==="ok"){',
+    '    fetch("/jb/api/status",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id,status:"handled"})}).then(function(r){return r.json();}).then(function(d){',
+    '      if(d&&d.ok){toast("✅ 已标记为已处理");JB_DATA.forEach(function(x){if(x.id===id){x.status="handled";x.handledAt=(d.item&&d.item.handledAt)||Date.now();x.handledBy=(d.item&&d.item.handledBy)||"我";}});render();}',
+    '      else{toast((d&&d.error)||"操作失败",true);}',
+    '    }).catch(function(){toast("网络错误",true);});',
+    '  }',
+    '});',
+    'render();',
+    '<\/script>',
+    '</body>',
+    '</html>'
+  ].join('\n'));
+});
+
+app.get('/jb/api/list', function (req, res) {
+  var sess = gwGetSession(req);
+  if (!sess) { res.status(401).json({ ok: false }); return; }
+  var userRec = persistentUsers[sess.userName] || {};
+  if (!userRec.isAdmin) { res.status(403).json({ ok: false }); return; }
+  res.json({ ok: true, list: reportsList });
+});
+
+app.post('/jb/api/delete', function (req, res) {
+  var sess = gwGetSession(req);
+  if (!sess) { res.status(401).json({ ok: false }); return; }
+  var userRec = persistentUsers[sess.userName] || {};
+  if (!userRec.isAdmin) { res.status(403).json({ ok: false }); return; }
+  gwReadBody(req, function (err, body) {
+    if (err) { res.json({ ok: false, error: '参数错误' }); return; }
+    var id = String((body && body.id) || '');
+    if (!id) { res.json({ ok: false, error: '缺少编号' }); return; }
+    var idx = -1;
+    for (var i = 0; i < reportsList.length; i++) {
+      if (reportsList[i].id === id) { idx = i; break; }
+    }
+    if (idx === -1) { res.json({ ok: false, error: '举报不存在' }); return; }
+    reportsList.splice(idx, 1);
+    saveReports();
+    console.log('🗑️ 举报已删除：' + id + ' by ' + sess.userName);
+    res.json({ ok: true });
+  });
+});
+
+app.post('/jb/api/status', function (req, res) {
+  var sess = gwGetSession(req);
+  if (!sess) { res.status(401).json({ ok: false }); return; }
+  var userRec = persistentUsers[sess.userName] || {};
+  if (!userRec.isAdmin) { res.status(403).json({ ok: false }); return; }
+  gwReadBody(req, function (err, body) {
+    if (err) { res.json({ ok: false, error: '参数错误' }); return; }
+    var id = String((body && body.id) || '');
+    var status = String((body && body.status) || 'handled');
+    if (!id) { res.json({ ok: false, error: '缺少编号' }); return; }
+    var r = null;
+    for (var i = 0; i < reportsList.length; i++) {
+      if (reportsList[i].id === id) { r = reportsList[i]; break; }
+    }
+    if (!r) { res.json({ ok: false, error: '举报不存在' }); return; }
+    r.status = (status === 'pending') ? 'pending' : 'handled';
+    r.handledAt = Date.now();
+    r.handledBy = sess.userName;
+    saveReports();
+    res.json({
+      ok: true,
+      item: {
+        id: r.id,
+        status: r.status,
+        handledAt: r.handledAt,
+        handledBy: r.handledBy
+      }
+    });
+  });
+});
+
 app.get('/root', function (req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache');
@@ -71144,32 +74427,6 @@ app.get('/api/contact-tags', function (req, res) {
   res.json({ ok: true, tags: tags });
 });
 
-// 1. 搜索歌曲（透传给酷狗中间件）
-app.get('/api/kugou/search', async (req, res) => {
-  try {
-    const keyword = req.query.keyword;
-    // 假设酷狗中间件运行在 4000 端口
-    const kugouRes = await fetch(`http://127.0.0.1:4000/search?keywords=${encodeURIComponent(keyword)}&type=1`);
-    const data = await kugouRes.json();
-    res.json({ ok: true, list: data.data?.lists || [] });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: '酷狗搜索失败' });
-  }
-});
-
-// 2. 获取播放链接（需要携带登录 Token）
-app.get('/api/kugou/url', async (req, res) => {
-  try {
-    const hash = req.query.hash;
-    // 这里的 token 和 userid 应该从用户资料或持久化的文件中读取
-    const kugouRes = await fetch(`http://127.0.0.1:4000/song/url?id=${hash}&platform=lite&token=${token}&userid=${userid}`);
-    const data = await kugouRes.json();
-    res.json({ ok: true, url: data.data?.url });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: '获取播放链接失败' });
-  }
-});
-
 app.post('/api/contact-tags', function (req, res) {
   var uid = String(req.body && req.body.userId || '');
   var tags = req.body && req.body.tags;
@@ -71447,7 +74704,10 @@ app.get('/music', function (req, res) {
       var durTxt = f.duration > 0 ? fmtDur(f.duration) : '-';
       var upName = f.uploaderName || f.uploader || '未知';
       rowsHtml += '<tr>' +
-        '<td class="dl-name"><span class="ext">AUDIO</span><b>' + esc(f.name) + '</b></td>' +
+        '<td class="dl-name"><span class="ext">AUDIO</span><b class="music-title-link" ' +
+          'data-id="' + esc(f.id) + '" ' +
+          'data-url="' + esc(playUrl) + '" ' +
+          'data-name="' + esc(f.name) + '">' + esc(f.name) + '</b></td>' +
         '<td>' + esc(f.artist || '-') + '</td>' +
         '<td class="dl-size">' + fmtSize(f.fileSize) + '</td>' +
         '<td class="dl-time">' + durTxt + '</td>' +
@@ -71474,7 +74734,10 @@ app.get('/music', function (req, res) {
     'body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f9f6fb;color:#1a1a1a;min-height:100vh;line-height:1.6}',
     'a{color:inherit;text-decoration:none}',
     '.nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,.92);backdrop-filter:blur(14px);border-bottom:1px solid #eaeaea;box-shadow:0 2px 8px rgba(156,39,176,.05)}',
-    '.nav-inner{max-width:1200px;margin:0 auto;padding:14px 24px;display:flex;align-items:center;gap:24px}',
+    '.nav-inner{max-width:1200px;margin:0 auto;padding:14px 24px;display:flex;align-items:center;gap:24px;position:relative}',
+    '.nav-actions{display:flex;align-items:center;gap:24px}',
+    '.nav-toggle{display:none;background:none;border:none;font-size:22px;cursor:pointer;color:#666;padding:4px 8px;border-radius:6px;line-height:1}',
+    '.nav-toggle:hover{background:rgba(0,0,0,.05)}',
     '.logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:19px;color:#9c27b0}',
     '.logo-icon{width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#9c27b0,#7b1fa2);display:flex;align-items:center;justify-content:center;font-size:20px;color:#fff;box-shadow:0 4px 12px rgba(156,39,176,.35)}',
     '.nav-spacer{flex:1}',
@@ -71493,7 +74756,10 @@ app.get('/music', function (req, res) {
     'td{padding:14px 18px;border-top:1px solid #f0f0f0}',
     'tr:hover td{background:#fdfcff}',
     '.dl-name{display:flex;align-items:center;gap:8px}',
-    '.dl-name .ext{display:inline-block;padding:1px 6px;border-radius:6px;font-size:10.5px;font-weight:700;background:rgba(156,39,176,.12);color:#9c27b0}',
+    '.dl-name .ext{display:inline-block;padding:1px 7px;border-radius:6px;font-size:10.5px;font-weight:700;background:rgba(156,39,176,.12);color:#9c27b0}',
+    '.dl-name .music-title-link{cursor:pointer;font-weight:600;color:#1a1a1a;transition:color .15s}',
+    '.dl-name .music-title-link:hover{color:#9c27b0;text-decoration:underline}',
+    '.dl-name .music-title-link:active{opacity:.75}',
     '.dl-size{color:#666;font-variant-numeric:tabular-nums}',
     '.dl-time{color:#888;font-size:13px}',
     '.dl-action{text-align:right;white-space:nowrap}',
@@ -71509,7 +74775,22 @@ app.get('/music', function (req, res) {
     '.player-text{font-size:14px;font-weight:600;color:#7b1fa2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px}',
     '.player-close{background:none;border:none;color:#999;font-size:16px;cursor:pointer;padding:4px;line-height:1;border-radius:50%}',
     '.player-close:hover{background:rgba(0,0,0,.06);color:#333}',
-    '@media (max-width:768px){.nav-inner{padding:12px 14px}.head h1{font-size:24px}.wrap{padding:24px 14px}.dl-time:nth-child(2){display:none}th,td{padding:10px 12px}.dl-action .dl-btn{margin-left:4px;padding:4px 8px;font-size:12px}}',
+    '@media (max-width:768px){',
+    '.nav-inner{padding:12px 14px;gap:10px}',
+    '.nav-toggle{display:inline-flex;align-items:center;justify-content:center}',
+    '.nav-actions{position:absolute;top:100%;left:0;right:0;background:#fff;flex-direction:column;padding:12px 16px;gap:8px;box-shadow:0 8px 20px rgba(0,0,0,.1);border-radius:0 0 12px 12px;display:none;z-index:200}',
+    '.nav-actions.open{display:flex}',
+    '.nav-actions .nav-btn{width:100%;text-align:center;justify-content:center}',
+    '.head h1{font-size:24px}.wrap{padding:24px 14px}',
+    '.dl-time:nth-child(2){display:none}th,td{padding:10px 12px}',
+    '.dl-action{white-space:normal;display:flex;flex-wrap:wrap;justify-content:flex-end;gap:4px}',
+    '.dl-action .dl-btn{margin-left:0;padding:4px 8px;font-size:12px}',
+    /* 播放器在窄屏改为纵向布局，避免 audio controls 撑破 */
+    '.player-bar{flex-direction:column;gap:8px;padding:10px 14px;max-width:calc(100vw - 20px);bottom:10px;position:relative;left:auto;transform:none;margin:14px auto 0;width:100%}',
+    '.player-text{font-size:13px;max-width:100%;width:100%;text-align:center}',
+    '.player-bar audio{width:100%;min-width:0}',
+    '.player-close{position:absolute;right:6px;top:6px;font-size:14px;background:rgba(0,0,0,.05);width:24px;height:24px;display:flex;align-items:center;justify-content:center}',
+    '}',
   ].join('\n'));
   parts.push('</style>');
   parts.push('</head>');
@@ -71518,9 +74799,12 @@ app.get('/music', function (req, res) {
   parts.push('<a class="logo" href="/gw"><div class="logo-icon">🎵</div><span>音乐库</span></a>');
   parts.push('<div class="nav-spacer"></div>');
   parts.push('<span style="font-size:13px;color:#666;margin-right:8px;">👤 ' + esc(_gwSession.userName) + '</span>');
+  parts.push('<button type="button" class="nav-toggle" id="navToggle" aria-label="菜单">☰</button>');
+  parts.push('<div class="nav-actions" id="navActions">');
   parts.push('<a class="nav-btn" href="/download">下载中心</a>');
   parts.push('<a class="nav-btn" href="/" style="background:#9c27b0;color:#fff;border-color:#9c27b0;">进入应用</a>');
   parts.push('<a class="nav-btn" href="/download/logout?returnTo=' + encodeURIComponent('/music') + '" style="color:#c62828;border-color:#f5b5b5;">退出</a>');
+  parts.push('</div>');
   parts.push('</div></header>');
   parts.push('<div class="wrap">');
   parts.push('<div class="head"><h1>🎵 音乐库</h1><p>点击「播放」在线收听，或使用「HTTPS / HTTP」下载。</p>');
@@ -71537,6 +74821,20 @@ app.get('/music', function (req, res) {
   parts.push('<button class="player-close" onclick="document.getElementById(\'playerBar\').style.display=\'none\';document.getElementById(\'pageAudio\').pause();">✕</button>');
   parts.push('</div>');
   parts.push('<script>');
+  parts.push('(function(){');
+  parts.push('  var btn = document.getElementById("navToggle");');
+  parts.push('  var menu = document.getElementById("navActions");');
+  parts.push('  if (!btn || !menu) return;');
+  parts.push('  btn.addEventListener("click", function(e){');
+  parts.push('    e.stopPropagation();');
+  parts.push('    menu.classList.toggle("open");');
+  parts.push('  });');
+  parts.push('  document.addEventListener("click", function(e){');
+  parts.push('    if (!menu.contains(e.target) && !btn.contains(e.target)) {');
+  parts.push('      menu.classList.remove("open");');
+  parts.push('    }');
+  parts.push('  });');
+  parts.push('})();');
   parts.push('function playAudio(url, name) {');
   parts.push('  var bar = document.getElementById("playerBar");');
   parts.push('  var audio = document.getElementById("pageAudio");');
@@ -71546,11 +74844,21 @@ app.get('/music', function (req, res) {
   parts.push('  audio.src = url;');
   parts.push('  audio.play().catch(function(e){ console.warn("播放失败", e); });');
   parts.push('}');
+  parts.push('function _musicPlayFromEl(el) {');
+  parts.push('  var id = el.getAttribute("data-id");');
+  parts.push('  if (id) fetch("/api/music/play?id=" + encodeURIComponent(id)).catch(function(){});');
+  parts.push('  playAudio(el.getAttribute("data-url"), el.getAttribute("data-name"));');
+  parts.push('}');
   parts.push('document.querySelectorAll(".dl-btn.play").forEach(function(btn) {');
-  parts.push('  btn.addEventListener("click", function() {');
-  parts.push('    var id = this.getAttribute("data-id");');
-  parts.push('    if (id) fetch("/api/music/play?id=" + encodeURIComponent(id)).catch(function(){});');
-  parts.push('    playAudio(this.getAttribute("data-url"), this.getAttribute("data-name"));');
+  parts.push('  btn.addEventListener("click", function(e) {');
+  parts.push('    e.stopPropagation();');
+  parts.push('    _musicPlayFromEl(this);');
+  parts.push('  });');
+  parts.push('});');
+  parts.push('document.querySelectorAll(".music-title-link").forEach(function(el) {');
+  parts.push('  el.addEventListener("click", function(e) {');
+  parts.push('    e.stopPropagation();');
+  parts.push('    _musicPlayFromEl(this);');
   parts.push('  });');
   parts.push('});');
   parts.push('<\/script>');
@@ -71695,7 +75003,7 @@ app.post('/api/dev-exempt', csrfGuard, function (req, res) {
   }
 });
 
-app.get('/readonly-check', function (req, res) {
+app.get('/readonly-check', attackGuardMiddleware, function (req, res) {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
@@ -71727,7 +75035,237 @@ app.get('/readonly-check', function (req, res) {
   });
 });
 
-app.get('/api/ip-status', function (req, res) {
+/* ===== 统计面板数据 ===== */
+var _statsCache = { data: null, ts: 0 };
+var _STATS_CACHE_TTL = 30 * 1000;
+
+function _calcDataDirSize() {
+  var total = 0, files = 0;
+  try {
+    var _walk = function (dir) {
+      var entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (var i = 0; i < entries.length; i++) {
+        var e = entries[i];
+        var fp = path.join(dir, e.name);
+        try {
+          if (e.isDirectory()) _walk(fp);
+          else if (e.isFile()) {
+            var st = fs.statSync(fp);
+            total += st.size;
+            files++;
+          }
+        } catch (e2) {}
+      }
+    };
+    _walk(DATA_DIR);
+  } catch (e) {}
+  return { bytes: total, files: files };
+}
+
+function buildStatsPayload() {
+  var now = Date.now();
+  var todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  var todayMid = todayStart.getTime();
+  var weekMid = todayMid - 6 * 24 * 3600 * 1000;
+
+  var totalUsers = Object.keys(persistentUsers).length;
+  var onlineCount = 0;
+  userMap.forEach(function (u) { if (u.online) onlineCount++; });
+
+  var totalMsgs = 0, todayMsgs = 0, weekMsgs = 0;
+  var totalSessions = 0;
+  for (var k in messageHistory) {
+    if (!messageHistory.hasOwnProperty(k)) continue;
+    var arr = messageHistory[k];
+    if (!Array.isArray(arr) || !arr.length) continue;
+    totalSessions++;
+    totalMsgs += arr.length;
+    for (var i = arr.length - 1; i >= 0; i--) {
+      var m = arr[i];
+      if (!m || !m.ts) break;
+      if (m.ts >= todayMid) todayMsgs++;
+      else if (m.ts >= weekMid) weekMsgs++;
+      else break;
+    }
+  }
+  weekMsgs += todayMsgs;
+
+  var groupCount = groupMap.size;
+  var musicCount = musicList.length;
+  var feedbackCount = feedbackList.length;
+  var reportCount = reportsList.length;
+  var pendingReports = 0;
+  for (var ri = 0; ri < reportsList.length; ri++) {
+    if (reportsList[ri].status === 'pending') pendingReports++;
+  }
+
+  var activeUsers = [];
+  var _activeMap = {};
+  for (var kk in messageHistory) {
+    if (!messageHistory.hasOwnProperty(kk)) continue;
+    if (kk.indexOf('private_') !== 0 && kk.indexOf('group_') !== 0) continue;
+    var arr2 = messageHistory[kk];
+    if (!Array.isArray(arr2)) continue;
+    var _scanStart = Math.max(0, arr2.length - 200);
+    for (var ai = _scanStart; ai < arr2.length; ai++) {
+      var m2 = arr2[ai];
+      if (!m2 || !m2.from || !m2.ts) continue;
+      if (m2.ts < weekMid) continue;
+      _activeMap[m2.from] = (_activeMap[m2.from] || 0) + 1;
+    }
+  }
+  var _aArr = [];
+  for (var uid in _activeMap) {
+    if (_activeMap.hasOwnProperty(uid)) {
+      _aArr.push({ id: uid, n: _activeMap[uid] });
+    }
+  }
+  _aArr.sort(function (a, b) { return b.n - a.n; });
+  for (var _ai2 = 0; _ai2 < Math.min(10, _aArr.length); _ai2++) {
+    var _u = getUserById(_aArr[_ai2].id);
+    if (_u) {
+      activeUsers.push({ id: _u.id, name: _u.name, count: _aArr[_ai2].n });
+    }
+  }
+
+  /* 最近 7 天每日消息量 */
+  var daily = [];
+  for (var di = 6; di >= 0; di--) {
+    var dayStart = todayMid - di * 24 * 3600 * 1000;
+    var dayEnd = dayStart + 24 * 3600 * 1000;
+    var cnt = 0;
+    for (var sk in messageHistory) {
+      if (!messageHistory.hasOwnProperty(sk)) continue;
+      var sArr = messageHistory[sk];
+      if (!Array.isArray(sArr)) continue;
+      for (var si = sArr.length - 1; si >= 0; si--) {
+        var sm = sArr[si];
+        if (!sm || !sm.ts) break;
+        if (sm.ts < dayStart) break;
+        if (sm.ts < dayEnd) cnt++;
+      }
+    }
+    var _d = new Date(dayStart);
+    daily.push({
+      day: (_d.getMonth() + 1) + '/' + _d.getDate(),
+      count: cnt
+    });
+  }
+
+  var storage = _calcDataDirSize();
+  var mem = process.memoryUsage();
+
+  return {
+    generatedAt: now,
+    users: {
+      total: totalUsers,
+      online: onlineCount,
+      offline: totalUsers - onlineCount
+    },
+    messages: {
+      total: totalMsgs,
+      today: todayMsgs,
+      week: weekMsgs,
+      sessions: totalSessions
+    },
+    groups: groupCount,
+    music: musicCount,
+    feedback: feedbackCount,
+    reports: { total: reportCount, pending: pendingReports },
+    storage: {
+      bytes: storage.bytes,
+      files: storage.files
+    },
+    memory: {
+      rss: mem.rss,
+      heap: mem.heapUsed,
+      uptime: process.uptime()
+    },
+    activeUsers: activeUsers,
+    daily: daily
+  };
+}
+
+app.get('/api/stats', attackGuardMiddleware, function (req, res) {
+  var sess = gwGetSession(req);
+  if (!sess) {
+    console.warn('⚠️ [stats] 未登录：cookie=' +
+      ((req.headers.cookie || '').slice(0, 60) || '空') +
+      ' query.t=' + ((req.query && req.query.t) ? '有' : '空'));
+    res.status(401).json({ ok: false, error: '未登录' });
+    return;
+  }
+  var userRec = persistentUsers[sess.userName] || {};
+  if (!userRec.isAdmin) {
+    console.warn('⚠️ [stats] 无权限：' + sess.userName + ' 不是管理员');
+    res.status(403).json({ ok: false, error: '无权限' });
+    return;
+  }
+
+  res.setHeader('Cache-Control', 'no-store');
+
+  var now = Date.now();
+  var _force = String((req.query && req.query.force) || '') === '1';
+  if (!_force && _statsCache.data && (now - _statsCache.ts) < _STATS_CACHE_TTL) {
+    res.json({ ok: true, stats: _statsCache.data, cached: true });
+    return;
+  }
+  try {
+    var data = buildStatsPayload();
+    _statsCache.data = data;
+    _statsCache.ts = now;
+    res.json({ ok: true, stats: data, cached: false });
+  } catch (e) {
+    console.error('❌ /api/stats 出错:', e.message);
+    res.status(500).json({ ok: false, error: 'stats failed' });
+  }
+});
+
+app.get('/api/ip-location', attackGuardMiddleware, function (req, res) {
+  var ip = String((req.query && req.query.ip) || _getRealIp(req));
+  if (!ip) { res.status(400).json({ ok: false, error: '缺少 IP' }); return; }
+  var loc = getIpLocation(ip);
+  if (!loc) {
+    res.json({ ok: true, ip: ip, location: null, regionText: '未知' });
+    return;
+  }
+  res.json({
+    ok: true,
+    ip: ip,
+    location: {
+      country: loc.country,
+      province: loc.province,
+      city: loc.city,
+      isp: loc.isp
+    },
+    regionText: loc.regionText
+  });
+});
+
+app.get('/api/ip-location', attackGuardMiddleware, function (req, res) {
+  var ip = String((req.query && req.query.ip) || _getRealIp(req));
+  if (!ip) { res.status(400).json({ ok: false, error: '缺少 IP' }); return; }
+  var _cf = req.headers && req.headers['cf-ipcountry'];
+  var loc = getIpLocation(ip, _cf);
+  if (!loc) {
+    res.json({ ok: true, ip: ip, location: null, regionText: '未知' });
+    return;
+  }
+  res.json({
+    ok: true,
+    ip: ip,
+    location: {
+      country: loc.country,
+      province: loc.province,
+      city: loc.city,
+      isp: loc.isp
+    },
+    regionText: loc.regionText
+  });
+});
+
+app.get('/api/ip-status', attackGuardMiddleware, function (req, res) {
   try {
     var ip = _getRealIp(req);
     if (ip && _agIsBanned(ip)) {
@@ -71875,7 +75413,7 @@ app.get('/api/changelog', function (req, res) {
   }
 });
 
-app.post('/api/ui-guard-violation', function (req, res) {
+app.post('/api/ui-guard-violation', csrfGuard, function (req, res) {
   var ip = _getRealIp(req);
   if (!ip) { res.status(400).json({ ok: false }); return; }
 
@@ -72938,15 +76476,23 @@ io.on('connection', function (socket) {
         }
       })();
 
+      var _rec = persistentUsers[name];
       var newUser = {
-        id: id, name: name, online: true, socketId: socket.id,
+        online: true,
+        socketId: socket.id,
+        /* 动态字段：运行时可变，普通属性 */
         level: level, vip: vip, isAdmin: isAdmin, muted: muted,
-        verified: verified, profile: profile,
-        presence: (rec && rec.presence) || 'online',
-        exp: userExp,
-        lastSignin: lastSignin,
-        banned: false
+        verified: verified, presence: (rec && rec.presence) || 'online',
+        exp: userExp, lastSignin: lastSignin, banned: false,
+        /* 静态字段：getter 直读源，省内存 */
+        _lastPatTs: 0, _lastTypingAt: 0,
+        _lastContent: '', _targetUser: null, _targetGroup: null
       };
+      Object.defineProperties(newUser, {
+        id:       { get: function () { return _rec.id; },     enumerable: true },
+        name:     { get: function () { return _rec.name; },   enumerable: true },
+        profile:  { get: function () { return persistentProfiles[_rec.name] || profile || {}; }, enumerable: true }
+      });
       userMap.set(id, newUser);
       socket.data.userId = id;
       socket.data.userName = name;
@@ -72988,6 +76534,9 @@ io.on('connection', function (socket) {
         maxLevel: MAX_LEVEL,
         createdAt: persistentUsers[name].createdAt || Date.now(),
         lastActive: Date.now(),
+        ip: _clientIp,
+        ipLocation: getIpLocation(_clientIp,
+          socket.handshake.headers && socket.handshake.headers['cf-ipcountry']),
         deviceToken: socket._issuedDeviceToken || '',
         feedbackToken: (function () {
           try { return gwCreateSession(id, name); }
@@ -72996,7 +76545,17 @@ io.on('connection', function (socket) {
             return '';
           }
         })(),
-        secure: _useHttps,
+        ipLocation: getIpLocation(_clientIp),
+        secure: (function () {
+          try {
+            var _hs = (socket && socket.handshake && socket.handshake.headers) || {};
+            var _xfp = _hs['x-forwarded-proto'];
+            if (_xfp && typeof _xfp === 'string') {
+              return String(_xfp).split(',')[0].trim().toLowerCase() === 'https';
+            }
+            return _useHttps;
+          } catch (e) { return _useHttps; }
+        })(),
         officialWebsite: (function () {
           var _fallback = 'https://localhost:' + PORT + '/gw';
           try {
@@ -73045,6 +76604,7 @@ io.on('connection', function (socket) {
         scheduled: scheduledMessages[id] || [],
         autoReplies: autoReplies[id] || [],
         interactions: _myInteractions,
+        restrictions: (persistentUsers[name] && persistentUsers[name].restrictions) || null,
         groupInvites: groupInvites.filter(function(i) { return i.targetId === id && i.status === 'pending'; })
       });
       try {
@@ -73060,7 +76620,16 @@ io.on('connection', function (socket) {
           socketId: socket.id
         });
       } catch (e) { }
-      log('LOGIN_SUCCESS', { socketId: socket.id, userId: id, name: name, level: level, isAdmin: isAdmin, resumed: resumed });
+      log('LOGIN_SUCCESS', {
+        socketId: socket.id, userId: id, name: name,
+        level: level, isAdmin: isAdmin, resumed: resumed,
+        ip: _clientIp,
+        region: (function () {
+          var _g = getIpLocation(_clientIp,
+            socket.handshake.headers && socket.handshake.headers['cf-ipcountry']);
+          return _g ? _g.regionText : '未知';
+        })()
+      });
       try { riskCheckConnect(id); } catch (eRC) { }
     try { riskCheckIp(_agIp, id); } catch (eRI) { }
 
@@ -73203,6 +76772,8 @@ io.on('connection', function (socket) {
         id: id, name: name, level: level, vip: vip,
         isAdmin: isAdmin, muted: muted, verified: verified,
         profile: profile,
+        ipLocation: getIpLocation(_clientIp,
+          socket.handshake.headers && socket.handshake.headers['cf-ipcountry']),
         exp: userExp,
         createdAt: persistentUsers[name] ? (persistentUsers[name].createdAt || 0) : 0,
         lastActive: persistentUsers[name] ? (persistentUsers[name].lastActive || 0) : 0
@@ -74165,7 +77736,7 @@ io.on('connection', function (socket) {
         expired: true
       });
       console.log('⚠️  Web 终端验证：验证码已过期（IP: ' +
-        (socket.handshake.address || 'unknown') + '）');
+        (_getRealIpFromSocket(socket) || 'unknown') + '）');
       return;
     }
 
@@ -74173,11 +77744,11 @@ io.on('connection', function (socket) {
       socket.data.termAuthorized = true;
       socket.emit('terminal-auth-result', { ok: true });
       console.log('🖥️  Web 终端已授权（IP: ' +
-        (socket.handshake.address || 'unknown') + '）');
+        (_getRealIpFromSocket(socket) || 'unknown') + '）');
     } else {
       socket.emit('terminal-auth-result', { ok: false, error: '验证码错误' });
       console.log('⚠️  Web 终端验证失败（IP: ' +
-        (socket.handshake.address || 'unknown') + '）');
+        (_getRealIpFromSocket(socket) || 'unknown') + '）');
     }
   });
 
@@ -74198,7 +77769,7 @@ io.on('connection', function (socket) {
     _termCode = String(Math.floor(100000 + Math.random() * 900000));
     _termCodeExpires = Date.now() + TERM_CODE_TTL;
 
-    var ip = socket.handshake.address || 'unknown';
+    var ip = _getRealIpFromSocket(socket) || 'unknown';
     var timeStr = new Date().toLocaleString('zh-CN', { hour12: false });
     console.log('');
     console.log('╔═══════════════════════════════════════════╗');
@@ -74407,7 +77978,7 @@ io.on('connection', function (socket) {
 
       if (_kfOut !== null) {
         socket.emit('terminal-output', { text: _kfOut });
-        console.log('[Web终端] ' + (socket.handshake.address || '?') + ' > ' + cmd);
+    console.log('[Web终端] ' + (_getRealIpFromSocket(socket) || '?') + ' > ' + cmd);
         return;
       }
     } catch (_kfErr) {
@@ -74446,7 +78017,7 @@ io.on('connection', function (socket) {
       text: outputs.length ? outputs.join('\n') : '(无输出)'
     });
 
-    console.log('[Web终端] ' + (socket.handshake.address || '?') + ' > ' + cmd);
+    console.log('[Web终端] ' + (_getRealIpFromSocket(socket) || '?') + ' > ' + cmd);
   });
 
   socket.on('net-ping', function (data) {
@@ -74454,6 +78025,50 @@ io.on('connection', function (socket) {
     socket.emit('net-pong', {
       t: (data && typeof data.t === 'number') ? data.t : Date.now()
     });
+  });
+
+  /* ★ v0.32.0：客户端按需拉取已剥离的 fileData */
+  socket.on('file-fetch', function (data, ack) {
+    var user = getUserBySocketId(socket.id);
+    if (!user || !data || !data.fileId) {
+      if (typeof ack === 'function') ack({ ok: false, error: '未登录或参数缺失' });
+      return;
+    }
+    /* 校验：只有该消息的参与方才有权拉取 */
+    var msgId = String(data.msgId || '');
+    var sessionKey = String(data.sessionKey || '');
+    var allowed = false;
+    try {
+      var arr = messageHistory[sessionKey] || [];
+      for (var i = 0; i < arr.length; i++) {
+        if (arr[i].msgId === msgId && arr[i].fileId === data.fileId) {
+          if (sessionKey.indexOf('private_') === 0) {
+            var rest = sessionKey.substring(8);
+            var idx = rest.indexOf('_');
+            if (idx !== -1) {
+              var a = rest.substring(0, idx);
+              var b = rest.substring(idx + 1);
+              if (a === user.id || b === user.id) allowed = true;
+            }
+          } else if (sessionKey.indexOf('group_') === 0) {
+            var gid = sessionKey.substring(6);
+            var g = groupMap.get(gid);
+            if (g && g.members.has(user.id)) allowed = true;
+          }
+          break;
+        }
+      }
+    } catch (e) {}
+    if (!allowed) {
+      if (typeof ack === 'function') ack({ ok: false, error: '无权访问' });
+      return;
+    }
+    var loaded = _fileStoreLoad(data.fileId);
+    if (!loaded) {
+      if (typeof ack === 'function') ack({ ok: false, error: '文件不存在' });
+      return;
+    }
+    if (typeof ack === 'function') ack({ ok: true, dataUrl: loaded.dataUrl });
   });
 
   /* ★ 客户端可随时拉取最新通话配置（WebRTC / PeerJS 分流） */
@@ -74476,7 +78091,7 @@ io.on('connection', function (socket) {
     socket.emit('history', {
       targetId: data.targetId,
       type: data.type,
-      messages: arr.slice(-HISTORY_PAGE_SIZE),
+      messages: _stripFileDataArr(arr.slice(-HISTORY_PAGE_SIZE)),
       hasMore: arr.length > HISTORY_PAGE_SIZE
     });
   });
@@ -74498,8 +78113,26 @@ io.on('connection', function (socket) {
     }
     var endIdx = arr.length;
     if (data.beforeMsgId) {
+      endIdx = -1;
       for (var i = arr.length - 1; i >= 0; i--) {
         if (arr[i].msgId === data.beforeMsgId) { endIdx = i; break; }
+      }
+      if (endIdx === -1) {
+        /* ★ v0.32.1：游标丢失（本地与服务端历史不同步）
+           - 不能返回 hasMore:false，否则客户端会永久锁死
+           - 返回 cursorMissing:true，客户端会重新 get-history 重建游标 */
+        console.warn('⚠️ [history-load-more] 游标丢失: ' +
+          data.beforeMsgId + ' @ ' + (user && user.name || user.id) +
+          '（服务端该会话共 ' + arr.length + ' 条）');
+        socket.emit('history-more', {
+          targetId: data.targetId,
+          type: type,
+          messages: [],
+          hasMore: true,
+          cursorMissing: true,
+          totalInServer: arr.length
+        });
+        return;
       }
     }
     var limit = Math.max(1, Math.min(200,
@@ -74508,7 +78141,7 @@ io.on('connection', function (socket) {
     socket.emit('history-more', {
       targetId: data.targetId,
       type: type,
-      messages: arr.slice(startIdx, endIdx),
+      messages: _stripFileDataArr(arr.slice(startIdx, endIdx)),
       hasMore: startIdx > 0
     });
   });
@@ -74526,6 +78159,7 @@ io.on('connection', function (socket) {
   socket.on('profile-update', function (data) {
     var user = getUserBySocketId(socket.id);
     if (!user || !data) return;
+    if (_rejectWithRestriction(socket, 'profile')) return;
     var prof = user.profile || {};
     if (typeof data.signature === 'string') prof.signature = data.signature.slice(0, 200);
     if (typeof data.gender === 'string') prof.gender = data.gender.slice(0, 10);
@@ -74710,6 +78344,13 @@ io.on('connection', function (socket) {
     var fromUser = getUserBySocketId(socket.id);
     if (!fromUser || !data) return;
 
+    /* ★ 账号功能限制：根据消息类型映射到具体限制项 */
+    var _restrictAction = 'message';
+    if (data.type === 'file' || data.type === 'image') _restrictAction = 'file';
+    else if (data.type === 'voice') _restrictAction = 'voice';
+    else if (data.type === 'redpacket') _restrictAction = 'redpacket';
+    if (_rejectWithRestriction(socket, _restrictAction, 'message-rejected')) return;
+
     var _agV = validateMessagePayload(data, false);
     if (!_agV.ok) {
       _agViolation(socket.data._agIp, 'bad-payload: ' + _agV.reason);
@@ -74795,6 +78436,10 @@ io.on('connection', function (socket) {
       fromName: fromUser.name,
       to: toUser.id,
       content: data.content || '',
+      latitude: (data.type === 'location' && data.latitude != null && data.latitude !== '') ? Number(data.latitude) : null,
+      longitude: (data.type === 'location' && data.longitude != null && data.longitude !== '') ? Number(data.longitude) : null,
+      accuracy: (data.type === 'location') ? Number(data.accuracy || 0) : 0,
+      address: (data.type === 'location') ? String(data.address || '').trim().slice(0, 120) : '',
       time: new Date().toLocaleString('zh-CN', { hour12: false }),
       msgId: data.msgId || generateId(),
       type: data.type || 'text',
@@ -74805,11 +78450,6 @@ io.on('connection', function (socket) {
       duration: data.duration || null,
       reply: data.reply || null,
       recalled: false, recalledBy: null,
-      fromLevel: fromUser.level || 0,
-      fromVip: !!fromUser.vip,
-      fromAdmin: !!fromUser.isAdmin,
-      fromVerified: fromUser.verified || '',
-      fromAvatar: (fromUser.profile && fromUser.profile.avatar) || '',
       isCallRecord: !!data.isCallRecord,
       callKind: data.callKind || null,
       callResult: data.callResult || null,
@@ -75148,6 +78788,7 @@ io.on('connection', function (socket) {
   socket.on('create-group', function (data) {
     var fromUser = getUserBySocketId(socket.id);
     if (!fromUser || !data) return;
+    if (_rejectWithRestriction(socket, 'groupCreate', 'group-error')) return;
     var name = (data.name || '').trim();
     if (!name) { socket.emit('group-error', '群名称不能为空'); return; }
     riskCheckGroupCreate(fromUser.id);
@@ -75504,7 +79145,8 @@ io.on('connection', function (socket) {
       socket.emit('group-error', '只有群主或管理员可以设置群公告');
       return;
     }
-    var text = (data.announcement || '').trim();
+    /* ★ v0.32.0：群公告长度上限 500 字符，避免超大公告卡渲染 */
+    var text = (data.announcement || '').trim().slice(0, 500);
     if (!text) return;
 
     if (!group.announcements) group.announcements = [];
@@ -75609,6 +79251,12 @@ io.on('connection', function (socket) {
     var fromUser = getUserBySocketId(socket.id);
     if (!fromUser || !data) return;
 
+    var _restrictActionG = 'message';
+    if (data.type === 'file' || data.type === 'image') _restrictActionG = 'file';
+    else if (data.type === 'voice') _restrictActionG = 'voice';
+    else if (data.type === 'redpacket') _restrictActionG = 'redpacket';
+    if (_rejectWithRestriction(socket, _restrictActionG, 'group-error')) return;
+
     var _agVg = validateMessagePayload(data, true);
     if (!_agVg.ok) {
       _agViolation(socket.data._agIp, 'bad-payload: ' + _agVg.reason);
@@ -75666,6 +79314,10 @@ io.on('connection', function (socket) {
       from: fromUser.id,
       fromName: fromUser.name,
       content: data.content || '',
+      latitude: (data.type === 'location' && data.latitude != null && data.latitude !== '') ? Number(data.latitude) : null,
+      longitude: (data.type === 'location' && data.longitude != null && data.longitude !== '') ? Number(data.longitude) : null,
+      accuracy: (data.type === 'location') ? Number(data.accuracy || 0) : 0,
+      address: (data.type === 'location') ? String(data.address || '').trim().slice(0, 120) : '',
       time: new Date().toLocaleString('zh-CN', { hour12: false }),
       msgId: finalMsgId,
       type: data.type || 'text',
@@ -75937,11 +79589,30 @@ io.on('connection', function (socket) {
     if (!user || !data) return;
     var group = getGroupById(data.groupId);
     if (!group || !group.members.has(user.id)) return;
+    /* ★ v0.32.0：群文件上传完整字段校验 */
+    if (!data.fileName || typeof data.fileName !== 'string' ||
+        data.fileName.length > 256 ||
+        data.fileName.indexOf('\x00') !== -1 ||
+        data.fileName.indexOf('..') !== -1 ||
+        data.fileName.indexOf('/') !== -1 ||
+        data.fileName.indexOf('\\') !== -1) {
+      socket.emit('group-error', '无效的文件名');
+      return;
+    }
     if (typeof data.fileSize === 'number' && data.fileSize > config.maxFileSize) {
       socket.emit('group-error', '文件太大（上限 ' + (config.maxFileSize / 1048576).toFixed(0) + 'MB）');
       return;
     }
+    if (typeof data.fileData !== 'string' || !data.fileData.length ||
+        data.fileData.length > MAX_FILE_DATA_LEN) {
+      socket.emit('group-error', '文件数据无效或过大');
+      return;
+    }
     if (!group.files) group.files = [];
+    if (group.files.length >= 500) {
+      socket.emit('group-error', '群文件已达上限（500）');
+      return;
+    }
     group.files.push({
       fileName: data.fileName, fileSize: data.fileSize, fileType: data.fileType,
       fileData: data.fileData, uploader: user.id, uploadTime: new Date().toISOString()
@@ -75959,7 +79630,24 @@ io.on('connection', function (socket) {
     if (!user || !data) return;
     var group = getGroupById(data.groupId);
     if (!group || !group.members.has(user.id)) return;
+    /* ★ v0.32.0：群相册上传校验 */
+    if (!data.fileName || typeof data.fileName !== 'string' ||
+        data.fileName.length > 256 ||
+        data.fileName.indexOf('\x00') !== -1 ||
+        data.fileName.indexOf('..') !== -1) {
+      socket.emit('group-error', '无效的文件名');
+      return;
+    }
+    if (typeof data.fileData !== 'string' || !data.fileData.length ||
+        data.fileData.length > MAX_FILE_DATA_LEN ||
+        data.fileData.indexOf('data:image/') !== 0) {
+      socket.emit('group-error', '仅允许图片数据');
+      return;
+    }
     if (!group.albums) group.albums = [];
+    if (group.albums.length >= 200) {
+      socket.emit('group-error', '群相册已达上限（200）'); return;
+    }
     group.albums.push({
       fileName: data.fileName, fileData: data.fileData,
       uploader: user.id, uploadTime: new Date().toISOString()
@@ -75976,12 +79664,25 @@ io.on('connection', function (socket) {
     if (!user || !data) return;
     var group = getGroupById(data.groupId);
     if (!group || !group.members.has(user.id)) return;
+    /* ★ v0.32.0：投票问题与选项校验 */
+    var _vQ = String(data.question || '').trim().slice(0, 200);
+    if (!_vQ) { socket.emit('vote-error', '投票问题不能为空'); return; }
+    var _vRaw = Array.isArray(data.options) ? data.options.slice(0, 10) : [];
+    var _vOpts = [];
+    for (var _vi = 0; _vi < _vRaw.length; _vi++) {
+      var _v = String(_vRaw[_vi] || '').trim().slice(0, 100);
+      if (_v) _vOpts.push(_v);
+    }
+    if (_vOpts.length < 2) { socket.emit('vote-error', '至少需要 2 个选项'); return; }
     if (!group.votes) group.votes = [];
+    if (group.votes.length >= 50) {
+      socket.emit('vote-error', '群投票数量已达上限（50）'); return;
+    }
     var voteId = generateVoteId();
     var results = {};
-    (data.options || []).forEach(function (o) { results[o] = 0; });
+    _vOpts.forEach(function (o) { results[o] = 0; });
     group.votes.push({
-      voteId: voteId, question: data.question, options: data.options,
+      voteId: voteId, question: _vQ, options: _vOpts,
       results: results, voters: [], creator: user.id, active: true
     });
     saveGroups();
@@ -76018,6 +79719,73 @@ io.on('connection', function (socket) {
     if (!u || !u.isAdmin) { socket.emit('admin-error', '权限不足'); return null; }
     return cb(u);
   }
+
+  socket.on('admin-set-restrictions', function (data) {
+    var admin = getUserBySocketId(socket.id);
+    if (!admin || !admin.isAdmin) { socket.emit('admin-error', '权限不足'); return; }
+    var u = getUserByName(data && data.targetName);
+    if (!u) { socket.emit('admin-error', '用户不在线或不存在'); return; }
+    var rec = persistentUsers[u.name];
+    if (!rec) { socket.emit('admin-error', '用户档案不存在'); return; }
+    if (!rec.restrictions || typeof rec.restrictions !== 'object') {
+      rec.restrictions = {};
+    }
+    var incoming = data.restrictions || {};
+    var allowed = ['message', 'file', 'voice', 'redpacket', 'call', 'moment', 'groupCreate', 'profile'];
+    for (var i = 0; i < allowed.length; i++) {
+      var k = allowed[i];
+      if (!incoming[k]) continue;
+      rec.restrictions[k] = {
+        allow: incoming[k].allow !== false,
+        reason: String(incoming[k].reason || '').slice(0, 60),
+        until: Math.max(0, Number(incoming[k].until) || 0)
+      };
+    }
+    saveUsers();
+    /* ★ 立即推给目标（在线用户秒生效，离线用户下次登录时读取） */
+    emitToUser(u.id, 'restrictions-updated', { restrictions: rec.restrictions });
+
+    /* ★ 同步给所有管理员，让他们的面板缓存保持最新 */
+    state._adminRestrictions = state._adminRestrictions || {}; /* 客户端本地维护 */
+    io.sockets.sockets.forEach(function (sk) {
+      try {
+        var skUser = getUserBySocketId(sk.id);
+        if (!skUser || !skUser.isAdmin) return;
+        sk.emit('admin-all-restrictions', {
+          restrictions: (function () {
+            var out = {};
+            for (var nm in persistentUsers) {
+              if (!persistentUsers.hasOwnProperty(nm)) continue;
+              var rr = persistentUsers[nm];
+              if (rr && rr.id && rr.restrictions) out[rr.id] = rr.restrictions;
+            }
+            return out;
+          })()
+        });
+      } catch (e) {}
+    });
+
+    socket.emit('restrictions-saved', { ok: true, targetName: u.name });
+    console.log('🛡️ 管理员 ' + admin.name + ' 修改了 ' + u.name + ' 的功能限制');
+  });
+
+  socket.on('admin-get-all-restrictions', function () {
+    var admin = getUserBySocketId(socket.id);
+    if (!admin || !admin.isAdmin) {
+      socket.emit('admin-all-restrictions', { restrictions: {}, error: '权限不足' });
+      return;
+    }
+    var out = {};
+    for (var name in persistentUsers) {
+      if (!persistentUsers.hasOwnProperty(name)) continue;
+      var rec = persistentUsers[name];
+      if (!rec || !rec.id) continue;
+      if (rec.restrictions && typeof rec.restrictions === 'object') {
+        out[rec.id] = rec.restrictions;
+      }
+    }
+    socket.emit('admin-all-restrictions', { restrictions: out });
+  });
 
   socket.on('admin-set-level', function (data) {
     requireAdmin(socket, function () {
@@ -76209,6 +79977,34 @@ io.on('connection', function (socket) {
     });
   });
 
+  socket.on('admin-set-restrictions', function (data) {
+    var admin = getUserBySocketId(socket.id);
+    if (!admin || !admin.isAdmin) { socket.emit('admin-error', '权限不足'); return; }
+    var u = getUserByName(data && data.targetName);
+    if (!u) { socket.emit('admin-error', '用户不在线或不存在'); return; }
+    var rec = persistentUsers[u.name];
+    if (!rec) { socket.emit('admin-error', '用户档案不存在'); return; }
+    if (!rec.restrictions || typeof rec.restrictions !== 'object') {
+      rec.restrictions = {};
+    }
+    var inComing = data.restrictions || {};
+    var allowed = ['message','file','voice','redpacket','call','moment','groupCreate','profile'];
+    for (var i = 0; i < allowed.length; i++) {
+      var k = allowed[i];
+      if (inComing[k]) {
+        rec.restrictions[k] = {
+          allow: inComing[k].allow !== false,
+          reason: String(inComing[k].reason || '').slice(0, 60),
+          until: Number(inComing[k].until) || 0
+        };
+      }
+    }
+    saveUsers();
+    emitToUser(u.id, 'restrictions-updated', { restrictions: rec.restrictions });
+    socket.emit('restrictions-saved', { ok: true, targetName: u.name });
+    console.log('🛡️ 管理员 ' + admin.name + ' 修改了 ' + u.name + ' 的功能限制');
+  });
+
   socket.on('admin-mute', function (data) {
     requireAdmin(socket, function () {
       var target = getUserByName(data.targetName);
@@ -76296,6 +80092,7 @@ if (!global.__roSchedHelpPrinted) {
   socket.on('moment-post', function (data) {
     var user = getUserBySocketId(socket.id);
     if (!user || !data) return;
+    if (_rejectWithRestriction(socket, 'moment', 'moment-error')) return;
     var content = String(data.content || '').trim().slice(0, 2000);
     var rawImgs = Array.isArray(data.images) ? data.images.slice(0, MAX_MOMENT_IMAGES) : [];
     var images = [];
@@ -76344,9 +80141,20 @@ if (!global.__roSchedHelpPrinted) {
     var user = getUserBySocketId(socket.id);
     if (!user) return;
     var targetId = (data && data.targetId) || user.id;
-    var offset = parseInt(data && data.offset, 10) || 0;
-    var limit = Math.min(60, parseInt(data && data.limit, 10) || 30);
-    var list = moments.filter(function (m) { return m.author === targetId; });
+    /* ★ v0.32.0：offset / limit 强制约束在合理范围 */
+    var offset = Math.max(0, parseInt(data && data.offset, 10) || 0);
+    var limit = Math.min(60, Math.max(1, parseInt(data && data.limit, 10) || 30));
+    /* ★ v0.32.0：moment-get 也按 visibility 过滤，与 feed 保持一致 */
+    var list = moments.filter(function (m) {
+      if (m.author !== targetId) return false;
+      var vis = m.visibility || 'public';
+      if (vis === 'private') return m.author === user.id;
+      if (vis === 'custom') {
+        if (m.author === user.id) return true;
+        return Array.isArray(m.visibleTo) && m.visibleTo.indexOf(user.id) !== -1;
+      }
+      return true;   /* public / friends */
+    });
     list.sort(function (a, b) { return (b.time || 0) - (a.time || 0); });
     var totalLikes = 0;
     for (var i = 0; i < list.length; i++) totalLikes += (list[i].likes || []).length;
@@ -76576,6 +80384,10 @@ if (!global.__roSchedHelpPrinted) {
     var _expenseAmt = amount;
     var _incomeAmt  = amount;
     if (w.balance < _expenseAmt) { socket.emit('wallet-error', '余额不足'); return; }
+    /* ★ v0.32.0：双重确认余额（防止极端并发下的 TOCTOU） */
+    if (getWallet(user.id).balance < _expenseAmt) {
+      socket.emit('wallet-error', '余额不足'); return;
+    }
     var note = String(data.note || '').slice(0, 20);
     var descOut = '转账给 ' + toUser.name + (note ? ' · ' + note : '');
     var descIn = '收到来自 ' + user.name + ' 的转账' + (note ? ' · ' + note : '');
@@ -76616,6 +80428,8 @@ if (!global.__roSchedHelpPrinted) {
   socket.on('redpacket-send', function (data) {
     var user = getUserBySocketId(socket.id);
     if (!user || !data) return;
+
+    if (_rejectWithRestriction(socket, 'redpacket', 'wallet-error')) return;
 
     var _rrb = checkRedpacketRate(user);
     if (_rrb) {
@@ -76920,16 +80734,23 @@ if (!global.__roSchedHelpPrinted) {
     if (!user || !data || !data.packetId) return;
     var packet = redPackets[data.packetId];
     if (!packet) {
-      _agViolation(socket.data._agIp, 'bad-redpacket-id');
+      /* ★ v0.32.x：查看历史消息中已过期/已清理的红包属于正常业务，
+         不能再计入 Attack Guard，否则加载旧聊天会误封 IP。 */
       socket.emit('redpacket-info-result', {
         packetId: data.packetId,
         error: '红包不存在',
-        expired: true
+        expired: true,
+        missing: true
       });
       return;
     }
     if (packet.targetUserId && packet.targetUserId !== user.id && packet.from !== user.id) {
-      socket.emit('redpacket-info-result', { packetId: data.packetId, error: '您无需收款' });
+      /* ★ v0.32.0 安全修复：非目标用户查询专属红包时，不泄露任何信息 */
+      socket.emit('redpacket-info-result', {
+        packetId: data.packetId,
+        error: '您无需收款',
+        missing: true
+      });
       return;
     }
 
@@ -77679,6 +81500,93 @@ socket.on('call-media-state', function (data) {
     console.log('🛡️ [审核] 管理员 ' + user.name + ' 学习新敏感词：' + w);
   });
 
+  socket.on('report-submit', function (data) {
+    var user = getUserBySocketId(socket.id);
+    if (!user) { socket.emit('report-error', '未登录'); return; }
+    if (!data || typeof data !== 'object') {
+      socket.emit('report-error', '参数错误'); return;
+    }
+    var reason = String(data.reason || '').trim().slice(0, 100);
+    var detail = String(data.detail || '').trim().slice(0, 1000);
+    var targetUserId = String(data.targetUserId || '').slice(0, 64);
+    var targetType = (data.targetType === 'group') ? 'group'
+      : (data.targetType === 'user') ? 'user' : 'message';
+    var msgId = String(data.msgId || '').slice(0, 64);
+    var msgContent = String(data.msgContent || '').slice(0, 500);
+
+    if (!reason) { socket.emit('report-error', '请选择举报理由'); return; }
+    if (!targetUserId) { socket.emit('report-error', '举报对象无效'); return; }
+    if (targetUserId === user.id) {
+      socket.emit('report-error', '不能举报自己'); return;
+    }
+    if (isSystemUserId(targetUserId)) {
+      socket.emit('report-error', '系统账号不可举报'); return;
+    }
+
+    var now = Date.now();
+
+    var _r5 = now - 5 * 60 * 1000;
+    for (var _ri = 0; _ri < reportsList.length; _ri++) {
+      var _rr = reportsList[_ri];
+      if (_rr.reporterId === user.id && _rr.targetUserId === targetUserId &&
+          _rr.msgId === msgId && _rr.createdAt > _r5) {
+        socket.emit('report-error', '您已举报过该内容，请勿重复提交');
+        return;
+      }
+    }
+
+    var _r1h = now - 60 * 60 * 1000;
+    var _userCnt = 0;
+    for (var _rj = 0; _rj < reportsList.length; _rj++) {
+      if (reportsList[_rj].reporterId === user.id &&
+          reportsList[_rj].createdAt > _r1h) {
+        _userCnt++;
+      }
+    }
+    if (_userCnt >= 10) {
+      socket.emit('report-error', '举报过于频繁，请稍后再试');
+      return;
+    }
+
+    var targetUser = getUserById(targetUserId);
+    var targetName = targetUser ? targetUser.name : targetUserId;
+    var report = {
+      id: genReportId(),
+      reporterId: user.id,
+      reporterName: user.name,
+      targetUserId: targetUserId,
+      targetName: targetName,
+      targetType: targetType,
+      msgId: msgId,
+      msgContent: msgContent,
+      reason: reason,
+      detail: detail,
+      status: 'pending',
+      createdAt: now,
+      handledAt: 0,
+      handledBy: ''
+    };
+    reportsList.unshift(report);
+    if (reportsList.length > REPORTS_MAX) reportsList.length = REPORTS_MAX;
+    saveReports();
+
+    socket.emit('report-success', { id: report.id });
+    console.log('🚨 [举报] ' + report.id + ' | ' + user.name +
+      ' → ' + targetName + ' | ' + reason);
+
+    userMap.forEach(function (u) {
+      if (u && u.online && u.isAdmin && u.id !== user.id) {
+        emitToUser(u.id, 'report-new', {
+          id: report.id,
+          reporterName: user.name,
+          targetName: targetName,
+          reason: reason,
+          time: now
+        });
+      }
+    });
+  });
+
   socket.on('refresh-request', function () {
     var user = getUserBySocketId(socket.id);
     if (!user) return;
@@ -78118,6 +82026,8 @@ function doResumeServer() {
     server.listen(PORT, '0.0.0.0', function () {
       _serverPaused = false;
       var _proto = _useHttps ? 'https' : 'http';
+      var _bootElapsed = Date.now() - (typeof BOOT_START !== 'undefined' ? BOOT_START : Date.now());
+  console.log('🚀 服务器启动完成，耗时 ' + _bootElapsed + 'ms');
       console.log('✅ 服务器已恢复');
       console.log('   · ' + _proto + '://localhost:' + PORT);
       console.log('   · 客户端将自动重连');
@@ -78238,35 +82148,68 @@ var TUI_LOG_NAME = {
   ADMIN_SET_MAX_FILE: '调整文件上限', ADMIN_SET_VERIFIED: '设置认证',
   REGISTER_SUCCESS: '新用户注册', REGISTER_CODE: '注册验证码',
   FORGOT_SUCCESS: '重置密码', SETUP_ACCOUNT: '首次安全设置',
-  DAILY_SIGNIN: '每日签到', QQ_FILE_UPLOAD: '群文件上传'
+  DAILY_SIGNIN: '每日签到', QQ_FILE_UPLOAD: '群文件上传',
+
+  /* ★ v0.31.0 */
+  GROUP_INVITE_SENT:     '发送入群邀请',
+  GROUP_INVITE_ACCEPTED: '接受入群邀请',
+  GROUP_INVITE_REJECTED: '拒绝入群邀请',
+  MUSIC_PAGE_ACCESS:     '访问音乐库页面',
+  BUBBLE_RADIUS_CHANGED: '调整气泡圆角',
+  MESSAGE_GAP_CHANGED:   '调整消息间距',
+
+  /* ★ v0.32.0 */
+  CALL_MODE_SWITCH:      '通话模式切换',
+  CALL_REJECTED_NOT_LAN: '通话被拒（非局域网）',
+  CALL_CF_TURN_REFRESH:  '刷新 CF TURN 凭证',
+  CALL_CF_TURN_FAILED:   'CF TURN 凭证失败',
+  READONLY_SCHEDULE_ON:  '调度只读开启',
+  READONLY_SCHEDULE_OFF: '调度只读关闭',
+  READONLY_MANUAL_ON:    '手动只读开启',
+  READONLY_MANUAL_OFF:   '手动只读关闭',
+  TUI_READONLY_TOGGLE:   'TUI 切换只读',
+  TUI_MANUAL_SAVE:       'TUI 手动保存',
+  TUI_FORCE_GC:          'TUI 触发 GC'
 };
 
 var TUI_USER_ACTIONS = [
-  { key: 'view', label: '📜 查看聊天记录' },
-  { key: 'msg', label: '✉️  发送私聊消息' },
-  { key: 'kick', label: '踢出（断开连接）', danger: true },
-  { key: 'ban', label: '封禁账号', danger: true },
-  { key: 'unban', label: '解除封禁' },
-  { key: 'admin', label: '设为 / 取消管理员' },
-  { key: 'mute', label: '禁言 / 解除禁言' },
-  { key: 'verify', label: '官方认证（默认文本）' },
-  { key: 'unverify', label: '取消官方认证' },
-  { key: 'level', label: '提升等级 +1' },
-  { key: 'money', label: '设置余额为 1000 元' },
-  { key: 'deluser', label: '删除账号（不可恢复）', danger: true },
-  { key: 'back', label: '← 返回用户列表' }
+  { key: 'view',       label: '📜 查看聊天记录' },
+  { key: 'msg',        label: '✉️  发送私聊消息' },
+  { key: 'cleardm',    label: '🗑️  清空与该用户的私聊' },
+  { key: 'kick',       label: '踢出（断开连接）', danger: true },
+  { key: 'ban',        label: '封禁账号', danger: true },
+  { key: 'unban',      label: '解除封禁' },
+  { key: 'admin',      label: '设为 / 取消管理员' },
+  { key: 'mute',       label: '禁言 / 解除禁言' },
+  { key: 'verify',     label: '官方认证（默认文本）' },
+  { key: 'unverify',   label: '取消官方认证' },
+  { key: 'level',      label: '提升等级 +1' },
+  { key: 'money',      label: '设置余额为 1000 元' },
+  { key: 'resettoken', label: '重置设备令牌（强制重登）', danger: true },
+  { key: 'deluser',    label: '删除账号（不可恢复）', danger: true },
+  { key: 'back',       label: '← 返回用户列表' }
 ];
 
 var TUI_GROUP_ACTIONS = [
-  { key: 'view', label: '📜 查看群聊天记录' },
-  { key: 'msg', label: '✉️  发送群消息' },
+  { key: 'view',     label: '📜 查看群聊天记录' },
+  { key: 'msg',      label: '✉️  发送群消息' },
   { key: 'announce', label: '📢 发送 / 修改群公告' },
+  { key: 'files',    label: '📁 查看群文件列表' },
+  { key: 'album',    label: '🖼️  查看群相册' },
+  { key: 'votes',    label: '🗳️  查看群投票' },
   { key: 'delgroup', label: '解散群组（不可恢复）', danger: true },
-  { key: 'back', label: '← 返回群组列表' }
+  { key: 'back',     label: '← 返回群组列表' }
 ];
 
 var TUI = {
   active: false,
+  /* ★ v0.32.0 新增字段 */
+  _memRss: 0,
+  _memHeap: 0,
+  _memTs: 0,
+  _searchQuery: '',
+  _searchHits: [],
+  _searchSel: 0,
   mode: 'main',        /* 'main' | 'user' | 'group' | 'input' | 'messages' */
   panel: 'users',      /* main 模式下显示：'users' | 'groups' */
   users: [],
@@ -78502,12 +82445,76 @@ function tuiDraw() {
   else upStr = Math.floor(up / 3600) + 'h ' + Math.floor((up % 3600) / 60) + 'm';
 
   out.push(' ' + A.bold + '📊 状态' + A.reset);
+  /* 通话模式：外网在线 → WebRTC+TURN；离线 → PeerJS 局域网直连 */
+  var _netDot, _netTxt, _netColor;
+  if (typeof _hasInternet === 'undefined') {
+    _netDot = '○'; _netColor = A.gray; _netTxt = '未知';
+  } else if (_hasInternet) {
+    _netDot = '●'; _netColor = A.green;
+    _netTxt = 'WebRTC' + (CF_TURN_CACHE && CF_TURN_CACHE.servers
+      ? ' (TURN)' : '');
+  } else {
+    _netDot = '●'; _netColor = A.yellow; _netTxt = 'PeerJS(局域网)';
+  }
+
+  /* ---- 计算通话模式 ---- */
+  var _cmDot, _cmColor, _cmText;
+  if (typeof _hasInternet === 'undefined') {
+    _cmDot = '○'; _cmColor = A.gray; _cmText = '未知';
+  } else if (_hasInternet) {
+    _cmDot = '●'; _cmColor = A.green;
+    var _hasTurn = (typeof CF_TURN_CACHE !== 'undefined' &&
+                    CF_TURN_CACHE && CF_TURN_CACHE.servers);
+    _cmText = 'WebRTC' + (_hasTurn ? ' + TURN' : ' (STUN)');
+  } else {
+    _cmDot = '●'; _cmColor = A.yellow; _cmText = 'PeerJS (局域网)';
+  }
+
+  /* ---- 只读徽章 ---- */
+  var _roBadge = '';
+  try {
+    if (typeof config !== 'undefined' && config.readonlyMode === true) {
+      _roBadge = '   ' + A.red + '🔒 只读' + A.reset;
+    }
+  } catch (eRO) {}
+
+  /* ---- 暂停徽章 ---- */
+  var _pauseBadge = '';
+  if (typeof _serverPaused !== 'undefined' && _serverPaused) {
+    _pauseBadge = '   ' + A.yellow + '⏸ 已暂停' + A.reset;
+  }
+
+  /* ---- 内存（2s 缓存，避免频繁 syscall） ---- */
+  var _now = Date.now();
+  if (!TUI._memTs || _now - TUI._memTs > 2000) {
+    try {
+      var _mu = process.memoryUsage();
+      TUI._memRss = Math.round(_mu.rss / 1048576);
+      TUI._memHeap = Math.round(_mu.heapUsed / 1048576);
+      TUI._memTs = _now;
+    } catch (eMem) {}
+  }
+  var _memColor = A.gray;
+  if (TUI._memRss >= 1500) _memColor = A.red;
+  else if (TUI._memRss >= 800) _memColor = A.yellow;
+
   out.push('   ' + A.gray + '在线' + A.reset + ' ' +
     A.green + onlineN + A.reset + ' / ' + TUI.users.length +
     '   ' + A.gray + '群组' + A.reset + ' ' + (TUI.groups || []).length +
     '   ' + A.gray + '消息' + A.reset + ' ' + msgTotal +
     '   ' + A.gray + '会话' + A.reset + ' ' + sessTotal +
-    '   ' + A.gray + '运行' + A.reset + ' ' + upStr);
+    '   ' + A.gray + '运行' + A.reset + ' ' + upStr +
+    _roBadge + _pauseBadge);
+  out.push('   ' + A.gray + '通话' + A.reset + ' ' +
+    _cmColor + _cmDot + ' ' + _cmText + A.reset +
+    '   ' + A.gray + '内存' + A.reset + ' ' +
+    _memColor + TUI._memRss + 'MB' + A.reset +
+    A.gray + ' / Heap ' + TUI._memHeap + 'MB' + A.reset);
+  out.push('   ' + A.gray + '通话' + A.reset + ' ' +
+    _netColor + _netDot + ' ' + _netTxt + A.reset +
+    (typeof _serverPaused !== 'undefined' && _serverPaused
+      ? ('   ' + A.yellow + '⏸ 服务已暂停' + A.reset)
+      : ''));
   out.push('');
 
   if (TUI.mode === 'input') {
@@ -78572,6 +82579,58 @@ function tuiDraw() {
       (_isBan ? '' : ('   已输入 ' + tuiWidth(TUI.inputBuffer || '') + ' 字')) +
       A.reset);
     out.push('');
+  }
+
+  /* ★ v0.32.0：搜索模式 */
+  if (TUI.mode === 'search') {
+    if (s === '\x1b') {
+      TUI.mode = 'main';
+      TUI.inputBuffer = '';
+      tuiDraw();
+      return;
+    }
+    if (s === '\x1b[A') {
+      if (TUI._searchHits.length > 0) {
+        TUI._searchSel = (TUI._searchSel - 1 + TUI._searchHits.length) %
+                        TUI._searchHits.length;
+      }
+      tuiDraw();
+      return;
+    }
+    if (s === '\x1b[B') {
+      if (TUI._searchHits.length > 0) {
+        TUI._searchSel = (TUI._searchSel + 1) % TUI._searchHits.length;
+      }
+      tuiDraw();
+      return;
+    }
+    if (s === '\r' || s === '\n') {
+      var _hit = TUI._searchHits[TUI._searchSel];
+      if (_hit) {
+        TUI.panel = _hit.kind;
+        if (_hit.kind === 'users') TUI.selId = _hit.id;
+        else TUI.selGroupId = _hit.id;
+        TUI.mode = 'main';
+        TUI.inputBuffer = '';
+      }
+      tuiDraw();
+      return;
+    }
+    if (s === '\x7f' || s === '\x08') {
+      if (TUI.inputBuffer) {
+        TUI.inputBuffer = TUI.inputBuffer.substring(0, TUI.inputBuffer.length - 1);
+      }
+      tuiRunSearch(TUI.inputBuffer);
+      tuiDraw();
+      return;
+    }
+    var _p = s.replace(/[\x00-\x1f\x7f]/g, '');
+    if (_p.length > 0) {
+      TUI.inputBuffer = (TUI.inputBuffer || '') + _p;
+      tuiRunSearch(TUI.inputBuffer);
+      tuiDraw();
+    }
+    return;
   }
 
   if (TUI.mode === 'messages') {
@@ -78770,12 +82829,13 @@ function tuiDraw() {
     hint = ' Enter 确认   Esc 取消 ';
   } else if (TUI.mode === 'messages') {
     hint = ' ↑ 看更早   ↓ 看更新   Esc / Q 返回 ';
+  } else if (TUI.mode === 'search') {
+    hint = ' ↑↓ 选择   Enter 定位   Esc 取消搜索 ';
   } else if (TUI.mode === 'user' || TUI.mode === 'group') {
     hint = ' ↑↓ 选择   Enter 执行   Esc 返回   Q 返回 ';
-  } else if (TUI.panel === 'groups') {
-    hint = ' ↑↓ 选择   Enter 操作   Tab 切换到用户   R 刷新   P 暂停 / 恢复   Q 退出 ';
   } else {
-    hint = ' ↑↓ 选择   Enter 操作   Tab 切换到群组   R 刷新   P 暂停 / 恢复   Q 退出 ';
+    hint = ' ↑↓ 选择   Enter 操作   Tab 切换列表   / 搜索   F 反馈   ' +
+           'L 只读   B 广播   S 保存   G GC   R 刷新   P 暂停   Q 退出 ';
   }
   out.push(A.gray + hint + A.reset);
 
@@ -79017,6 +83077,47 @@ function tuiExecAction(key) {
       tuiDraw();
       return;
     }
+    if (key === 'files' || key === 'album' || key === 'votes') {
+      var _gx = null;
+      for (var _gi3 = 0; _gi3 < TUI.groups.length; _gi3++) {
+        if (TUI.groups[_gi3].id === TUI.selGroupId) {
+          _gx = TUI.groups[_gi3]; break;
+        }
+      }
+      if (!_gx) return;
+      var _gobj = getGroupById(_gx.id);
+      if (!_gobj) return;
+      var _label = key === 'files' ? '群文件'
+                 : key === 'album' ? '群相册' : '群投票';
+      var _count = key === 'files' ? (_gobj.files || []).length
+                 : key === 'album' ? (_gobj.albums || []).length
+                 : (_gobj.votes || []).length;
+      TUI.logs.unshift({
+        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        text: '📂 ' + _gx.name + ' · ' + _label + '（共 ' + _count + ' 项）'
+      });
+      for (var _ii = 0; _ii < Math.min(_count, 8); _ii++) {
+        var _item = key === 'files' ? _gobj.files[_ii]
+                  : key === 'album' ? _gobj.albums[_ii]
+                  : _gobj.votes[_ii];
+        if (!_item) continue;
+        var _line = '';
+        if (key === 'files') {
+          _line = '   ' + (_item.fileName || '未命名') + ' · ' +
+                  ((_item.fileSize || 0) / 1024).toFixed(1) + 'KB';
+        } else if (key === 'album') {
+          _line = '   ' + (_item.fileName || '未命名') + ' · 🖼️';
+        } else {
+          _line = '   ' + (_item.question || '?') + ' · ' +
+                  (_item.voters ? _item.voters.length : 0) + ' 票';
+        }
+        TUI.logs.unshift({ time: '', text: _line });
+      }
+      if (TUI.logs.length > 30) TUI.logs.length = 30;
+      tuiDraw();
+      return;
+    }
+
     if (key === 'delgroup') {
       var gd = null;
       for (var gk2 = 0; gk2 < TUI.groups.length; gk2++) {
@@ -79066,6 +83167,14 @@ function tuiExecAction(key) {
       cmd = 'money ' + u.name + ' 1000';
       note = u.name + ' 余额 → ¥1000';
       break;
+    case 'cleardm':
+      cmd = 'clearuser ' + u.name;
+      note = '清空与 ' + u.name + ' 的全部私聊';
+      break;
+    case 'resettoken':
+      cmd = 'resettoken ' + u.name;
+      note = '重置 ' + u.name + ' 设备令牌（下次需重新登录）';
+      break;
     case 'deluser':
       cmd = 'deluser ' + u.name;
       note = '删除 ' + u.name;
@@ -79080,6 +83189,36 @@ function tuiSendMessage() {
   var kind = TUI.inputTargetKind || 'user';
   var tid = TUI.inputTargetId;
   var tname = TUI.inputTargetName;
+
+  /* ★ v0.32.0：广播分支 */
+  if (kind === 'broadcast') {
+    if (!text) {
+      TUI.mode = 'main';
+      TUI.inputBuffer = '';
+      TUI.inputTargetKind = 'user';
+      tuiDraw();
+      return;
+    }
+    try {
+      io.emit('global-announce', { content: text, from: 'SYSTEM (TUI)' });
+      TUI.logs.unshift({
+        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        text: '📢 广播 → 全体在线：' +
+          (text.length > 40 ? text.substring(0, 40) + '…' : text)
+      });
+    } catch (eB) {
+      TUI.logs.unshift({
+        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        text: '❌ 广播失败：' + (eB.message || '未知错误')
+      });
+    }
+    if (TUI.logs.length > 30) TUI.logs.length = 30;
+    TUI.mode = 'main';
+    TUI.inputBuffer = '';
+    TUI.inputTargetKind = 'user';
+    tuiDraw();
+    return;
+  }
 
   if (kind === 'ban') {
     if (!tid) {
@@ -79210,6 +83349,31 @@ function tuiSendMessage() {
   tuiDraw();
 }
 
+/* ★ v0.32.0：TUI 搜索辅助 */
+function tuiRunSearch(q) {
+  q = String(q || '').trim().toLowerCase();
+  TUI._searchQuery = q;
+  TUI._searchHits = [];
+  TUI._searchSel = 0;
+  if (!q) return;
+
+  for (var i = 0; i < TUI.users.length; i++) {
+    var u = TUI.users[i];
+    if (String(u.name).toLowerCase().indexOf(q) !== -1 ||
+        String(u.id).toLowerCase().indexOf(q) !== -1) {
+      TUI._searchHits.push({ kind: 'users', id: u.id, name: u.name });
+    }
+  }
+  for (var j = 0; j < TUI.groups.length; j++) {
+    var g = TUI.groups[j];
+    if (String(g.name).toLowerCase().indexOf(q) !== -1 ||
+        String(g.id).toLowerCase().indexOf(q) !== -1) {
+      TUI._searchHits.push({ kind: 'groups', id: g.id, name: g.name });
+    }
+  }
+  if (TUI._searchHits.length > 50) TUI._searchHits.length = 50;
+}
+
 function tuiOnKey(buf) {
   if (!TUI.active) return;
   var s = buf.toString('utf8');
@@ -79248,6 +83412,37 @@ function tuiOnKey(buf) {
       tuiDraw();
     }
     return;
+  }
+
+    if (TUI.mode === 'search') {
+    out.push(A.cyan + hr('─') + A.reset);
+    out.push(' ' + A.bold + '🔍 搜索' + A.reset +
+      A.gray + '   (↑↓ 选择，Enter 定位，Esc 取消)' + A.reset);
+    out.push('');
+    var _sbuf = String(TUI.inputBuffer || '');
+    out.push('   ' + A.green + '> ' + A.reset + _sbuf +
+      A.cyan + '█' + A.reset);
+    out.push('');
+    if (!TUI._searchHits.length) {
+      out.push('   ' + A.gray +
+        (_sbuf ? '(无匹配结果)' : '(输入关键词开始搜索)') + A.reset);
+    } else {
+      for (var _si = 0; _si < TUI._searchHits.length && _si < 12; _si++) {
+        var _h = TUI._searchHits[_si];
+        var _isSel = (_si === TUI._searchSel);
+        var _c = _isSel ? (A.cyan + ' ▸ ' + A.reset) : '   ';
+        var _icon = _h.kind === 'users' ? '👤' : '👥';
+        var _label = tuiPad(_h.name, 20);
+        if (_isSel) _label = A.bold + _label + A.reset;
+        out.push(_c + _icon + ' ' + _label +
+          A.gray + ' (' + _h.kind + ')' + A.reset);
+      }
+      if (TUI._searchHits.length > 12) {
+        out.push('   ' + A.gray + '... 共 ' +
+          TUI._searchHits.length + ' 条匹配' + A.reset);
+      }
+    }
+    out.push('');
   }
 
   if (TUI.mode === 'messages') {
@@ -79311,6 +83506,123 @@ function tuiOnKey(buf) {
     tuiCollectGroups();
     tuiDraw();
     return;
+  }
+
+  /* ★ v0.32.0：主界面新增快捷键（仅在 main 模式生效） */
+  if (TUI.mode === 'main') {
+    if (low === 'l') {
+      var _nowRO = (typeof config !== 'undefined' && config.readonlyMode === true);
+      var _nextRO = !_nowRO;
+      try {
+        config.readonlyMode = _nextRO;
+        config.readOnly = _nextRO;
+        if (_nextRO) config.readonlyManual = true;
+        else config.readonlyManual = false;
+        saveJSONNow(F_CONFIG, config);
+      } catch (eRO) { console.error('只读切换失败:', eRO.message); }
+      try {
+        _roLoginRate = {};
+        io.emit('readonly-mode-changed',
+          { enabled: _nextRO, readOnly: _nextRO, readonlyMode: _nextRO });
+        io.emit('readonly-changed',
+          { enabled: _nextRO, readOnly: _nextRO, readonlyMode: _nextRO });
+      } catch (eEmit) {}
+      TUI.logs.unshift({
+        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        text: (_nextRO ? '🔒 ' : '🔓 ') + '切换只读模式：' +
+          (_nextRO ? '已开启' : '已关闭')
+      });
+      if (TUI.logs.length > 30) TUI.logs.length = 30;
+      tuiDraw();
+      return;
+    }
+
+    if (low === 's') {
+      var _ok = 0, _fail = 0;
+      try {
+        saveHistoryNow(); saveUsers(); saveGroups(); saveStickers();
+        saveWallets(); saveRedPackets(); saveMusicList();
+        saveContactTags(); saveRemarks(); saveArchived(); saveChatSounds();
+        saveDevices(); saveScheduled(); saveAutoReplies();
+        saveAnnouncementReads(); saveGroupActivity();
+        saveAnnouncementHistory(); saveKeywordRules();
+        saveShortcuts(); saveTimeTheme(); saveMoments(); saveVisitors();
+        saveBlocks(); saveUserDataStore(); saveFeedback();
+        _ok = 19;
+      } catch (eSave) { _fail++; console.error('保存失败:', eSave.message); }
+      TUI.logs.unshift({
+        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        text: '💾 手动保存完成（' + _ok + ' 项成功' +
+          (_fail ? ' / ' + _fail + ' 项失败' : '') + '）'
+      });
+      if (TUI.logs.length > 30) TUI.logs.length = 30;
+      tuiDraw();
+      return;
+    }
+
+    if (low === 'g') {
+      var _gcOk = false;
+      try {
+        if (typeof global.gc === 'function') {
+          global.gc();
+          _gcOk = true;
+        }
+      } catch (eGc) {}
+      TUI.logs.unshift({
+        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        text: _gcOk ? '♻️ 已触发 V8 GC'
+                    : '⚠️  未启用 --expose-gc，无法触发 GC'
+      });
+      if (TUI.logs.length > 30) TUI.logs.length = 30;
+      tuiDraw();
+      return;
+    }
+
+    if (low === 'f') {
+      try {
+        TUI.logs.unshift({
+          time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+          text: '📮 最近反馈（共 ' + feedbackList.length + ' 条）'
+        });
+        var _fl = feedbackList.slice().sort(function (a, b) {
+          return (b.createdAt || 0) - (a.createdAt || 0);
+        }).slice(0, 6);
+        for (var _fi = 0; _fi < _fl.length; _fi++) {
+          var _f = _fl[_fi];
+          var _st = FEEDBACK_STATUS[_f.status || 'unconfirmed'] || { zh: '?' };
+          TUI.logs.unshift({
+            time: '',
+            text: '   ' + _f.id + ' [' + _st.zh + '] ' +
+              (_f.userName || '') + ': ' +
+              String(_f.content || '').slice(0, 30).replace(/\n/g, ' ')
+          });
+        }
+        if (TUI.logs.length > 30) TUI.logs.length = 30;
+      } catch (eF) {}
+      tuiDraw();
+      return;
+    }
+
+    if (low === 'b') {
+      TUI.inputTargetKind = 'broadcast';
+      TUI.inputTargetId = '__all__';
+      TUI.inputTargetName = '全体在线用户';
+      TUI.inputBuffer = '';
+      TUI.mode = 'input';
+      TUI.confirmPending = false;
+      tuiDraw();
+      return;
+    }
+
+    if (s === '/') {
+      TUI.mode = 'search';
+      TUI.inputBuffer = '';
+      TUI._searchQuery = '';
+      TUI._searchHits = [];
+      TUI._searchSel = 0;
+      tuiDraw();
+      return;
+    }
   }
 
   if (low === 'p') {
@@ -80392,6 +84704,33 @@ function handleCommand(cmd) {
       var _durTxt = _bDurationMs > 0 ? formatBanDuration(_bDurationMs) : '永久';
       console.log('✅ 已封禁 "' + _bName + '"（' + _durTxt + '）' +
         (_bReason ? '（原因：' + _bReason + '）' : ''));
+      break;
+    }
+        case 'resettoken': {
+      var _rtn = (args[1] || '').trim();
+      if (!_rtn) {
+        console.log('用法：resettoken <用户名>');
+        break;
+      }
+      var _rtRec = persistentUsers[_rtn];
+      if (!_rtRec) {
+        console.log('❌ 用户不存在：' + _rtn);
+        break;
+      }
+      _rtRec.deviceTokens = [];
+      saveUsers();
+      try {
+        var _rtLive = getUserById(_rtRec.id);
+        if (_rtLive && _rtLive.online) {
+          var _rtSk = io.sockets.sockets.get(_rtLive.socketId);
+          if (_rtSk) {
+            _rtSk.emit('force-logout', '设备令牌已被管理员重置，请重新登录');
+            setTimeout(function () { try { _rtSk.disconnect(true); } catch (e) {} }, 300);
+          }
+        }
+      } catch (eRt) {}
+      console.log('✅ 已重置 ' + _rtn + ' 的全部设备令牌');
+      log('RESET_TOKEN', { target: _rtn });
       break;
     }
     case 'unban': {
@@ -81714,14 +86053,8 @@ function handleCommand(cmd) {
         '  modqueue                  - 查看待审核队列',
         '  modclear                  - 清空待审队列',
         '',
-        '【风控系统（v0.25.1 新增）】',
-        '  risk                      - 列出所有用户的风险评分',
-        '  riskuser <用户名>         - 查看指定用户的风控详情',
-        '  riskclear [用户名]        - 清空风控档案（不带参数则清空全部）',
-        '  riskconfig                - 查看风控阈值配置',
-        '',
-        '【风控系统（v0.25.0 新增）】',
-        '  risk                      - 查看风控状态与帮助',
+        '【风控系统（v0.25.0 / v0.25.1）】',
+        '  risk                      - 查看风控状态与帮助（也可直接查看风险评分）',
         '  risk on | off             - 开启 / 关闭',
         '  risk events [N]           - 查看最近 N 条风控事件',
         '  risk clear                - 清空风控事件',
@@ -81729,16 +86062,19 @@ function handleCommand(cmd) {
         '  risk resetall             - 重置全部用户风险状态',
         '  risk whitelist            - 查看白名单',
         '  risk white / unwhite <名> - 添加 / 移除白名单',
-        '  risk rule <规则> <参数> <值>- 修改规则参数',
+        '  risk rule <规则> <参数> <值> - 修改规则参数',
         '  risk top                  - 风险评分排行',
+        '  riskuser <用户名>         - 查看指定用户的风控详情',
+        '  riskclear [用户名]        - 清空风控档案（不带参数则清空全部）',
+        '  riskconfig                - 查看风控阈值配置',
+        '',
+        '【记录清理】',
         '  clearhistory              - 清空全部聊天记录',
         '  cleardm <用户A> <用户B>   - 清空两人私聊记录',
         '  cleargroup <群ID或群名>   - 清空指定群聊记录',
         '  clearuser <用户名>        - 清空指定用户的所有私聊记录（含离线）',
         '  delmsg <消息ID>           - 删除指定单条消息',
         '  backup                    - 备份数据到 files/backups/',
-        '',
-        '【记录清理】',
         '  clearredpackets           - 清空全部红包记录',
         '  clearwallets              - 清空全部钱包与交易记录',
         '  clearblocks               - 清空全部拉黑关系',
@@ -81762,9 +86098,40 @@ function handleCommand(cmd) {
         '  delredpacket <红包ID>     - 删除指定红包',
         '  cleardeadredpackets       - 清理已过期红包',
         '',
+        '【只读模式（v0.30.0 新增 / v0.32.0 扩展调度）】',
+        '  readonly on | off         - 开启 / 关闭只读模式（写操作 / API / 下载 / 音乐全禁）',
+        '  readonly status           - 查看当前只读状态（含调度规则概览）',
+        '  readonly reset-login      - 清空只读模式下单 IP 登录限流计数',
+        '  readonly sched list                     - 查看所有调度规则',
+        '  readonly sched add weekly 22:00-07:00 1,2,3,4,5  工作日夜间自动只读',
+        '  readonly sched add date 2026-10-01 2026-10-07    国庆假期全天只读',
+        '  readonly sched add once "2026-10-15 20:00" "2026-10-15 22:00"  单次维护',
+        '  readonly sched del|enable|disable <id>  管理指定规则',
+        '  readonly sched clear                    清空全部规则',
+        '  readonly sched help                     查看调度命令详细帮助',
+        '',
+        '【反馈中心（v0.31.0 新增）】',
+        '  kflist [n]                - 列出最近 n 条用户反馈（默认 10）',
+        '  kfshow <反馈编号>         - 查看指定反馈详情（含回复历史）',
+        '  kfstats                   - 查看反馈统计（状态 / 分类 / 优先级 / 高优待处理）',
+        '  kfreply <编号> <文本>     - 以管理员身份回复反馈（用户可见）',
+        '  kfdel <编号>              - 删除指定反馈（不可撤销）',
+        '  kfopen                    - 显示反馈中心访问地址（/kf）',
+        '  kfhelp                    - 显示反馈中心命令帮助',
+        '',
+        '【系统运维扩展（v0.31.0 新增）】',
+        '  online                    - 列出在线用户（含 ID / IP / 设备）',
+        '  whois <昵称或ID>          - 查看用户完整档案（含注册时间 / 最后活跃）',
+        '  sessions                  - 会话统计（私聊数 / 群聊数 / 消息总量）',
+        '  mem                       - 内存详情（RSS / Heap / 前 5 大会话）',
+        '  gc                        - 触发 V8 垃圾回收（需 --expose-gc 启动）',
+        '  uptime                    - 运行时长（含暂停累计）',
+        '  wipe <昵称>               - 清空该用户的全部私聊会话（不可恢复）',
+        '  broadcast <文本>          - 广播全局公告（等同 announce，兼容别名）',
+        '',
         '【服务器】',
         '  stream                    - 查看界面流式分段状态',
-        '  ui / menu / dashboard     - 打开命令行控制台（类图形界面）',
+        '  ui / menu / dashboard / console - 打开命令行控制台（类图形界面）',
         '  pause                     - 暂停服务器（断开连接、释放端口、拒绝新访问）',
         '  resume                    - 恢复服务器（重新监听端口，客户端自动重连）',
         '  retry                     - 重新尝试监听端口（端口被占用 / 权限不足时使用）',
@@ -81775,6 +86142,7 @@ function handleCommand(cmd) {
         '  restart                   - 保存并重启（自重启，会重新读取 server.js）',
         '  exit                      - 关闭服务器（不重启）',
         '  help                      - 显示本帮助',
+        '  help+                     - 显示本帮助 + 全部扩展命令（含本文档所有区块）',
         ''
       ].join('\n'));
       break;
@@ -82319,6 +86687,14 @@ if (_useHttps) {
 }
 
 server.listen(PORT, '0.0.0.0', function () {
+  try {
+    if (String(process.env.BEHIND_CLOUDFLARE || '').toLowerCase() === 'true') {
+      console.log('🌐 已开启 Cloudflare Tunnel 模式（BEHIND_CLOUDFLARE=true）');
+    }
+    if (String(process.env.TRUSTED_PROXIES || '').trim()) {
+      console.log('🌐 受信代理: ' + process.env.TRUSTED_PROXIES);
+    }
+  } catch (e) {}
   var _proto = _useHttps ? 'https' : 'http';
   console.log('🚀 服务端运行在 ' + _proto + '://localhost:' + PORT);
   console.log('📡 局域网访问：' + _proto + '://<本机IP>:' + PORT);
