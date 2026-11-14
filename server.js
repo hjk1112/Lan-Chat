@@ -1,15 +1,983 @@
-/* ★ v0.32.0：启动计时起点 */
 var BOOT_START = Date.now();
+/* ==================================================================
+   ★ DSH 扩展能力（P0/P1/P2/P3）—— 全部内联，单文件
+   P0: 配置中心 / 结构化日志轮转 / 启动自检 / 统一清理定时器
+   P1: SQLite 索引与全文检索 / 审计流水 / 备份回滚 / 证书管理 /
+       上传魔数校验 / CSRF Token / 登录防爆破 / CSP
+   P2: 离线队列 / 群公告待办 / 已读回执 / 多端同步 / 收藏标签 /
+       通话（局域网可用）
+   P3: /metrics / mDNS 发现 / Redis Adapter 抽象
+   ================================================================== */
+var DSH = {
+  startedAt: Date.now(),
+  thresholds: null,
+  db: null, fts: false, indexed: Object.create(null),
+  metrics: {
+    httpRequests: 0, httpErrors: 0, socketMessages: 0, calls: 0,
+    callActive: 0, audits: 0, offlineQueued: 0, searches: 0,
+    backups: 0, cspReports: 0, readReceipts: 0, syncEvents: 0
+  },
+  csrfTokens: Object.create(null),
+  loginFails: Object.create(null),
+  offlineQueue: Object.create(null),
+  groupMeta: Object.create(null),
+  userState: Object.create(null),
+  callSessions: Object.create(null),
+  discoveredPeers: Object.create(null),
+  auditBuf: [],
+  logDir: null,
+  timers: [],
+  initialized: false
+};
 
-/*进程异常兜底（Process Guard）*/
+/* ---------------- P0-E 阈值集中配置中心 ---------------- */
+var DSH_DEFAULTS = {
+  logRetentionDays: 14, logRotateAfterDays: 7, logMaxBytes: 8 * 1024 * 1024,
+  filestoreOrphanHours: 2, filestoreCleanupMinutes: 30,
+  maxConnTotal: 1000, maxConnPerIp: 20, maxHttpPerIp: 120,
+  maxMsgPerSec: 50, maxMsgPerMin: 600,
+  banDurationMs: 10 * 60 * 1000, banThreshold: 30,
+  loginMaxFails: 5, loginLockMs: 60 * 1000, loginWindowMs: 10 * 60 * 1000,
+  uploadMaxBytes: 200 * 1024 * 1024, quotaPerUserBytes: 2 * 1024 * 1024 * 1024,
+  backupKeep: 10, backupIntervalHours: 24, certExpireWarnDays: 14,
+  callRingTimeoutMs: 30 * 1000, callMaxPeers: 8,
+  discoveryIntervalMs: 30 * 1000, archiveIndexMinutes: 5,
+  csrfTtlMs: 30 * 60 * 1000, searchMaxResults: 50,
+  enableMdns: true, enableRedisAdapter: false,
+  enableOfflineQueue: true, enableStructuredAudit: true,
+  enableMarkdown: false, enableReadReceipt: true, enableMultiDeviceSync: true,
+  enableTurnProxy: true, callForceTurn: false, callQualityIntervalMs: 2000,
+  callReconnectAttempts: 3, callAutoAnswer: false, callDefaultVideo: false
+};
+function dshT(key) {
+  if (DSH.thresholds && Object.prototype.hasOwnProperty.call(DSH.thresholds, key)) return DSH.thresholds[key];
+  return DSH_DEFAULTS[key];
+}
+function dshThresholdFile() { return path.join(DATA_DIR_EARLY, 'runtime_config.json'); }
+function dshLoadThresholds() {
+  DSH.thresholds = Object.assign({}, DSH_DEFAULTS);
+  try {
+    const obj = JSON.parse(fs.readFileSync(dshThresholdFile(), 'utf8'));
+    if (obj && typeof obj === 'object') {
+      for (const k in obj) if (Object.prototype.hasOwnProperty.call(DSH_DEFAULTS, k) &&
+          typeof obj[k] === typeof DSH_DEFAULTS[k]) DSH.thresholds[k] = obj[k];
+    }
+  } catch (e) {}
+}
+function dshSaveThresholds() {
+  try {
+    const tmp = dshThresholdFile() + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(DSH.thresholds, null, 2), 'utf8');
+    fs.renameSync(tmp, dshThresholdFile());
+    return true;
+  } catch (e) { return false; }
+}
+function dshApplyThresholds() {
+  try {
+    AG.MAX_CONN_TOTAL = dshT('maxConnTotal');
+    AG.MAX_CONN_PER_IP = dshT('maxConnPerIp');
+    AG.MAX_HTTP_PER_IP = dshT('maxHttpPerIp');
+    AG.MAX_MSG_PER_SEC = dshT('maxMsgPerSec');
+    AG.MAX_MSG_PER_MIN = dshT('maxMsgPerMin');
+    AG.BAN_DURATION_MS = dshT('banDurationMs');
+    AG.BAN_THRESHOLD = dshT('banThreshold');
+    AG.MAX_FILE_SIZE = dshT('uploadMaxBytes');
+    if (typeof config !== 'undefined' && config) config.maxFileSize = dshT('uploadMaxBytes');
+    dshLog('info', 'config.applied', {});
+  } catch (e) {}
+}
+function dshAllThresholds() {
+  return { values: Object.assign({}, DSH.thresholds), defaults: Object.assign({}, DSH_DEFAULTS) };
+}
+function dshSetThreshold(key, val) {
+  if (!Object.prototype.hasOwnProperty.call(DSH_DEFAULTS, String(key))) return false;
+  DSH.thresholds[String(key)] = val;
+  dshSaveThresholds(); dshApplyThresholds();
+  return true;
+}
+
+/* ---------------- P0-D 结构化日志 + 轮转 ---------------- */
+function dshLog(level, event, data) {
+  try {
+    if (!DSH.logDir) return;
+    const rec = { ts: new Date().toISOString(), level: level, event: event,
+      pid: process.pid, uptimeMs: Date.now() - DSH.startedAt, data: data || {} };
+    const f = path.join(DSH.logDir, rec.ts.slice(0, 10) + '.jsonl');
+    fs.appendFileSync(f, JSON.stringify(rec) + '\n', 'utf8');
+  } catch (e) {}
+}
+function dshRotateLogs() {
+  try {
+    const days = dshT('logRetentionDays');
+    const rotateAfter = dshT('logRotateAfterDays');
+    const cutoff = Date.now() - days * 86400000;
+    const rotateCutoff = Date.now() - rotateAfter * 86400000;
+    for (const name of fs.readdirSync(DSH.logDir)) {
+      const full = path.join(DSH.logDir, name);
+      let st; try { st = fs.statSync(full); } catch (e) { continue; }
+      if (!st.isFile()) continue;
+      if (st.mtimeMs < cutoff) { try { fs.unlinkSync(full); } catch (e) {} continue; }
+      const rotate = (/\.jsonl$/.test(name) && st.mtimeMs < rotateCutoff) || st.size > dshT('logMaxBytes');
+      if (rotate) {
+        try {
+          const gz = zlib.gzipSync(fs.readFileSync(full));
+          fs.writeFileSync(full + '.' + Date.now() + '.gz', gz);
+          fs.unlinkSync(full);
+        } catch (e) {}
+      }
+    }
+    /* 旧 crash.log / restart.log 也纳入体积轮转 */
+    for (const old of ['crash.log', 'restart.log', 'server-output.log']) {
+      const f = path.join(DATA_DIR_EARLY, old);
+      try {
+        if (fs.existsSync(f) && fs.statSync(f).size > dshT('logMaxBytes')) {
+          const gz = zlib.gzipSync(fs.readFileSync(f));
+          fs.writeFileSync(f + '.' + Date.now() + '.gz', gz);
+          fs.unlinkSync(f);
+        }
+      } catch (e) {}
+    }
+  } catch (e) { dshLog('warn', 'log.rotate.failed', { error: e.message }); }
+}
+function dshReadLogs(limit, level) {
+  const out = [];
+  try {
+    const files = fs.readdirSync(DSH.logDir).filter(function (n) { return /\.jsonl$/.test(n); }).sort().reverse();
+    for (const name of files) {
+      const lines = fs.readFileSync(path.join(DSH.logDir, name), 'utf8').trim().split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        let r; try { r = JSON.parse(lines[i]); } catch (e) { continue; }
+        if (level && r.level !== level) continue;
+        out.push(r);
+        if (out.length >= limit) return out;
+      }
+    }
+  } catch (e) {}
+  return out;
+}
+
+/* ---------------- P1 SQLite 索引 / 全文检索 / 审计存储 ----------------
+   主业务数据仍由原 JSON/Brotli 层负责（零迁移风险），
+   SQLite 只作为「全文检索索引 + 审计流水」的存储层。 */
+function dshDbPath() { return path.join(DATA_DIR_EARLY, 'dsh_index.db'); }
+function dshInitDb() {
+  try {
+    const DatabaseSync = require('node:sqlite').DatabaseSync;
+    DSH.db = new DatabaseSync(dshDbPath());
+    DSH.db.exec('PRAGMA journal_mode=WAL;');
+    DSH.db.exec('PRAGMA synchronous=NORMAL;');
+    DSH.db.exec('CREATE TABLE IF NOT EXISTS messages (msgId TEXT PRIMARY KEY, hkey TEXT, ts INTEGER, fromId TEXT, fromName TEXT, type TEXT, content TEXT, fileId TEXT);');
+    DSH.db.exec('CREATE INDEX IF NOT EXISTS idx_messages_hkey ON messages(hkey, ts);');
+    DSH.db.exec('CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, actor TEXT, action TEXT, target TEXT, detail TEXT, ip TEXT);');
+    DSH.db.exec('CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);');
+    try {
+      DSH.db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(msgId UNINDEXED, content, fromName, tokenize="unicode61");');
+      DSH.fts = true;
+    } catch (e) { DSH.fts = false; }
+    dshLog('info', 'db.ready', { fts5: DSH.fts });
+  } catch (e) { DSH.db = null; dshLog('error', 'db.init.failed', { error: e.message }); }
+}
+function dshDbUpsert(m, hkey) {
+  if (!DSH.db || !m || !m.msgId) return;
+  try {
+    const ts = (typeof m.ts === 'number' && m.ts) ? m.ts : Date.now();
+    const content = String(m.content == null ? '' : m.content).slice(0, 20000);
+    DSH.db.prepare('INSERT OR REPLACE INTO messages(msgId,hkey,ts,fromId,fromName,type,content,fileId) VALUES(?,?,?,?,?,?,?,?)')
+      .run(String(m.msgId), String(hkey || ''), ts, String(m.from || ''), String(m.fromName || ''), String(m.type || 'text'), content, String(m.fileId || ''));
+    if (DSH.fts) {
+      DSH.db.prepare('DELETE FROM messages_fts WHERE msgId=?').run(String(m.msgId));
+      DSH.db.prepare('INSERT INTO messages_fts(msgId,content,fromName) VALUES(?,?,?)').run(String(m.msgId), content, String(m.fromName || ''));
+    }
+  } catch (e) {}
+}
+function dshIndexHistory() {
+  if (!DSH.db) return 0;
+  let n = 0;
+  try {
+    for (const k in messageHistory) {
+      if (!Object.prototype.hasOwnProperty.call(messageHistory, k)) continue;
+      const arr = messageHistory[k];
+      if (!Array.isArray(arr)) continue;
+      DSH.indexed[k] = DSH.indexed[k] || 0;
+      for (let i = DSH.indexed[k]; i < arr.length; i++) { dshDbUpsert(arr[i], k); n++; }
+      DSH.indexed[k] = arr.length;
+    }
+  } catch (e) { dshLog('warn', 'db.index.failed', { error: e.message }); }
+  if (n) dshLog('info', 'db.index.done', { added: n });
+  return n;
+}
+function dshSearch(q, limit) {
+  if (!DSH.db) return { ok: false, error: 'db unavailable', results: [] };
+  limit = Math.max(1, Math.min(dshT('searchMaxResults'), Number(limit) || 20));
+  DSH.metrics.searches++;
+  const like = '%' + String(q) + '%';
+  try {
+    if (DSH.fts) {
+      const rows = DSH.db.prepare(
+        'SELECT m.msgId,m.hkey,m.ts,m.fromName,m.type,m.content FROM messages_fts f JOIN messages m ON m.msgId=f.msgId WHERE messages_fts MATCH ? ORDER BY m.ts DESC LIMIT ?'
+      ).all(String(q), limit);
+      return { ok: true, engine: 'fts5', results: rows };
+    }
+  } catch (e) {}
+  try {
+    const rows = DSH.db.prepare(
+      'SELECT msgId,hkey,ts,fromName,type,content FROM messages WHERE content LIKE ? OR fromName LIKE ? ORDER BY ts DESC LIMIT ?'
+    ).all(like, like, limit);
+    return { ok: true, engine: 'like', results: rows };
+  } catch (e) { return { ok: false, error: e.message, results: [] }; }
+}
+
+/* ---------------- P1 审计流水 ---------------- */
+function dshAudit(actor, action, target, detail, ip) {
+  DSH.metrics.audits++;
+  const rec = { ts: Date.now(), actor: actor, action: action, target: target || '', ip: ip || '', detail: detail || {} };
+  if (dshT('enableStructuredAudit')) dshLog('audit', 'audit.' + action, rec);
+  if (DSH.db) {
+    try { DSH.db.prepare('INSERT INTO audit(ts,actor,action,target,detail,ip) VALUES(?,?,?,?,?,?)')
+      .run(rec.ts, String(actor), String(action), String(target || ''), JSON.stringify(detail).slice(0, 4000), String(ip || '')); } catch (e) {}
+  }
+}
+function dshAuditList(limit) {
+  if (!DSH.db) return [];
+  try { return DSH.db.prepare('SELECT * FROM audit ORDER BY id DESC LIMIT ?').all(Math.min(500, Number(limit) || 100)); }
+  catch (e) { return []; }
+}
+
+/* ---------------- 状态持久化（离线队列 / 群元数据 / 多端状态） ---------------- */
+var DSH_STATE_FILES = {
+  offlineQueue: 'offline_queue.json',
+  groupMeta: 'group_meta.json',
+  userState: 'user_state.json'
+};
+function dshRestoreState() {
+  for (const key in DSH_STATE_FILES) {
+    try {
+      const obj = JSON.parse(fs.readFileSync(path.join(DATA_DIR_EARLY, DSH_STATE_FILES[key]), 'utf8'));
+      if (obj && typeof obj === 'object') DSH[key] = obj;
+    } catch (e) {}
+  }
+}
+function dshPersist(key) {
+  try {
+    const f = DSH_STATE_FILES[key]; if (!f) return;
+    const tmp = path.join(DATA_DIR_EARLY, f + '.tmp');
+    fs.writeFileSync(tmp, JSON.stringify(DSH[key]), 'utf8');
+    fs.renameSync(tmp, path.join(DATA_DIR_EARLY, f));
+  } catch (e) { dshLog('warn', 'state.persist.failed', { key: key, error: e.message }); }
+}
+
+/* ---------------- P0-B 启动自检 /health ---------------- */
+function dshCertDaysLeft() {
+  try {
+    const out = require('child_process').execSync(
+      'openssl x509 -in "' + CERT_FILE + '" -noout -enddate',
+      { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] });
+    const m = /notAfter=(.+)/.exec(out);
+    if (!m) return null;
+    const t = Date.parse(m[1]);
+    return isNaN(t) ? null : Math.round((t - Date.now()) / 86400000);
+  } catch (e) { return null; }
+}
+function dshHealth() {
+  const checks = [];
+  function add(name, ok, detail) { checks.push({ name: name, ok: !!ok, detail: String(detail) }); }
+  try {
+    const probe = path.join(DATA_DIR_EARLY, '.health_probe');
+    fs.writeFileSync(probe, String(Date.now()));
+    fs.unlinkSync(probe);
+    add('dataDirWritable', true, DATA_DIR_EARLY);
+  } catch (e) { add('dataDirWritable', false, e.message); }
+  try { add('dataDirExists', fs.statSync(DATA_DIR_EARLY).isDirectory(), 'ok'); }
+  catch (e) { add('dataDirExists', false, e.message); }
+  try { add('certPresent', fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE), 'ok'); }
+  catch (e) { add('certPresent', false, e.message); }
+  const cd = dshCertDaysLeft();
+  add('certDaysLeft', cd === null || cd > 0, cd === null ? 'n/a (openssl unavailable)' : cd);
+  add('certExpiryWarning', cd === null || cd > dshT('certExpireWarnDays'), cd === null ? 'n/a' : cd + 'd');
+  for (const m of ['express', 'socket.io', 'compression', 'web-push', 'peer']) {
+    try { require.resolve(m); add('module:' + m, true, 'ok'); }
+    catch (e) { add('module:' + m, false, 'missing'); }
+  }
+  add('sqliteIndex', !!DSH.db, DSH.fts ? 'fts5' : (DSH.db ? 'no-fts5' : 'unavailable'));
+  add('https', true, _useHttps ? 'on' : 'off');
+  try { const a = server.address(); add('listening', !!a, a ? a.port : 'not yet'); }
+  catch (e) { add('listening', false, e.message); }
+  const mem = process.memoryUsage();
+  add('memory', mem.heapUsed < 900 * 1024 * 1024, Math.round(mem.heapUsed / 1048576) + 'MB');
+  try {
+    let n = 0; for (const k in messageHistory) if (Array.isArray(messageHistory[k])) n += messageHistory[k].length;
+    add('messageHistory', true, n + ' in RAM');
+  } catch (e) { add('messageHistory', false, e.message); }
+  const ok = checks.filter(function (c) { return c.ok; }).length;
+  return {
+    ok: ok === checks.length, status: ok === checks.length ? 'healthy' : 'degraded',
+    score: ok + '/' + checks.length,
+    uptimeSec: Math.round((Date.now() - DSH.startedAt) / 1000),
+    startedAt: new Date(DSH.startedAt).toISOString(),
+    node: process.version, pid: process.pid, version: 'dsh-inline-1.0', checks: checks
+  };
+}
+function dshStartupReport() {
+  const h = dshHealth();
+  const bad = h.checks.filter(function (c) { return !c.ok; });
+  console.log('🩺 启动自检 ' + h.score + ' 项通过' +
+    (bad.length ? ' | 异常: ' + bad.map(function (c) { return c.name + '(' + c.detail + ')'; }).join(', ') : ' | 全部正常'));
+  dshLog('info', 'startup.health', { score: h.score, failed: bad.map(function (c) { return c.name; }) });
+  const cd = dshCertDaysLeft();
+  if (cd !== null && cd <= dshT('certExpireWarnDays')) {
+    console.warn('⚠️ HTTPS 证书将在 ' + cd + ' 天后过期，可执行 certrenew 重建');
+    dshLog('warn', 'cert.expiring', { days: cd });
+  }
+  return h;
+}
+
+/* ---------------- P3 /metrics ---------------- */
+function dshMetricsText() {
+  const m = DSH.metrics, mem = process.memoryUsage();
+  let conns = 0; try { conns = io.sockets.sockets.size; } catch (e) {}
+  let msgs = 0;
+  try { for (const k in messageHistory) if (Array.isArray(messageHistory[k])) msgs += messageHistory[k].length; } catch (e) {}
+  const L = [];
+  function g(n, h, v) { L.push('# HELP ' + n + ' ' + h); L.push('# TYPE ' + n + ' gauge'); L.push(n + ' ' + v); }
+  g('dsh_uptime_seconds', 'Process uptime', Math.round((Date.now() - DSH.startedAt) / 1000));
+  g('dsh_socket_connections', 'Connected sockets', conns);
+  g('dsh_messages_in_memory', 'Messages held in RAM', msgs);
+  g('dsh_http_requests_total', 'HTTP requests observed', m.httpRequests);
+  g('dsh_http_errors_total', 'Errors logged', m.httpErrors);
+  g('dsh_socket_messages_total', 'Socket messages observed', m.socketMessages);
+  g('dsh_calls_total', 'Calls initiated', m.calls);
+  g('dsh_calls_active', 'Active calls', m.callActive);
+  g('dsh_audit_events_total', 'Admin audit events', m.audits);
+  g('dsh_offline_queued_total', 'Offline messages queued', m.offlineQueued);
+  g('dsh_searches_total', 'Full text searches', m.searches);
+  g('dsh_read_receipts_total', 'Read receipts', m.readReceipts);
+  g('dsh_sync_events_total', 'Multi-device sync events', m.syncEvents);
+  g('dsh_csp_reports_total', 'CSP violation reports', m.cspReports);
+  g('dsh_heap_used_bytes', 'V8 heap used', mem.heapUsed);
+  g('dsh_rss_bytes', 'Resident set size', mem.rss);
+  g('dsh_readonly', 'Read-only mode', (config.readonlyMode === true || config.readOnly === true) ? 1 : 0);
+  return L.join('\n') + '\n';
+}
+
+/* ---------------- P0-C CI 静态扫描 ----------------
+   用途：在 CI / 提交前拦截「未定义变量」「语法错误」这类事故
+   （历史事故：_csrfSameOrigin、pad2、_roScheduleWasActive 缺失，
+    以及客户端函数被误放进服务端作用域）。
+   零外部依赖：语法检查用 new vm.Script；若本地装了 acorn，
+   额外做作用域级未定义标识符分析。 */
+function dshStaticScan(opts) {
+  opts = opts || {};
+  const file = String(opts.file || __filename);
+  const out = { ok: true, file: file, checks: [] };
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    out.ok = false;
+    out.checks.push({ name: 'read', ok: false, detail: e.message });
+    return out;
+  }
+  out.bytes = Buffer.byteLength(text, 'utf8');
+  out.lines = text.split(String.fromCharCode(10)).length;
+
+  /* 1) 语法检查（vm.Script 编译，不执行） */
+  try {
+    const vm = require('vm');
+    new vm.Script(text, { filename: file });
+    out.checks.push({ name: 'syntax', ok: true, detail: 'ok' });
+  } catch (e) {
+    out.ok = false;
+    out.checks.push({ name: 'syntax', ok: false, detail: e.message });
+    return out;   /* 语法错误时后续 AST 分析无意义 */
+  }
+
+  /* 2) 危险模式 / 历史事故回归检查 */
+  const patterns = [
+    { name: 'eval-usage', re: /\.eval\s*\(/g, level: 'warn' },
+    { name: 'client-doc-in-server', re: /document\.getElementById/g, level: 'info' }
+  ];
+  const hits = {};
+  for (const p of patterns) {
+    const m = text.match(p.re);
+    hits[p.name] = m ? m.length : 0;
+  }
+  out.checks.push({ name: 'patterns', ok: true, detail: hits });
+
+  /* 3) 反引号污染检查：HTML 模板内不允许出现裸反引号 */
+  try {
+    const tplStart = text.indexOf('const html = String.raw' + String.fromCharCode(96));
+    const tplEnd = text.indexOf('</html>' + String.fromCharCode(96) + ';', tplStart);
+    if (tplStart !== -1 && tplEnd !== -1) {
+      const inner = text.slice(tplStart + 24, tplEnd);
+      const n = (inner.match(new RegExp(String.fromCharCode(96), 'g')) || []).length;
+      out.checks.push({ name: 'template-backtick', ok: n === 0,
+        detail: n === 0 ? 'clean' : n + ' stray backtick(s) inside HTML template' });
+      if (n !== 0) out.ok = false;
+    } else {
+      out.checks.push({ name: 'template-backtick', ok: true, detail: 'template not found (skipped)' });
+    }
+  } catch (e) {
+    out.checks.push({ name: 'template-backtick', ok: true, detail: 'skipped: ' + e.message });
+  }
+
+  /* 4) 作用域级未定义变量检测（需要 acorn；未安装则跳过并说明） */
+  let acorn = null;
+  try { acorn = require('acorn'); } catch (e) {}
+  if (!acorn) {
+    out.checks.push({ name: 'undefined-vars', ok: true, detail: 'skipped (acorn not installed)' });
+    return out;
+  }
+  try {
+    const ast = acorn.parse(text, {
+      ecmaVersion: 'latest', sourceType: 'script', locations: true,
+      allowHashBang: true, allowReturnOutsideFunction: true
+    });
+    const GLOBALS = new Set(('Object Function Array String Boolean Number Math JSON Date RegExp Error '
+      + 'TypeError RangeError SyntaxError ReferenceError EvalError URIError AggregateError Promise '
+      + 'Symbol BigInt Map Set WeakMap WeakSet Reflect Proxy Intl parseInt parseFloat isNaN isFinite '
+      + 'encodeURIComponent decodeURIComponent encodeURI decodeURI escape unescape eval setTimeout '
+      + 'clearTimeout setInterval clearInterval setImmediate clearImmediate queueMicrotask console '
+      + 'process require module exports __dirname __filename global globalThis Buffer URL '
+      + 'URLSearchParams TextEncoder TextDecoder AbortController fetch structuredClone performance '
+      + 'crypto atob btoa arguments undefined NaN Infinity WebSocket Event EventTarget CustomEvent '
+      + 'navigator location document window self localStorage sessionStorage alert confirm prompt '
+      + 'requestAnimationFrame cancelAnimationFrame Image FileReader Blob File FormData Headers '
+      + 'Request Response XMLHttpRequest DOMParser MutationObserver IntersectionObserver '
+      + 'ResizeObserver WebAssembly SharedArrayBuffer ArrayBuffer DataView Float32Array Float64Array '
+      + 'Int8Array Int16Array Int32Array Uint8Array Uint16Array Uint32Array Uint8ClampedArray '
+      + 'BigInt64Array BigUint64Array FinalizationRegistry WeakRef Generator AsyncFunction '
+      + 'AsyncGeneratorFunction vm').split(/\s+/));
+
+    const scopeOf = new Map();
+    const nonRef = new Set();
+    const allIds = [];
+    const SKIP = new Set(['type', 'start', 'end', 'loc', 'range', 'raw', 'parent']);
+    function newScope(type, parent) { return { type: type, parent: parent, vars: new Set() }; }
+    function findFunc(s) { let c = s; while (c && c.type !== 'function' && c.type !== 'global') c = c.parent; return c || s; }
+    function resolve(s, name) { let c = s; while (c) { if (c.vars.has(name)) return true; c = c.parent; } return GLOBALS.has(name); }
+    function patternNames(n, out2) {
+      if (!n) return;
+      if (n.type === 'Identifier') { out2.push(n.name); return; }
+      if (n.type === 'RestElement') { patternNames(n.argument, out2); return; }
+      if (n.type === 'AssignmentPattern') { patternNames(n.left, out2); return; }
+      if (n.type === 'ArrayPattern') { for (const e of n.elements) patternNames(e, out2); return; }
+      if (n.type === 'ObjectPattern') {
+        for (const p of n.properties) patternNames(p.type === 'RestElement' ? p.argument : p.value, out2);
+      }
+    }
+    function declare(n, scope) { const names = []; patternNames(n, names); for (const nm of names) scope.vars.add(nm); }
+    function visitPattern(n, scope) {
+      if (!n) return;
+      scopeOf.set(n, scope);
+      if (n.type === 'Identifier') { nonRef.add(n); return; }
+      if (n.type === 'RestElement') { visitPattern(n.argument, scope); return; }
+      if (n.type === 'AssignmentPattern') { visitPattern(n.left, scope); build(n.right, scope); return; }
+      if (n.type === 'ArrayPattern') { for (const e of n.elements) visitPattern(e, scope); return; }
+      if (n.type === 'ObjectPattern') {
+        for (const p of n.properties) {
+          if (p.type === 'RestElement') visitPattern(p.argument, scope);
+          else {
+            scopeOf.set(p, scope);
+            if (!p.computed && p.key && p.key.type === 'Identifier') { scopeOf.set(p.key, scope); nonRef.add(p.key); }
+            visitPattern(p.value, scope);
+          }
+        }
+        return;
+      }
+      generic(n, scope);
+    }
+    function hoist(n, scope, onlyVar) {
+      if (!n || typeof n.type !== 'string') return;
+      switch (n.type) {
+        case 'VariableDeclaration': {
+          const target = n.kind === 'var' ? findFunc(scope) : (onlyVar ? null : scope);
+          for (const d of n.declarations) { if (target) declare(d.id, target); if (d.init) hoist(d.init, scope, onlyVar); }
+          return;
+        }
+        case 'FunctionDeclaration': if (n.id) { findFunc(scope).vars.add(n.id.name); scope.vars.add(n.id.name); } return;
+        case 'ClassDeclaration': if (!onlyVar && n.id) scope.vars.add(n.id.name); return;
+        case 'FunctionExpression': case 'ArrowFunctionExpression': case 'ClassExpression': return;
+        case 'BlockStatement': for (const s of n.body) hoist(s, scope, true); return;
+        case 'IfStatement': hoist(n.consequent, scope, onlyVar); hoist(n.alternate, scope, onlyVar); return;
+        case 'ForStatement': hoist(n.init, scope, onlyVar); hoist(n.body, scope, onlyVar); return;
+        case 'ForInStatement': case 'ForOfStatement': hoist(n.left, scope, onlyVar); hoist(n.body, scope, onlyVar); return;
+        case 'WhileStatement': case 'DoWhileStatement': hoist(n.body, scope, onlyVar); return;
+        case 'TryStatement':
+          hoist(n.block, scope, onlyVar);
+          if (n.handler) hoist(n.handler.body, scope, onlyVar);
+          hoist(n.finalizer, scope, onlyVar);
+          return;
+        case 'SwitchStatement': for (const c of n.cases) for (const s of c.consequent) hoist(s, scope, onlyVar); return;
+        case 'LabeledStatement': case 'WithStatement': hoist(n.body, scope, onlyVar); return;
+        case 'ExpressionStatement': case 'ReturnStatement': case 'ThrowStatement': case 'BreakStatement':
+        case 'ContinueStatement': case 'DebuggerStatement': case 'EmptyStatement': return;
+        default:
+          for (const k of Object.keys(n)) {
+            if (SKIP.has(k)) continue;
+            const v = n[k]; if (!v) continue;
+            if (Array.isArray(v)) { for (const c of v) if (c && typeof c.type === 'string') hoist(c, scope, onlyVar); }
+            else if (typeof v === 'object' && typeof v.type === 'string') hoist(v, scope, onlyVar);
+          }
+      }
+    }
+    function generic(n, scope) {
+      for (const k of Object.keys(n)) {
+        if (SKIP.has(k)) continue;
+        const v = n[k]; if (!v) continue;
+        if (Array.isArray(v)) { for (const c of v) if (c && typeof c.type === 'string') build(c, scope); }
+        else if (typeof v === 'object' && typeof v.type === 'string') build(v, scope);
+      }
+    }
+    function buildBody(block, fnScope) {
+      scopeOf.set(block, fnScope);
+      for (const _st of block.body) hoist(_st, fnScope, false);
+      for (const _st2 of block.body) build(_st2, fnScope);
+    }
+    function build(n, scope) {
+      if (!n || typeof n.type !== 'string') return;
+      scopeOf.set(n, scope);
+      if (n.type === 'Identifier') { allIds.push(n); return; }
+      switch (n.type) {
+        case 'Program': case 'BlockStatement':
+          for (const _bs of n.body) hoist(_bs, scope, false);
+          for (const _bs2 of n.body) build(_bs2, scope);
+          return;
+        case 'FunctionDeclaration': case 'FunctionExpression': {
+          const fs2 = newScope('function', scope);
+          if (n.id) { scopeOf.set(n.id, n.type === 'FunctionExpression' ? fs2 : scope); nonRef.add(n.id); fs2.vars.add(n.id.name); if (n.type === 'FunctionDeclaration') scope.vars.add(n.id.name); }
+          for (const p of n.params) { declare(p, fs2); visitPattern(p, fs2); }
+          buildBody(n.body, fs2); return;
+        }
+        case 'ArrowFunctionExpression': {
+          const fs2 = newScope('function', scope);
+          for (const p of n.params) { declare(p, fs2); visitPattern(p, fs2); }
+          if (n.body.type === 'BlockStatement') buildBody(n.body, fs2); else build(n.body, fs2);
+          return;
+        }
+        case 'ClassDeclaration': case 'ClassExpression':
+          if (n.id) { scopeOf.set(n.id, scope); nonRef.add(n.id); if (n.type === 'ClassDeclaration') scope.vars.add(n.id.name); }
+          if (n.superClass) build(n.superClass, scope);
+          if (n.body) build(n.body, scope); return;
+        case 'CatchClause': {
+          const cs = newScope('block', scope);
+          if (n.param) { declare(n.param, cs); visitPattern(n.param, cs); }
+          buildBody(n.body, cs); return;
+        }
+        case 'ForStatement': case 'ForInStatement': case 'ForOfStatement': {
+          const ls = newScope('block', scope);
+          const head = n.type === 'ForStatement' ? n.init : n.left;
+          if (head) hoist(head, ls, false);
+          for (const k of Object.keys(n)) {
+            if (SKIP.has(k)) continue;
+            const v = n[k]; if (!v) continue;
+            if (Array.isArray(v)) { for (const c of v) if (c && typeof c.type === 'string') build(c, ls); }
+            else if (typeof v === 'object' && typeof v.type === 'string') build(v, ls);
+          }
+          return;
+        }
+        case 'SwitchStatement': {
+          const ss = newScope('block', scope);
+          for (const c of n.cases) for (const _cs of c.consequent) hoist(_cs, ss, false);
+          generic(n, ss); return;
+        }
+        case 'VariableDeclaration':
+          for (const d of n.declarations) { visitPattern(d.id, scope); if (d.init) build(d.init, scope); }
+          return;
+        default: generic(n, scope);
+      }
+    }
+    function markNonRefs(n) {
+      if (!n || typeof n.type !== 'string') return;
+      if (n.type === 'MemberExpression') { if (!n.computed && n.property && n.property.type === 'Identifier') nonRef.add(n.property); }
+      else if (n.type === 'Property') { if (!n.computed && !n.shorthand && n.key && n.key.type === 'Identifier') nonRef.add(n.key); }
+      else if (n.type === 'MethodDefinition' || n.type === 'PropertyDefinition') { if (!n.computed && n.key && n.key.type === 'Identifier') nonRef.add(n.key); }
+      else if (n.type === 'LabeledStatement' || n.type === 'BreakStatement' || n.type === 'ContinueStatement') { if (n.label && n.label.type === 'Identifier') nonRef.add(n.label); }
+      else if (n.type === 'MetaProperty') { if (n.meta) nonRef.add(n.meta); if (n.property) nonRef.add(n.property); }
+      for (const k of Object.keys(n)) {
+        if (SKIP.has(k)) continue;
+        const v = n[k]; if (!v) continue;
+        if (Array.isArray(v)) { for (const c of v) if (c && typeof c.type === 'string') markNonRefs(c); }
+        else if (typeof v === 'object' && typeof v.type === 'string') markNonRefs(v);
+      }
+    }
+
+    const gs = newScope('global', null);
+    build(ast, gs);
+    markNonRefs(ast);
+
+    /* 过滤误报：
+       ① typeof X 保护（X 可安全未定义，且通常就是防御性写法）
+       ② 位于 HTML 模板字符串数组内的客户端代码（服务端作用域里天然不存在） */
+    const guardedLines = new Set();
+    const tplStart = text.indexOf('const html = String.raw' + String.fromCharCode(96));
+    const tplEnd = text.indexOf('</html>' + String.fromCharCode(96) + ';', tplStart);
+    {
+      let gi = text.indexOf('typeof ');
+      while (gi !== -1) {
+        guardedLines.add(text.slice(0, gi).split(String.fromCharCode(10)).length);
+        gi = text.indexOf('typeof ', gi + 7);
+      }
+    }
+    function lineOf(off) { return text.slice(0, off).split(String.fromCharCode(10)).length; }
+    const unresolved = [];
+    const seen = Object.create(null);
+    for (const id of allIds) {
+      if (nonRef.has(id)) continue;
+      const sc = scopeOf.get(id);
+      if (!sc || resolve(sc, id.name)) continue;
+      const ln = id.loc && id.loc.start ? id.loc.start.line : -1;
+      if (guardedLines.has(ln)) continue;
+      if (typeof id.start === 'number' && tplStart !== -1 && tplEnd !== -1 &&
+          id.start > tplStart && id.start < tplEnd) continue;
+      const key = id.name + '@' + ln;
+      if (seen[key]) continue;
+      seen[key] = 1;
+      unresolved.push({ name: id.name, line: ln });
+    }
+    out.checks.push({
+      name: 'undefined-vars',
+      ok: true,
+      detail: unresolved.length ? { count: unresolved.length, sample: unresolved.slice(0, 30) }
+        : 'none'
+    });
+    out.undefinedVars = unresolved;
+  } catch (e) {
+    out.checks.push({ name: 'undefined-vars', ok: true, detail: 'skipped: ' + e.message });
+  }
+  return out;
+}
+
+/* ---------------- cloudflared 隧道管理 ----------------
+   同目录自带 cloudflared.exe（36MB）。这里提供一条命令就能开隧道，
+   并把 cloudflared 注入的真实客户端 IP / cf-ray 头纳入既有安全链路。 */
+var DSH_TUNNEL = {
+  proc: null, url: '', startedAt: 0, lastError: '', mode: ''
+};
+function dshCloudflaredPath() {
+  try { return path.join(__dirname, 'cloudflared.exe'); } catch (e) { return ''; }
+}
+function dshTunnelStatus() {
+  return {
+    available: !!fs.existsSync(dshCloudflaredPath()),
+    running: !!(DSH_TUNNEL.proc && DSH_TUNNEL.proc.exitCode === null),
+    url: DSH_TUNNEL.url,
+    startedAt: DSH_TUNNEL.startedAt,
+    uptimeSec: DSH_TUNNEL.startedAt ? Math.round((Date.now() - DSH_TUNNEL.startedAt) / 1000) : 0,
+    mode: DSH_TUNNEL.mode,
+    lastError: DSH_TUNNEL.lastError
+  };
+}
+function dshTunnelStart(opts) {
+  opts = opts || {};
+  var bin = dshCloudflaredPath();
+  if (!fs.existsSync(bin)) return { ok: false, error: '未找到 cloudflared.exe（应与 server.js 同目录）' };
+  if (DSH_TUNNEL.proc && DSH_TUNNEL.proc.exitCode === null) {
+    return { ok: false, error: '隧道已在运行: ' + (DSH_TUNNEL.url || '(获取中)') };
+  }
+  var args;
+  var mode = opts.mode || 'quick';
+  if (mode === 'quick') {
+    /* 快速隧道：免登录，随机 trycloudflare.com 域名 */
+    args = ['tunnel', '--no-autoupdate', '--url', 'http://127.0.0.1:' + (typeof PORT === 'number' ? PORT : 3000)];
+  } else {
+    /* 命名隧道：需要用户先 cloudflared tunnel login + create */
+    var name = String(opts.name || process.env.DSH_TUNNEL_NAME || '');
+    if (!name) return { ok: false, error: '命名隧道需要隧道名' };
+    args = ['tunnel', '--no-autoupdate', 'run', name];
+  }
+  try {
+    var cp = require('child_process');
+    var proc = cp.spawn(bin, args, { cwd: __dirname, windowsHide: true });
+    DSH_TUNNEL.proc = proc;
+    DSH_TUNNEL.mode = mode;
+    DSH_TUNNEL.startedAt = Date.now();
+    DSH_TUNNEL.url = '';
+    DSH_TUNNEL.lastError = '';
+    var onData = function (buf) {
+      var s = buf.toString('utf8');
+      /* 从输出里抓 trycloudflare 域名 */
+      var m = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i.exec(s);
+      if (m && !DSH_TUNNEL.url) {
+        DSH_TUNNEL.url = m[0];
+        console.log('🌐 cloudflared 隧道已就绪: ' + DSH_TUNNEL.url);
+        dshLog('info', 'tunnel.ready', { url: DSH_TUNNEL.url, mode: mode });
+        try { io.emit('tunnel-status', dshTunnelStatus()); } catch (e) {}
+      }
+      if (/ERR|error/i.test(s) && !DSH_TUNNEL.url) DSH_TUNNEL.lastError = s.slice(0, 300);
+    };
+    if (proc.stdout) proc.stdout.on('data', onData);
+    if (proc.stderr) proc.stderr.on('data', onData);
+    proc.on('exit', function (code) {
+      console.log('🌐 cloudflared 已退出 (code=' + code + ')');
+      dshLog('info', 'tunnel.exit', { code: code });
+      DSH_TUNNEL.startedAt = 0;
+      DSH_TUNNEL.url = '';
+      try { io.emit('tunnel-status', dshTunnelStatus()); } catch (e) {}
+    });
+    dshLog('info', 'tunnel.start', { mode: mode });
+    return { ok: true, message: '隧道启动中，几秒后查看状态' };
+  } catch (e) {
+    DSH_TUNNEL.lastError = e.message;
+    return { ok: false, error: e.message };
+  }
+}
+function dshTunnelStop() {
+  try {
+    if (DSH_TUNNEL.proc && DSH_TUNNEL.proc.exitCode === null) {
+      DSH_TUNNEL.proc.kill();
+      console.log('🌐 cloudflared 已停止');
+      return { ok: true };
+    }
+    return { ok: false, error: '隧道未在运行' };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+/* ---------------- P1 上传魔数校验 ---------------- */
+var DSH_MAGIC = [
+  { re: /^\.png$/i, sig: [[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]] },
+  { re: /^\.(jpg|jpeg)$/i, sig: [[0xFF, 0xD8, 0xFF]] },
+  { re: /^\.gif$/i, sig: [[0x47, 0x49, 0x46, 0x38]] },
+  { re: /^\.webp$/i, sig: [[0x52, 0x49, 0x46, 0x46]] },
+  { re: /^\.pdf$/i, sig: [[0x25, 0x50, 0x44, 0x46]] },
+  { re: /^\.mp3$/i, sig: [[0x49, 0x44, 0x33], [0xFF, 0xFB]] },
+  { re: /^\.(ogg|webm)$/i, sig: [[0x4F, 0x67, 0x67, 0x53], [0x1A, 0x45, 0xDF, 0xA3]] },
+  { re: /^\.(zip|docx|xlsx|pptx|apk)$/i, sig: [[0x50, 0x4B, 0x03, 0x04]] }
+];
+function dshValidateMagic(buf, fileName) {
+  if (!buf || !buf.length) return { ok: true, reason: 'empty' };
+  const ext = path.extname(String(fileName || '')).toLowerCase();
+  for (const rule of DSH_MAGIC) {
+    if (!rule.re.test(ext)) continue;
+    const hit = rule.sig.some(function (sig) {
+      if (buf.length < sig.length) return false;
+      for (let i = 0; i < sig.length; i++) if (buf[i] !== sig[i]) return false;
+      return true;
+    });
+    if (!hit) return { ok: false, reason: '文件头与扩展名不符 (' + ext + ')' };
+    return { ok: true, reason: 'magic-ok' };
+  }
+  if (buf[0] === 0x4D && buf[1] === 0x5A) return { ok: false, reason: '不允许上传可执行文件' };
+  return { ok: true, reason: 'unchecked-extension' };
+}
+
+/* ---------------- P1 备份 / 回滚 ---------------- */
+function dshBackupDir() { return path.join(DATA_DIR_EARLY, 'backups'); }
+function dshBackupList() {
+  try {
+    return fs.readdirSync(dshBackupDir()).filter(function (n) { return /\.json\.gz$/.test(n); })
+      .map(function (n) { const st = fs.statSync(path.join(dshBackupDir(), n)); return { name: n, size: st.size, at: st.mtimeMs }; })
+      .sort(function (a, b) { return b.at - a.at; });
+  } catch (e) { return []; }
+}
+function dshBackup(tag) {
+  try {
+    fs.mkdirSync(dshBackupDir(), { recursive: true });
+    const names = ['config.json', 'users.json', 'groups.json', 'stickers.json', 'profiles.json',
+      'wallets.json', 'redpackets.json', 'moments.json', 'visitors.json', 'blocks.json',
+      'history.json', 'file_owners.json', 'moderation.json', 'user_data.json', 'burn.json',
+      'risk_events.json', 'risk_control.json', 'reports.json', 'runtime_config.json'];
+    const payload = {};
+    for (const n of names) {
+      for (const suffix of ['', '.br', '.gz']) {
+        const f = path.join(DATA_DIR_EARLY, n + suffix);
+        if (!fs.existsSync(f)) continue;
+        try {
+          let buf = fs.readFileSync(f);
+          if (suffix === '.br') buf = zlib.brotliDecompressSync(buf);
+          else if (suffix === '.gz') buf = zlib.gunzipSync(buf);
+          payload[n] = buf.toString('utf8');
+        } catch (e) {}
+        break;
+      }
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const name = 'backup-' + stamp + (tag ? '-' + String(tag).replace(/[^A-Za-z0-9_-]/g, '') : '') + '.json.gz';
+    fs.writeFileSync(path.join(dshBackupDir(), name),
+      zlib.gzipSync(Buffer.from(JSON.stringify({ createdAt: new Date().toISOString(), files: payload }), 'utf8'), { level: 6 }));
+    DSH.metrics.backups++;
+    const all = dshBackupList();
+    for (let i = dshT('backupKeep'); i < all.length; i++) {
+      try { fs.unlinkSync(path.join(dshBackupDir(), all[i].name)); } catch (e) {}
+    }
+    dshLog('info', 'backup.created', { name: name, files: Object.keys(payload).length });
+    dshAudit('system', 'backup.create', name, {});
+    return { ok: true, name: name, files: Object.keys(payload).length };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+function dshRestore(name) {
+  try {
+    const f = path.join(dshBackupDir(), String(name).replace(/[^A-Za-z0-9_.-]/g, ''));
+    if (!fs.existsSync(f)) return { ok: false, error: '备份不存在' };
+    const obj = JSON.parse(zlib.gunzipSync(fs.readFileSync(f)).toString('utf8'));
+    dshBackup('pre-restore');
+    for (const n in obj.files) {
+      try { fs.writeFileSync(path.join(DATA_DIR_EARLY, n), obj.files[n], 'utf8'); } catch (e) {}
+    }
+    dshAudit('system', 'backup.restore', name, { files: Object.keys(obj.files).length });
+    return { ok: true, files: Object.keys(obj.files).length, needRestart: true };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+/* ---------------- P1 证书重建 ---------------- */
+function dshRenewCert() {
+  try {
+    const sni = ['127.0.0.1'];
+    try {
+      const ifs = require('os').networkInterfaces();
+      for (const n in ifs) for (const it of (ifs[n] || [])) {
+        if (it && it.family === 'IPv4' && !it.internal && it.address && sni.indexOf(it.address) === -1) sni.push(it.address);
+      }
+    } catch (e) {}
+    const san = 'DNS:localhost,IP:' + sni.join(',IP:');
+    const cmd = 'openssl req -x509 -newkey rsa:2048 -keyout "' + KEY_FILE +
+      '" -out "' + CERT_FILE + '" -days 365 -nodes -subj "/CN=LAN-Chat"' +
+      ' -addext "subjectAltName=' + san + '"';
+    require('child_process').execSync(cmd, { stdio: 'ignore', timeout: 5000 });
+    dshLog('info', 'cert.renewed', {});
+    return { ok: true, days: 365, note: '重启服务端生效：restart' };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+/* ---------------- P0-A 统一的 filestore 清理（3→1） ---------------- */
+function dshFilestoreCleanup() {
+  try {
+    if (!fs.existsSync(FILE_STORE_DIR)) return { removed: 0, freed: 0 };
+    const refs = Object.create(null);
+    for (const k in messageHistory) {
+      if (!Object.prototype.hasOwnProperty.call(messageHistory, k)) continue;
+      const arr = messageHistory[k];
+      if (!Array.isArray(arr)) continue;
+      for (let i = 0; i < arr.length; i++) if (arr[i] && arr[i].fileId) refs[arr[i].fileId] = true;
+    }
+    /* 归档中的消息同样持有 fileId —— 原 3 个定时器都会误删，这里补齐 */
+    try {
+      if (fs.existsSync(HISTORY_ARCHIVE_DIR)) {
+        for (const fn of fs.readdirSync(HISTORY_ARCHIVE_DIR)) {
+          if (!/\.ndjson\.gz$/.test(fn)) continue;
+          try {
+            const lines = zlib.gunzipSync(fs.readFileSync(path.join(HISTORY_ARCHIVE_DIR, fn))).toString('utf8').split('\n');
+            for (let i = 0; i < lines.length; i++) {
+              if (!lines[i].trim()) continue;
+              try { const m = JSON.parse(lines[i]); if (m && m.fileId) refs[m.fileId] = true; } catch (e) {}
+            }
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
+    const maxAge = dshT('filestoreOrphanHours') * 3600000;
+    const now = Date.now();
+    let removed = 0, freed = 0, changedOwners = false;
+    for (const fname of fs.readdirSync(FILE_STORE_DIR)) {
+      if (refs[fname]) continue;
+      const fp = path.join(FILE_STORE_DIR, fname);
+      let st; try { st = fs.statSync(fp); } catch (e) { continue; }
+      if (!st.isFile()) continue;
+      const o = fileOwners[fname];
+      if (o && o.lastAccess && (now - o.lastAccess) < maxAge) continue;
+      if (now - st.mtimeMs < maxAge) continue;
+      try {
+        freed += st.size; fs.unlinkSync(fp); removed++;
+        if (o) { delete fileOwners[fname]; changedOwners = true; }
+      } catch (e) {}
+    }
+    if (changedOwners) { try { saveFileOwners(); rebuildUploadQuota(); } catch (e) {} }
+    if (removed || changedOwners) {
+      console.log('🧹 filestore 统一清理：删除 ' + removed + ' 个，释放 ' + (freed / 1048576).toFixed(1) + 'MB');
+      dshLog('info', 'filestore.cleanup', { removed: removed, freed: freed, ownersChanged: changedOwners });
+    }
+    return { removed: removed, freed: freed };
+  } catch (e) {
+    dshLog('error', 'filestore.cleanup.failed', { error: e.message });
+    return { removed: 0, freed: 0, error: e.message };
+  }
+}
+
+/* ---------------- DSH 初始化（在所有依赖就绪后调用） ---------------- */
+function dshInit() {
+  if (DSH.initialized) return;
+  DSH.initialized = true;
+  /* 运维令牌：未显式配置时生成一次性令牌并写入 files/ops_token.txt，
+     供 CLI / CI 访问管理员端点（避免仅凭回环地址放行）。 */
+  try {
+    if (!process.env.DSH_OPS_TOKEN) {
+      const tf = path.join(DATA_DIR_EARLY, 'ops_token.txt');
+      let tok = '';
+      try { tok = fs.readFileSync(tf, 'utf8').trim(); } catch (e) {}
+      if (!tok || tok.length < 24) {
+        tok = crypto.randomBytes(24).toString('hex');
+        fs.writeFileSync(tf, tok, 'utf8');
+      }
+      process.env.DSH_OPS_TOKEN = tok;
+      if (!DSH._tokenPrinted) {
+        DSH._tokenPrinted = true;
+        console.log('🔑 运维令牌（管理员端点）: ' + tok.slice(0, 8) +
+          '…  完整令牌见 files/ops_token.txt，用法: -H "X-Ops-Token: <token>"');
+      }
+    }
+  } catch (e) {}
+  DSH.logDir = path.join(DATA_DIR_EARLY, 'logs');
+  try { fs.mkdirSync(DSH.logDir, { recursive: true }); } catch (e) {}
+  dshLoadThresholds();
+  dshInitDb();
+  dshRestoreState();
+  dshApplyThresholds();
+  dshRotateLogs();
+  /* 统一定时器：清理 / 索引 / 日志轮转 / 备份 / 发现 */
+  DSH.timers.push(setInterval(function () { try { dshFilestoreCleanup(); } catch (e) {} },
+    Math.max(5, dshT('filestoreCleanupMinutes')) * 60 * 1000));
+  DSH.timers.push(setInterval(function () { try { dshIndexHistory(); } catch (e) {} },
+    Math.max(1, dshT('archiveIndexMinutes')) * 60 * 1000));
+  DSH.timers.push(setInterval(function () { try { dshRotateLogs(); } catch (e) {} }, 60 * 60 * 1000));
+  if (dshT('backupIntervalHours') > 0) {
+    DSH.timers.push(setInterval(function () { try { dshBackup('auto'); } catch (e) {} },
+      dshT('backupIntervalHours') * 3600000));
+  }
+  dshLog('info', 'dsh.initialized', { version: 'dsh-inline-1.0' });
+}
+
+
+
+/* 进程异常兜底 & 致命错误 3 分钟自动重启 */
+var _fatalErrorTimer = null;
+function _triggerFatalError(reason) {
+  if (_fatalErrorTimer) return; // 已经在倒计时中，避免重复触发
+  console.error('🚨🚨 服务器触发致命错误（' + reason + '），将在 3 分钟后自动重启...');
+  
+  // 给所有在线客户端广播即将重启的提示
+  try {
+    if (typeof io !== 'undefined' && io.emit) {
+      io.emit('account-banned', {
+        reason: '服务器发生致命错误，正在尝试恢复，将于 3 分钟后自动重启。',
+        bannedUntil: 0
+      });
+    }
+  } catch (e) {}
+
+  _fatalErrorTimer = setTimeout(function () {
+    console.error('🔄 3 分钟已到，强制执行服务器重启...');
+    try {
+      // 尝试优雅重启
+      if (typeof restartServer === 'function') {
+        restartServer();
+      } else {
+        process.exit(1);
+      }
+    } catch (e) {
+      process.exit(1);
+    }
+  }, 3 * 60 * 1000); // 3 分钟
+}
+
 process.on('uncaughtException', function (err) {
   try {
-    console.error('[未捕获异常]', (err && err.stack) || err);
+    sysLog('error', '🚨 [未捕获异常] ' + ((err && err.message) || err), '🚨 [Uncaught Exception] ' + ((err && err.message) || err));
+    _triggerFatalError('uncaughtException');
   } catch (e) {}
 });
 process.on('unhandledRejection', function (reason) {
   try {
     console.error('[未处理的 Promise 拒绝]', (reason && reason.stack) || reason);
+    _triggerFatalError('unhandledRejection');
   } catch (e) {}
 });
 process.on('warning', function (w) {
@@ -25,14 +993,12 @@ const KEY_FILE_EARLY = pathMod.join(__dirname, 'files', 'key.pem');
 if (!fsMod.existsSync(pathMod.join(__dirname, 'files'))) {
   fsMod.mkdirSync(pathMod.join(__dirname, 'files'), { recursive: true });
 }
-/* ★ v0.32.0 启动优化：证书生成顺序调整为「openssl 优先（同步、快速、可靠）→ selfsigned 兜底」。
-   这样首次启动不会因为 selfsigned v3 异步未写完而多走一次 openssl 分支。
-   给 openssl 加 3 秒超时，防止极端环境下卡死启动。 */
+/* 证书生成：openssl 优先（同步、加 3s 超时），selfsigned 兜底。
+   SAN 自动包含本机所有局域网 IPv4，避免 wss 握手被拒。 */
 if (!fsMod.existsSync(CERT_FILE_EARLY) || !fsMod.existsSync(KEY_FILE_EARLY)) {
   var _certOk = false;
 
-  /* 1. openssl 优先（同步 <200ms，最稳定） */
-  /* ★ v0.32.3：证书 SAN 自动包含本机所有 IPv4，避免局域网 IP 访问时 wss 握手被拒 */
+  /* 1. openssl 优先 */
   var _allIps = ['127.0.0.1'];
   try {
     var _ifaces = require('os').networkInterfaces();
@@ -129,120 +1095,73 @@ const crypto = require('crypto');
 
 const app = express();
 
-/*内存监控 + 全局资源清理（Memory Guard）*/
+/* 内存监控 + 资源清理 */
 var __memMonitor = { history: [] };
 
-setInterval(function () {
-  try {
-    var mu = process.memoryUsage();
-    var heapMB = Math.round(mu.heapUsed / 1048576);
-    var rssMB = Math.round(mu.rss / 1048576);
-    __memMonitor.history.push({ t: Date.now(), heapMB: heapMB, rssMB: rssMB });
-    if (__memMonitor.history.length > 20) __memMonitor.history.shift();
+/* ★ 全局日志语言与工具函数 */
+var SERVER_LANG = 'zh';
+function sysLog(level, zh, en) {
+  var msg = (SERVER_LANG === 'en' && en) ? en : zh;
+  if (level === 'warn') console.warn(msg);
+  else if (level === 'error') console.error(msg);
+  else console.log(msg);
+}
 
-    if (rssMB >= 1500) {
-      console.warn('[内存告警] RSS ' + rssMB + 'MB（严重）');
-      try {
-        console.warn('  会话总数: ' + Object.keys(messageHistory).length +
-          ' · 用户总数: ' + Object.keys(persistentUsers).length +
-          ' · 在线: ' + userMap.size +
-          ' · 群组: ' + groupMap.size);
-      } catch (e) {}
-      var top = [];
-      for (var k in messageHistory) {
-        if (messageHistory.hasOwnProperty(k) && Array.isArray(messageHistory[k])) {
-          top.push({ key: k, n: messageHistory[k].length });
-        }
-      }
-      top.sort(function (a, b) { return b.n - a.n; });
-      for (var i = 0; i < Math.min(5, top.length); i++) {
-        console.warn('  最大会话 ' + top[i].key + '：' + top[i].n + ' 条');
-      }
-      if (global.gc) { try { global.gc(); } catch (e) {} }
-    } else if (rssMB >= 800) {
-      console.warn('[内存告警] RSS ' + rssMB + 'MB');
-    }
-  } catch (e) {}
-}, 5 * 60 * 1000);
+/* ★ 日志防刷屏缓存与精简工具 */
+var _logThrottleMap = Object.create(null);
+var _lastThrottleCleanup = Date.now();
 
-setInterval(function () {
-  try {
-    var now = Date.now();
-
-    if (typeof userMap !== 'undefined' && userMap.size > 5000) {
-      var cutoff = now - 30 * 60 * 1000;
-      var removed = 0;
-      userMap.forEach(function (u, id) {
-        if (!u.online && (u.lastSeen || 0) < cutoff) { userMap.delete(id); removed++; }
-      });
-      if (removed) console.log('[资源清理] userMap 移除 ' + removed + ' 个离线用户');
-    }
-
-    if (typeof riskProfiles !== 'undefined') {
-      var rpKeys = Object.keys(riskProfiles);
-      if (rpKeys.length > 50000) {
-        var cut2 = now - 30 * 60 * 1000;
-        var r2 = 0;
-        for (var i = 0; i < rpKeys.length; i++) {
-          var p = riskProfiles[rpKeys[i]];
-          if (p && p.score <= 0 && (p.lastEventAt || 0) < cut2) {
-            delete riskProfiles[rpKeys[i]]; r2++;
-          }
-        }
-        if (r2) console.log('[资源清理] riskProfiles 清理 ' + r2 + ' 条');
-      }
-    }
-
-    if (typeof groupReadMap !== 'undefined') {
-      var gKeys = Object.keys(groupReadMap);
-      for (var gi = 0; gi < gKeys.length; gi++) {
-        var _gid = gKeys[gi];
-        var map = groupReadMap[_gid];
-        if (!map) { delete groupReadMap[_gid]; continue; }
-        var mKeys = Object.keys(map);
-        if (mKeys.length > 500) {
-          for (var di = 0; di < mKeys.length - 500; di++) delete map[mKeys[di]];
-        }
-        /* ★ v0.32.0：群已解散 / 不存在 → 整组清理 */
-        if (typeof groupMap !== 'undefined' && !groupMap.has(_gid)) {
-          delete groupReadMap[_gid];
-          continue;
-        }
-        /* ★ v0.32.0：组内消息已从 messageHistory 删除 → 清掉对应已读集合 */
-        var _hkey = 'group_' + _gid;
-        var _hist = messageHistory[_hkey];
-        if (Array.isArray(_hist)) {
-          var _live = new Set();
-          for (var hi = 0; hi < _hist.length; hi++) {
-            if (_hist[hi] && _hist[hi].msgId) _live.add(_hist[hi].msgId);
-          }
-          for (var ki = 0; ki < mKeys.length; ki++) {
-            if (!_live.has(mKeys[ki])) delete map[mKeys[ki]];
-          }
-        }
-      }
-    }
-
-    if (typeof ACTIVE_CALLS !== 'undefined') {
-      Object.keys(ACTIVE_CALLS).forEach(function (uid) {
-        var rec = ACTIVE_CALLS[uid];
-        if (rec && now - rec.since > 5 * 60 * 1000) {
-          delete ACTIVE_CALLS[uid];
-          console.log('[资源清理] 清理卡死通话 ' + uid);
-        }
-      });
-    }
-
-    if (typeof agState !== 'undefined' && agState.ipConnHist) {
-      Object.keys(agState.ipConnHist).forEach(function (ip) {
-        var arr = agState.ipConnHist[ip];
-        if (!arr || !arr.length) delete agState.ipConnHist[ip];
-      });
-    }
-  } catch (e) {
-    console.warn('[资源清理] 异常:', e.message);
+// 判断是否在刷屏（相同 key 在 ms 毫秒内只打印一次）
+function isSpamLog(key, ms) {
+  var now = Date.now();
+  if (now - _lastThrottleCleanup > 60000) {
+    _logThrottleMap = Object.create(null);
+    _lastThrottleCleanup = now;
   }
-}, 10 * 60 * 1000);
+  if (_logThrottleMap[key] && (now - _logThrottleMap[key]) < ms) {
+    return true;
+  }
+  _logThrottleMap[key] = now;
+  return false;
+}
+
+// 将巨大的 JSON 对象精简为单行关键信息
+function formatLogData(data, lang) {
+  if (!data) return '';
+  if (typeof data !== 'object') return String(data);
+  
+  var isEn = (lang === 'en');
+  var parts = [];
+  
+  if (data.ip) parts.push((isEn ? 'IP:' : 'IP:') + data.ip);
+  if (data.name && data.name !== '') parts.push((isEn ? 'User:' : '用户:') + data.name);
+  if (data.userId && data.userId !== data.name && data.userId !== '') parts.push('ID:' + data.userId);
+  if (data.level) parts.push('LV' + data.level);
+  if (data.isAdmin === true) parts.push(isEn ? 'Admin' : '管理员');
+  if (data.muted === true) parts.push(isEn ? 'Muted' : '禁言');
+  if (data.banned === true) parts.push(isEn ? 'Banned' : '封禁');
+  if (data.resumed) parts.push(isEn ? 'Resumed' : '继承会话');
+  if (data.reason) parts.push((isEn ? 'Reason:' : '原因:') + data.reason);
+  if (data.action) parts.push((isEn ? 'Action:' : '操作:') + data.action);
+  if (data.target) parts.push((isEn ? 'Target:' : '目标:') + data.target);
+  if (data.socketId && typeof data.socketId === 'string') {
+    parts.push('Socket:' + data.socketId.slice(0, 6) + '...');
+  }
+  
+  // 如果上述都没提取到，就直接截断 JSON 输出
+  if (parts.length === 0) {
+    try {
+      var str = JSON.stringify(data);
+      if (str.length > 80) str = str.slice(0, 80) + '...';
+      return str;
+    } catch (e) { return '[Object]'; }
+  }
+  
+  return parts.join(' | ');
+}
+
+/* ★ P0：三个重复的 filestore 清理定时器已合并为文件末尾的统一实现
+   （_unifiedFilestoreCleanup，含归档引用保护、owner 同步、结构化日志）。 */
 
 /* ★ Cloudflare Tunnel / 反向代理安全：
    - 默认不信任代理，避免攻击者伪造 X-Forwarded-For 绕过 IP 封禁
@@ -265,6 +1184,14 @@ setInterval(function () {
   }
 })();
 
+/* ★ 放行 PWA 和 Service Worker 必需文件 */
+app.use(function (req, res, next) {
+  if (req.path === '/sw.js' || req.path === '/manifest.json') {
+    return next();
+  }
+  next();
+});
+
 app.use(function (req, res, next) {
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -275,6 +1202,31 @@ app.use(function (req, res, next) {
 
 /*安全响应头增强（Security Headers+）*/
 app.use(function (req, res, next) {
+  /* ★ DSH P1 CSP：必须在 serveHtml 路由之前注册才能生效。
+     使用 Report-Only + nonce，不破坏现有内联脚本。 */
+  try {
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      const _cp = String(req.path || '');
+      const _htmlRoutes = ['/', '/index', '/index.html', '/gw', '/log', '/download', '/kf', '/root'];
+      if (_htmlRoutes.indexOf(_cp) !== -1) {
+        const _nonce = crypto.randomBytes(12).toString('base64');
+        res.locals = res.locals || {};
+        res.locals.cspNonce = _nonce;
+        res.setHeader('Content-Security-Policy-Report-Only', [
+          "default-src 'self'",
+          "script-src 'self' 'nonce-" + _nonce + "' 'unsafe-inline' https://unpkg.com",
+          "style-src 'self' 'unsafe-inline'",
+          "img-src 'self' data: blob: https:",
+          "media-src 'self' blob: data:",
+          "connect-src 'self' ws: wss: https:",
+          "font-src 'self' data:",
+          "frame-src 'self'", "object-src 'none'",
+          "base-uri 'self'", "form-action 'self'",
+          "report-uri /api/csp-report"
+        ].join('; '));
+      }
+    }
+  } catch (e) {}
   if (!res.getHeader('Referrer-Policy')) {
     res.setHeader('Referrer-Policy', 'same-origin');
   }
@@ -307,6 +1259,20 @@ app.use(function (req, res, next) {
 
     var _ip = _getRealIp(req);
     if (_ip && _agIsBanned(_ip)) {
+      /* ★ 统计被封禁 IP 的探测次数：连续探测超过 5 次后直接 404，不再渲染封禁页 */
+      if (!agState.banProbe) agState.banProbe = {};
+      var _probe = (agState.banProbe[_ip] || 0) + 1;
+      agState.banProbe[_ip] = _probe;
+
+      if (_probe > 5) {
+        /* 连续探测阈值触发：直接 404 空 body，避免被封禁爬虫持续消耗带宽 */
+        res.status(404);
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end('404');
+        return;
+      }
+
       var _until = agState.bannedIps[_ip] || 0;
       var _remainSec = Math.max(0, Math.round((_until - Date.now()) / 1000));
       res.status(403);
@@ -371,7 +1337,8 @@ var _bodyUrlParser = express.urlencoded({ extended: true, limit: '2mb' });
 app.use(function (req, res, next) {
   if (req.path.indexOf('/kf/api/') === 0 ||
     req.path.indexOf('/jb/api/') === 0 ||
-    req.path === '/download/login') {
+    req.path === '/download/login' ||
+    req.path.indexOf('/api/upload') === 0) {
     return next();
   }
   if (req.method === 'GET' || req.method === 'HEAD' ||
@@ -413,14 +1380,24 @@ app.use(function (req, res, next) {
   if (!pageName) return next();
 
   var ip = _clientIp(req);
-  var t1 = new Date().toLocaleString('zh-CN', { hour12: false });
-  console.log('[' + t1 + '] [连接] ' + pageName + '  ' + ip +
-    '  → ' + req.path);
+  var logKey = 'http_' + ip + '_' + req.path;
+  var _isSpam = isSpamLog(logKey, 3000); // 3秒内同一个IP访问同一路径不刷屏
+
+  if (!_isSpam) {
+    var t1 = new Date().toLocaleString('zh-CN', { hour12: false });
+    var zhMsg = '[' + t1 + '] [连接] ' + pageName + ' | IP:' + ip + ' → ' + req.path;
+    var enMsg = '[' + t1 + '] [Connect] ' + pageName + ' | IP:' + ip + ' → ' + req.path;
+    sysLog('info', zhMsg, enMsg);
+  }
 
   res.on('finish', function () {
-    var t2 = new Date().toLocaleString('zh-CN', { hour12: false });
-    console.log('[' + t2 + '] [断开] ' + pageName + '  ' + ip +
-      '  ← ' + req.path + ' ' + res.statusCode);
+    // 断开日志太吵，如果 3 秒内请求的，干脆不打印断开了
+    if (!_isSpam) {
+      var t2 = new Date().toLocaleString('zh-CN', { hour12: false });
+      var zhMsg2 = '[' + t2 + '] [断开] ' + pageName + ' | IP:' + ip + ' ← ' + res.statusCode;
+      var enMsg2 = '[' + t2 + '] [Disconnect] ' + pageName + ' | IP:' + ip + ' ← ' + res.statusCode;
+      sysLog('info', zhMsg2, enMsg2);
+    }
   });
 
   next();
@@ -438,14 +1415,442 @@ const DOWNLOAD_DIR = path.join(DATA_DIR_EARLY, 'Download');
 try { if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true }); }
 catch (e) { console.error('❌ 创建 Download 目录失败:', e.message); }
 
-/* ★ v0.32.0 内存优化：大 fileData 剥离到磁盘，消息体只留 fileId
- * 不减少任何聊天记录条数，只把 base64 文件内容从内存挪到磁盘 */
+/* 大 fileData 剥离到磁盘，消息体只留 fileId，条数不变 */
 const FILE_STORE_DIR = path.join(DATA_DIR_EARLY, 'filestore');
 try { if (!fs.existsSync(FILE_STORE_DIR)) fs.mkdirSync(FILE_STORE_DIR, { recursive: true }); }
 catch (e) { console.error('❌ 创建 filestore 目录失败:', e.message); }
 
-/* ★ v0.32.2：阈值从 32KB 提升到 512KB，绝大多数图片/表情包/短语音直接内联 */
-var FILE_STORE_THRESHOLD = 512 * 1024;
+var F_FILE_OWNERS = path.join(DATA_DIR_EARLY, 'file_owners.json');
+var fileOwners = loadJSON(F_FILE_OWNERS, {});
+var userUploadQuota = {};
+function saveFileOwners() { saveJSON(F_FILE_OWNERS, fileOwners); }
+function rebuildUploadQuota() {
+    userUploadQuota = {};
+    for (var fid in fileOwners) {
+        if (!fileOwners.hasOwnProperty(fid)) continue;
+        var f = fileOwners[fid];
+        if (f && f.userId) {
+            userUploadQuota[f.userId] = (userUploadQuota[f.userId] || 0) + (f.size || 0);
+        }
+    }
+}
+rebuildUploadQuota();
+
+/* 全局下载限速令牌桶 */
+var downloadTokens = 20 * 1024 * 1024;
+var downloadRefillRate = 20 * 1024 * 1024; // 20MB/s
+var downloadLastRefill = Date.now();
+function _refillDownloadTokens() {
+    var now = Date.now();
+    var elapsed = now - downloadLastRefill;
+    if (elapsed > 0) {
+        downloadTokens += (elapsed / 1000) * downloadRefillRate;
+        if (downloadTokens > downloadRefillRate) downloadTokens = downloadRefillRate;
+        downloadLastRefill = now;
+    }
+}
+function streamWithLimit(stream, res) {
+    stream.on('data', function (chunk) {
+        _refillDownloadTokens();
+        if (downloadTokens >= chunk.length) {
+            downloadTokens -= chunk.length;
+            if (!res.write(chunk)) {
+                /* 客户端接收慢：暂停读取，等 drain 再恢复，避免内存无限堆积 */
+                stream.pause();
+                res.once('drain', function () {
+                    if (!stream.destroyed) stream.resume();
+                });
+            }
+        } else {
+            stream.pause();
+            var waitMs = ((chunk.length - downloadTokens) / downloadRefillRate) * 1000;
+            setTimeout(function () {
+                _refillDownloadTokens();
+                downloadTokens = Math.max(0, downloadTokens - chunk.length);
+                if (res.writable) {
+                    if (!res.write(chunk)) {
+                        res.once('drain', function () {
+                            if (!stream.destroyed) stream.resume();
+                        });
+                        return;
+                    }
+                }
+                if (!stream.destroyed) stream.resume();
+            }, Math.max(10, waitMs));
+        }
+    });
+    stream.on('end', function () { res.end(); });
+    stream.on('error', function () { res.end(); });
+    res.on('close', function () { stream.destroy(); });
+}
+
+/* 上传票据验证（防范伪造身份刷配额） */
+function verifyUploadTicket(req) {
+    try {
+        var ticket = req.headers['x-upload-ticket'];
+        if (!ticket) return null;
+        var parts = ticket.split('|');
+        if (parts.length !== 3) return null;
+        var uid = parts[0];
+        var exp = parseInt(parts[1], 10);
+        var sig = parts[2];
+        if (exp < Date.now()) return null;
+        var payload = uid + '|' + exp;
+        var expect = crypto.createHmac('sha256', DL_SECRET).update(payload).digest('hex');
+        if (expect.length !== sig.length) return null;
+        if (crypto.timingSafeEqual(Buffer.from(expect), Buffer.from(sig))) return uid;
+    } catch (e) {}
+    return null;
+}
+
+/* 历史消息归档：内存保留最近 N 条，更早的压缩到磁盘，按需读回 */
+const HISTORY_ARCHIVE_DIR = path.join(DATA_DIR_EARLY, 'history_archive');
+try { if (!fs.existsSync(HISTORY_ARCHIVE_DIR)) fs.mkdirSync(HISTORY_ARCHIVE_DIR, { recursive: true }); }
+catch (e) { console.error('❌ 创建 history_archive 目录失败:', e.message); }
+
+var MEMORY_HISTORY_KEEP = 500;
+var _archiveCountCache = Object.create(null);
+
+function _archivePath(key) {
+  var s = String(key).replace(/[^A-Za-z0-9_\-]/g, '_');
+  return path.join(HISTORY_ARCHIVE_DIR, s + '.ndjson.gz');
+}
+function _archiveLegacyPath(key) {
+  var s = String(key).replace(/[^A-Za-z0-9_\-]/g, '_');
+  return path.join(HISTORY_ARCHIVE_DIR, s + '.json.br');
+}
+function _archiveCountFile(key) {
+  return _archivePath(key) + '.cnt';
+}
+
+/* 全量加载：仅用于迁移、sidecar 缺失时的首次计数回退。
+   业务主路径请用 _archiveReadBefore（流式）。 */
+function _archiveLoadAll(key) {
+  try {
+    var p = _archivePath(key);
+    if (!fs.existsSync(p)) return [];
+    var buf = fs.readFileSync(p);
+    var raw = zlib.gunzipSync(buf);
+    buf = null;
+    var text = raw.toString('utf8');
+    raw = null;
+    var arr = [];
+    var lines = text.split('\n');
+    text = null;
+    for (var i = 0; i < lines.length; i++) {
+      var ln = lines[i].trim();
+      if (!ln) continue;
+      try { arr.push(JSON.parse(ln)); } catch (e) {}
+    }
+    return arr;
+  } catch (e) { return []; }
+}
+
+/* 读旧 .json.br（broтli 单块压缩的 JSON 数组）——仅迁移使用 */
+function _archiveLoadLegacy(key) {
+  try {
+    var p = _archiveLegacyPath(key);
+    if (!fs.existsSync(p)) return null;
+    var raw = zlib.brotliDecompressSync(fs.readFileSync(p));
+    var arr = JSON.parse(raw.toString('utf8'));
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return null; }
+}
+
+/* 异步队列：每批独立 gzip 成员追加，读取时 gunzip 自动连接。
+   同一 key 串行，保证顺序。 */
+var _archiveQueues = Object.create(null);
+
+function _archiveAppend(key, msgs) {
+  if (!Array.isArray(msgs) || !msgs.length) return;
+  var q = _archiveQueues[key] || (_archiveQueues[key] = []);
+  q.push(msgs);
+  _archiveFlush(key);
+}
+
+function _archiveFlush(key) {
+  var q = _archiveQueues[key];
+  if (!q || !q.length || q._busy) return;
+  var batch = q.shift();
+  q._busy = true;
+
+  var lines = '';
+  for (var i = 0; i < batch.length; i++) {
+    try { lines += JSON.stringify(batch[i]) + '\n'; } catch (e) {}
+  }
+  if (!lines) {
+    q._busy = false;
+    _archiveFlush(key);
+    return;
+  }
+
+  zlib.gzip(Buffer.from(lines, 'utf8'), { level: 6 }, function (err, buf) {
+    q._busy = false;
+    if (err || !buf) {
+      console.error('[archive] 压缩失败:', key, err && err.message);
+      _archiveFlush(key);
+      return;
+    }
+    fs.appendFile(_archivePath(key), buf, function (err2) {
+      if (err2) {
+        console.error('[archive] 追加失败:', key, err2.message);
+      } else {
+        _archiveBumpCount(key, batch.length);
+      }
+      _archiveFlush(key);
+    });
+  });
+}
+
+/* 流式：逐行 gunzip 扫描，只保留滑动窗口。
+   - beforeMsgId 存在：返回该消息"之前"最近的 limit 条；找不到 → 空数组
+   - beforeMsgId 为空：返回归档末尾的 limit 条
+   回调 cb(messages:Array)。 */
+function _archiveReadBefore(key, beforeMsgId, limit, cb) {
+  limit = Math.max(1, Math.min(500, Number(limit) || 100));
+  var p = _archivePath(key);
+  if (!fs.existsSync(p)) { try { cb([], true); } catch (e) {} return; }
+
+  var hasCursor = !!beforeMsgId;
+  var found = !hasCursor;
+  var out = [];
+  var done = false;
+  var stream = null, gunzip = null, rl = null;
+
+  /* cursorFound：true = 游标有效（含"已到归档第一条"）/ false = 游标在归档里找不到 */
+  function finish(err, result, cursorFound) {
+    if (done) return;
+    done = true;
+    try { if (rl) rl.close(); } catch (e) {}
+    try { if (gunzip) gunzip.destroy(); } catch (e) {}
+    try { if (stream) stream.destroy(); } catch (e) {}
+    try { cb(Array.isArray(result) ? result : [], cursorFound !== false); }
+    catch (e) {}
+  }
+
+  try {
+    stream = fs.createReadStream(p);
+    gunzip = zlib.createGunzip();
+    rl = readline.createInterface({
+      input: stream.pipe(gunzip),
+      crlfDelay: Infinity
+    });
+  } catch (e) {
+    finish(e, [], false); return;
+  }
+
+  rl.on('line', function (line) {
+    if (done) return;
+    line = line.trim();
+    if (!line) return;
+    var m;
+    try { m = JSON.parse(line); } catch (e) { return; }
+
+    if (!found) {
+      if (m && m.msgId === beforeMsgId) {
+        /* 游标就在归档里：返回游标之前的 limit 条（可能为空） */
+        found = true;
+        finish(null, out.slice(), true);
+        return;
+      }
+      out.push(m);
+      if (out.length > limit) out.shift();
+      return;
+    }
+
+    out.push(m);
+    if (out.length > limit) out.shift();
+  });
+
+  rl.on('close', function () {
+    if (done) return;
+    if (hasCursor && !found) {
+      /* 游标在归档里也找不到 → 真的丢了 */
+      finish(null, [], false);
+      return;
+    }
+    finish(null, out.slice(), true);
+  });
+  rl.on('error', function (e) { finish(e, [], false); });
+  stream.on('error', function (e) { finish(e, [], false); });
+  gunzip.on('error', function (e) { finish(e, [], false); });
+}
+
+/* 归档条数：sidecar 缓存，缺失时一次性全量统计并落盘 */
+function _archiveBumpCount(key, n) {
+  var cur = _archiveCountCache[key] || 0;
+  cur += (n || 0);
+  _archiveCountCache[key] = cur;
+  try { fs.writeFileSync(_archiveCountFile(key), String(cur)); } catch (e) {}
+}
+function _archiveCount(key) {
+  if (_archiveCountCache[key] !== undefined) return _archiveCountCache[key];
+  try {
+    var cf = _archiveCountFile(key);
+    if (fs.existsSync(cf)) {
+      var n = parseInt(fs.readFileSync(cf, 'utf8'), 10);
+      if (!isNaN(n) && n >= 0) { _archiveCountCache[key] = n; return n; }
+    }
+  } catch (e) {}
+  try {
+    var arr = _archiveLoadAll(key);
+    _archiveCountCache[key] = arr.length;
+    try { fs.writeFileSync(_archiveCountFile(key), String(arr.length)); } catch (e) {}
+    return arr.length;
+  } catch (e) { return 0; }
+}
+
+/* 同步兼容包装：仅供非流式场景回退使用。
+   业务主路径请使用 _archiveReadBefore（流式）。 */
+function _archiveLoadBefore(key, beforeMsgId, limit) {
+  limit = Math.max(1, Math.min(500, Number(limit) || 100));
+  var all = _archiveLoadAll(key);
+  if (!all.length) return [];
+  var endIdx = all.length;
+  if (beforeMsgId) {
+    var hit = false;
+    for (var i = all.length - 1; i >= 0; i--) {
+      if (all[i] && all[i].msgId === beforeMsgId) { endIdx = i; hit = true; break; }
+    }
+    if (!hit) return [];
+  }
+  var start = Math.max(0, endIdx - limit);
+  return all.slice(start, endIdx);
+}
+
+/* 一次性迁移：旧 .json.br → 新 .ndjson.gz，并修正乱序。
+   迁移同步执行（仅启动时一次），之后业务路径全部流式。 */
+(function _migrateArchivesOnce() {
+  try {
+    var _flag = path.join(HISTORY_ARCHIVE_DIR, '.migrated_ndjson_v1');
+    if (fs.existsSync(_flag)) return;
+    var _files = [];
+    try {
+      _files = fs.readdirSync(HISTORY_ARCHIVE_DIR).filter(function (f) {
+        return /\.json\.br$/.test(f);
+      });
+    } catch (e) {}
+    if (!_files.length) {
+      try { fs.writeFileSync(_flag, String(Date.now())); } catch (e) {}
+      return;
+    }
+    console.log('🛠️ 开始迁移 ' + _files.length + ' 个旧归档 → ndjson.gz ...');
+    var _ok = 0, _bad = 0;
+    for (var _i = 0; _i < _files.length; _i++) {
+      var _fname = _files[_i];
+      var _base = _fname.substring(0, _fname.length - '.json.br'.length);
+      var _oldPath = path.join(HISTORY_ARCHIVE_DIR, _fname);
+      var _newPath = path.join(HISTORY_ARCHIVE_DIR, _base + '.ndjson.gz');
+      var _cntPath = _newPath + '.cnt';
+      try {
+        var _raw = zlib.brotliDecompressSync(fs.readFileSync(_oldPath)).toString('utf8');
+        var _arr = JSON.parse(_raw);
+        if (!Array.isArray(_arr)) { _bad++; continue; }
+        _arr.sort(function (x, y) {
+          var tx = (x && typeof x.ts === 'number') ? x.ts : 0;
+          var ty = (y && typeof y.ts === 'number') ? y.ts : 0;
+          return tx - ty;
+        });
+        var _lines = '';
+        for (var _j = 0; _j < _arr.length; _j++) {
+          try { _lines += JSON.stringify(_arr[_j]) + '\n'; } catch (e2) {}
+        }
+        var _gz = zlib.gzipSync(Buffer.from(_lines, 'utf8'), { level: 6 });
+        var _tmp = _newPath + '.tmp';
+        fs.writeFileSync(_tmp, _gz);
+        fs.renameSync(_tmp, _newPath);
+        try { fs.writeFileSync(_cntPath, String(_arr.length)); } catch (e3) {}
+        try { fs.unlinkSync(_oldPath); } catch (e4) {}
+        _ok++;
+      } catch (e) {
+        _bad++;
+        console.warn('⚠️ 迁移失败:', _fname, e.message);
+      }
+    }
+    try { fs.writeFileSync(_flag, String(Date.now())); } catch (e) {}
+    console.log('🛠️ 归档迁移完成：成功 ' + _ok + ' / 失败 ' + _bad);
+  } catch (e) {
+    console.warn('⚠️ 归档迁移异常:', e.message);
+  }
+})();
+
+/* 启动时把已存在的超大会话一次性归档 */
+/* ★ 修复：原为立即执行函数，位于 messageHistory 声明之前，
+   Object.keys(undefined) 抛错（启动日志「初始归档失败」），功能从未生效。
+   改为具名函数，在 messageHistory 加载完成后调用。 */
+function _initialArchiveMigration() {
+  try {
+    var _moved = 0;
+    if (typeof messageHistory !== 'object' || !messageHistory) return;
+    var _keys = Object.keys(messageHistory);
+    for (var _ki = 0; _ki < _keys.length; _ki++) {
+      var _key = _keys[_ki];
+      var _arr = messageHistory[_key];
+      if (!Array.isArray(_arr) || _arr.length <= MEMORY_HISTORY_KEEP) continue;
+      var _over = _arr.length - MEMORY_HISTORY_KEEP;
+      var _old = _arr.splice(0, _over);
+      _archiveAppend(_key, _old);
+      _moved += _over;
+    }
+    if (_moved > 0) {
+      console.log('🗄️ 已将 ' + _moved + ' 条旧消息归档到磁盘（释放内存）');
+      scheduleSaveHistory();
+    }
+  } catch (e) {
+    console.warn('⚠️ 初始归档失败:', e.message);
+  }
+}
+
+
+
+/* ★ 优化：降低至 128KB，几乎把所有图片/音频都剥离到硬盘，大幅降低 Node 内存占用 */
+var FILE_STORE_THRESHOLD = 128 * 1024; 
+
+
+
+// 定期按 LRU 清理超出配额的用户的文件
+setInterval(function() {
+    var now = Date.now();
+    // 按用户分组
+    var userFiles = {};
+    for (var fid in fileOwners) {
+        if (!fileOwners.hasOwnProperty(fid)) continue;
+        var f = fileOwners[fid];
+        if (!userFiles[f.userId]) userFiles[f.userId] = [];
+        userFiles[f.userId].push({ id: fid, lastAccess: f.lastAccess, size: f.size });
+    }
+    var MAX_QUOTA = 2 * 1024 * 1024 * 1024;
+    var cleanedAny = false;
+    for (var uid in userFiles) {
+        var totalSize = 0;
+        for (var i = 0; i < userFiles[uid].length; i++) totalSize += userFiles[uid][i].size;
+        if (totalSize > MAX_QUOTA) {
+            // 按 lastAccess 排序（最旧在前）
+            userFiles[uid].sort(function(a, b) { return a.lastAccess - b.lastAccess; });
+            var freed = 0;
+            for (var i = 0; i < userFiles[uid].length; i++) {
+                var f = userFiles[uid][i];
+                // 如果最后访问时间超过 7 天，或者需要释放空间
+                if (totalSize - freed > MAX_QUOTA * 0.8 || (now - f.lastAccess > 7 * 24 * 3600 * 1000)) {
+                    var fullPath = path.join(FILE_STORE_DIR, f.id);
+                    if (fs.existsSync(fullPath)) {
+                        try { fs.unlinkSync(fullPath); } catch(e) {}
+                    }
+                    delete fileOwners[f.id];
+                    freed += f.size;
+                    cleanedAny = true;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    if (cleanedAny) {
+        saveFileOwners();
+        rebuildUploadQuota();
+        console.log('🧹 [LRU] 已按访问时间清理超额文件');
+    }
+}, 60 * 60 * 1000);
 
 function _fileStoreSave(base64Data, hintExt) {
   try {
@@ -507,9 +1912,14 @@ function _fileStoreLoad(fileId) {
 
 /* 自动剥离：保存消息前检查 fileData 大小 */
 function _maybeStripFileData(msg) {
-  if (!msg || !msg.fileData) return msg;
+  if (!msg || typeof msg !== 'object') return msg;
+  if (msg.fileId && msg.fileData) {
+    msg.fileData = null;
+    msg._needsFetch = true;
+    return msg;
+  }
+  if (!msg.fileData) return msg;
   if (typeof msg.fileData !== 'string') return msg;
-  if (msg.fileData.length <= FILE_STORE_THRESHOLD) return msg;
   var _hintExt = '';
   if (msg.fileName) _hintExt = path.extname(msg.fileName);
   var saved = _fileStoreSave(msg.fileData, _hintExt);
@@ -518,6 +1928,7 @@ function _maybeStripFileData(msg) {
   msg.fileMime = saved.mimeType;
   msg.fileSize = saved.size;
   msg.fileData = null;   /* 内存中彻底不保留 */
+  msg._needsFetch = true; /* 关键：告诉前端需要回源拉取 */
   return msg;
 }
 
@@ -588,7 +1999,7 @@ const KEY_FILE = path.join(DATA_DIR_EARLY, 'key.pem');
 
 function ensureSelfSignedCert() {
   if (fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE)) {
-    /* ★ v0.32.3：已有证书但 SAN 可能不含局域网 IP → 校验一次，不匹配则重建 */
+    /* 校验现有证书的 SAN，缺少本机 IP 则重建 */
     try {
       var _curAllIps = ['127.0.0.1'];
       try {
@@ -646,7 +2057,7 @@ function ensureSelfSignedCert() {
     var cmd = 'openssl req -x509 -newkey rsa:2048 -keyout "' + KEY_FILE +
       '" -out "' + CERT_FILE + '" -days 365 -nodes -subj "/CN=LAN-Chat"' +
       ' -addext "subjectAltName=' + _san2 + '"';
-    /* ★ v0.32.0：加 3 秒超时，防止 openssl 卡死阻塞启动 */
+    /* 加 3 秒超时，防止 openssl 卡死阻塞启动 */
     execSync(cmd, { stdio: 'ignore', timeout: 3000 });
     return fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE);
   } catch (e) {
@@ -679,7 +2090,10 @@ try {
   const { ExpressPeerServer } = require('peer');
   peerServer = ExpressPeerServer(server, {
     debug: false,
-    path: '/peerjs',
+    /* ★ DSH 通话修复 R3：peer 1.0.2 内部会再拼一次 options.path，
+       与外层 app.use('/peerjs') 组合成 /peerjs/peerjs/... 导致客户端 404。
+       改为 path:'/' 后与客户端 path:'/peerjs' 对齐。 */
+    path: '/',
     allow_discovery: true,
     proxied: true
   });
@@ -692,7 +2106,7 @@ try {
 const io = new Server(server, {
   cors: { origin: "*" },
   transports: ['websocket', 'polling'],
-  maxHttpBufferSize: 1.6e8,
+  maxHttpBufferSize: 100 * 1024 * 1024,
   perMessageDeflate: false
 });
 
@@ -760,7 +2174,7 @@ function _agNormIp(ip) {
   return ip || 'unknown';
 }
 
-/* ★ v0.32.0 安全修复：仅当请求来自受信代理时才信任转发头，防止 IP 伪造绕过封禁 */
+/* 安全修复：仅当请求来自受信代理时才信任转发头，防止 IP 伪造绕过封禁 */
 var TRUSTED_PROXIES = (function () {
   var env = String(process.env.TRUSTED_PROXIES || '').trim();
   if (!env) return null;   /* null = 不信任任何代理，只用 socket 层 IP */
@@ -851,27 +2265,7 @@ function _extractIpFromHeaders(headers, fallback, remoteIp) {
   return _agNormIp(fallback || 'unknown');
 }
 
-function _getRealIp(req) {
-  try {
-    if (!req) return 'unknown';
-    var _remote = req.ip || (req.connection && req.connection.remoteAddress) ||
-                  (req.socket && req.socket.remoteAddress);
-    return _extractIpFromHeaders(req.headers, _remote, _remote);
-  } catch (e) {
-    return 'unknown';
-  }
-}
-
-function _getRealIpFromSocket(socket) {
-  try {
-    if (!socket) return 'unknown';
-    var hs = socket.handshake || {};
-    var _remote = hs.address || (socket.conn && socket.conn.remoteAddress) || 'unknown';
-    return _extractIpFromHeaders(hs.headers, _remote, _remote);
-  } catch (e) {
-    return 'unknown';
-  }
-}
+/* 已删除重复定义：保留后文更完整的 _getRealIp / _getRealIpFromSocket */
 
 function _getRealIp(req) {
   try {
@@ -1636,13 +3030,40 @@ setInterval(function () {
   }
   if (changed) saveRedPackets();
 
-  /* ★ v0.32.2：不再自动清除历史图片/视频/文件/语音的 fileData
+  /* 不再自动清除历史图片/视频/文件/语音的 fileData
      历史媒体数据永久保留。>512KB 的大文件已在 saveMessage 时剥离到
      files/filestore/ 磁盘，内存中只存 fileId，几乎不占 RAM。 */
   if (global.gc) {
     try { global.gc(); } catch (e) {}
   }
 }, 60 * 60 * 1000);
+
+/* 已阅即焚消息在 burned 后 24 小时整体从内存删除（磁盘随 history.json 一起保留已清空的对象） */
+setInterval(function () {
+  try {
+    var _cutoff = Date.now() - 24 * 3600 * 1000;
+    var _removed = 0;
+    for (var _bk in messageHistory) {
+      if (!messageHistory.hasOwnProperty(_bk)) continue;
+      var _barr = messageHistory[_bk];
+      if (!Array.isArray(_barr) || !_barr.length) continue;
+      var _filtered = _barr.filter(function (m) {
+        if (!m || !m.burned) return true;
+        var _bTs = m.ts || (m.burnAfterRead && m.burnAfterRead.viewedAt) || 0;
+        if (_bTs > 0 && _bTs < _cutoff) return false;
+        return true;
+      });
+      if (_filtered.length !== _barr.length) {
+        _removed += (_barr.length - _filtered.length);
+        messageHistory[_bk] = _filtered;
+      }
+    }
+    if (_removed > 0) {
+      scheduleSaveHistory();
+      console.log('🧹 已清理 ' + _removed + ' 条过期阅后即焚消息');
+    }
+  } catch (e) {}
+}, 6 * 3600 * 1000);
 
 var _memCleanupLastLog = 0;
 setInterval(function () {
@@ -1732,12 +3153,21 @@ setInterval(function () {
 
   try {
     var _emptyCount = 0;
+    /* ★ 优化：不仅清理空数组，还清理长期没人访问的冷门会话（释放内存） */
+    var _cutoff30Days = now - 30 * 24 * 3600 * 1000;
     for (k in messageHistory) {
       if (!messageHistory.hasOwnProperty(k)) continue;
       var arr = messageHistory[k];
       if (Array.isArray(arr) && arr.length === 0) {
         delete messageHistory[k];
         _emptyCount++;
+      } else if (Array.isArray(arr) && arr.length > 0) {
+        var _lastMsgTime = arr[arr.length - 1].ts || 0;
+        // 如果该会话最后一条消息超过 30 天，且不是当前正在看的，直接清理出内存
+        if (_lastMsgTime > 0 && _lastMsgTime < _cutoff30Days) {
+          delete messageHistory[k];
+          _emptyCount++;
+        }
       }
     }
     for (var _gid in groupReadMap) {
@@ -1745,6 +3175,13 @@ setInterval(function () {
         delete groupReadMap[_gid];
         _emptyCount++;
       }
+    }
+    /* 清理风险控制的僵尸数据，防止长期运行 OOM */
+    for (var _riskId in riskProfiles) {
+        if (riskProfiles[_riskId] && riskProfiles[_riskId].score === 0 && now - riskProfiles[_riskId].lastEventAt > 24 * 3600 * 1000) {
+            delete riskProfiles[_riskId];
+            _emptyCount++;
+        }
     }
     var _vCutoff = now - 30 * 24 * 3600 * 1000;
     for (var _vid in visitors) {
@@ -1783,7 +3220,11 @@ setInterval(function () {
 
   for (k in agState.bannedIps) {
     if (!agState.bannedIps.hasOwnProperty(k)) continue;
-    if (agState.bannedIps[k] < now) delete agState.bannedIps[k];
+    if (agState.bannedIps[k] < now) {
+      delete agState.bannedIps[k];
+      /* ★ 封禁到期时同步清理探测计数 */
+      if (agState.banProbe && agState.banProbe[k]) delete agState.banProbe[k];
+    }
   }
 
   var connCutoff = now - AG.CONN_WINDOW_MS;
@@ -1875,7 +3316,7 @@ function _flushPendingWrites() {
 
   var i = 0;
 
-  /* ★ v0.32.0：异步 Brotli，主线程 0 阻塞
+  /* 异步 Brotli，主线程 0 阻塞
    * 关键点：setImmediate(step) 只在【异步回调里】推进一次；
    * 外层 step 定义后只启动一次，绝不重复调用，避免并发写同一文件 */
   function step() {
@@ -1993,8 +3434,7 @@ function flushAllPendingWrites() {
 
 setTimeout(function() {
   try {
-    /* ★ v0.32.0 启动优化：先检测是否真的存在待迁移的旧 .json，
-       如果数据已经是 .br 格式（绝大多数情况），直接跳过，不白白阻塞 */
+    /* 仅在存在未压缩旧 .json 时才迁移，避免无谓阻塞 */
     var _dir = path.join(__dirname, 'files');
     var _needMigrate = false;
     if (fs.existsSync(_dir)) {
@@ -2039,7 +3479,7 @@ setTimeout(function() {
   } catch(e) {
     console.error('⚠️ 数据无损压缩迁移失败:', e.message);
   }
-}, 30000);   /* ★ v0.32.0：从 5 秒延后到 30 秒，错开用户首访高峰 */
+}, 30000);   /* 延后 30s 错开首访高峰 */
 
 var config = loadJSON(F_CONFIG, { saveHistory: true, maxFileSize: 50 * 1024 * 1024 });
 if (typeof config.saveHistory !== 'boolean') config.saveHistory = true;
@@ -2100,6 +3540,14 @@ saveJSON(F_CONFIG, config);
 var RO_LOGIN_WINDOW_MS = 10 * 60 * 1000;   /* 10 分钟窗口 */
 var RO_LOGIN_MAX_ATTEMPTS = 5;             /* 窗口内最多 5 次 */
 var _roLoginRate = {};                     /* ip -> [timestamp, ...] */
+
+/* ★ 修复：readonly schedule 命令用到的「上次是否处于定时区间」状态标记。
+   原先缺失声明，首次读取 !_roScheduleWasActive 会抛 ReferenceError。 */
+var _roScheduleWasActive = false;
+
+/* ★ 修复：服务端日期工具。HTML 模板字符串里那个同名 pad2 只是字符串内容，
+   服务端作用域必须单独定义，否则 date 型定时只读规则会抛 pad2 is not defined。 */
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
 
 function _roParseHM(s) {
   if (!s) return null;
@@ -2238,9 +3686,83 @@ app.use(function readOnlyHttpGuard(req, res, next) {
   });
 });
 
+/* ============================================================
+   Web Push 离线推送（web-push + VAPID）
+   注意：必须放在 DATA_DIR_EARLY / loadJSON / saveJSONNow 定义之后
+   ============================================================ */
+let webpush = null;
+try {
+  webpush = require('web-push');
+} catch (e) {
+  console.warn('⚠️ web-push 未安装，离线推送不可用。请运行 npm install web-push');
+}
+
+var F_PUSH_SUBS = path.join(DATA_DIR_EARLY, 'push_subscriptions.json');
+var pushSubscriptions = loadJSON(F_PUSH_SUBS, {}); // { userId: [subscription, ...] }
+var VAPID_PUBLIC_KEY = '';
+var VAPID_PRIVATE_KEY = '';
+
+(function initWebPush() {
+  if (!webpush) return;
+  try {
+    var F_VAPID = path.join(DATA_DIR_EARLY, 'vapid.json');
+    var vapid = loadJSON(F_VAPID, null);
+    if (!vapid || !vapid.publicKey || !vapid.privateKey) {
+      vapid = webpush.generateVAPIDKeys();
+      saveJSONNow(F_VAPID, vapid);
+      console.log('🔑 已生成 VAPID 密钥');
+    }
+    VAPID_PUBLIC_KEY = vapid.publicKey;
+    VAPID_PRIVATE_KEY = vapid.privateKey;
+    webpush.setVapidDetails(
+      'mailto:admin@lanchat.local',
+      VAPID_PUBLIC_KEY,
+      VAPID_PRIVATE_KEY
+    );
+    console.log('🔔 Web Push 已就绪（VAPID 公钥：' +
+      VAPID_PUBLIC_KEY.slice(0, 16) + '…）');
+  } catch (e) {
+    console.error('❌ Web Push 初始化失败:', e.message);
+  }
+})();
+
+function savePushSubs() {
+  saveJSON(F_PUSH_SUBS, pushSubscriptions);
+}
+
+function savePushSubscription(userId, subscription) {
+  if (!userId || !subscription || !subscription.endpoint) return;
+  var list = pushSubscriptions[userId] || [];
+  list = list.filter(function (s) { return s.endpoint !== subscription.endpoint; });
+  list.push({
+    endpoint: subscription.endpoint,
+    keys: subscription.keys || {},
+    createdAt: Date.now()
+  });
+  if (list.length > 5) list = list.slice(-5);
+  pushSubscriptions[userId] = list;
+  savePushSubs();
+}
+
+function removePushSubscription(userId, endpoint) {
+  if (!userId || !pushSubscriptions[userId]) return;
+  pushSubscriptions[userId] = pushSubscriptions[userId].filter(function (s) {
+    return s.endpoint !== endpoint;
+  });
+  if (!pushSubscriptions[userId].length) delete pushSubscriptions[userId];
+  savePushSubs();
+}
+
+var _groupPushCooldown = Object.create(null);
+
 var messageHistory = loadJSON(F_HISTORY, {});
 
-/* ★ v0.32.1：为早期没有 ts 的消息回填时间戳 */
+/* ★ 历史数据加载完成后再执行超大会话归档（修复执行时机） */
+try { _initialArchiveMigration(); } catch (e) {
+  console.warn('⚠️ 初始归档异常:', e && e.message);
+}
+
+/* 为早期没有 ts 的消息回填时间戳 */
 (function _backfillMessageTs() {
   try {
     var _changed = false;
@@ -2263,30 +3785,7 @@ var messageHistory = loadJSON(F_HISTORY, {});
   } catch (e) { console.warn('⚠️ 回填消息时间戳失败:', e.message); }
 })();
 
-/* ★ v0.32.1：为早期没有 ts 的消息回填时间戳（用于统计面板） */
-(function _backfillMessageTs() {
-  try {
-    var _changed = false;
-    var _keys = Object.keys(messageHistory);
-    for (var _i = 0; _i < _keys.length; _i++) {
-      var _arr = messageHistory[_keys[_i]];
-      if (!Array.isArray(_arr)) continue;
-      for (var _j = 0; _j < _arr.length; _j++) {
-        var _m = _arr[_j];
-        if (!_m || typeof _m.ts === 'number') continue;
-        var _p = Date.parse(String(_m.time || '').replace(/-/g, '/'));
-        _m.ts = (!isNaN(_p) && _p > 0) ? _p : Date.now();
-        _changed = true;
-      }
-    }
-    if (_changed) {
-      console.log('🛠️ 已为历史消息回填 ts 字段（用于统计面板）');
-      saveJSON(F_HISTORY, messageHistory);
-    }
-  } catch (e) {
-    console.warn('⚠️ 回填消息时间戳失败:', e.message);
-  }
-})();
+/* 已删除重复的 ts 回填 IIFE（功能等价于上方第一份） */
 var persistentUsers = loadJSON(F_USERS, {});
 
 (function cleanupTestAccounts() {
@@ -2482,7 +3981,7 @@ var USER_DATA_WHITELIST = {
   'customFontName': 1,      /* 自定义字体名称（不含字体数据） */
   'header_collapsed': 1,    /* 顶栏收纳状态 */
   'header_collapsed': 1,    /* 顶栏收纳状态 */
-  'set_allowInvite': 1,     /* ★ v0.29.0：允许被拉入群聊 */
+  'set_allowInvite': 1,     /* 允许被拉入群聊 */
 };
 
 /* 排除名单：敏感键绝不入库 */
@@ -2537,12 +4036,21 @@ function addWalletRecord(userId, type, amount, desc, extra, i18n) {
   var w = getWallet(userId);
   w.balance += amount;
   if (w.balance < 0) w.balance = 0;
+  /* extra 只保留可定位字段，不存整条消息对象 */
+  var _leanExtra = null;
+  if (extra && typeof extra === 'object') {
+    _leanExtra = {};
+    var _keep = ['packetId', 'msgId', 'targetId', 'targetName', 'fromId', 'fromName'];
+    for (var _ki = 0; _ki < _keep.length; _ki++) {
+      if (extra[_keep[_ki]] != null) _leanExtra[_keep[_ki]] = extra[_keep[_ki]];
+    }
+  }
   var rec = {
     id: 'wr' + Date.now().toString(36) + Math.random().toString(36).substring(2, 6),
     type: type,
     amount: amount,
     desc: desc || '',
-    extra: extra || null,
+    extra: _leanExtra,
     time: Date.now()
   };
   if (i18n && i18n.key) {
@@ -2779,6 +4287,31 @@ var RISK_EVENTS_MAX = 1000;
 var reportsList = loadJSON(F_REPORTS, []);
 if (!Array.isArray(reportsList)) reportsList = [];
 var REPORTS_MAX = 5000;
+  /* 启动 + 每 6 小时裁剪举报列表 */
+  (function _trimReportsOnBoot() {
+  try {
+    if (reportsList.length <= REPORTS_MAX) return;
+    reportsList.sort(function (a, b) {
+      return (b.createdAt || 0) - (a.createdAt || 0);
+    });
+    var _n = reportsList.length - REPORTS_MAX;
+    reportsList.length = REPORTS_MAX;
+    saveReports();
+    console.log('🧹 举报列表裁剪 ' + _n + ' 条');
+  } catch (e) {}
+})();
+setInterval(function () {
+  try {
+    if (reportsList.length <= REPORTS_MAX) return;
+    reportsList.sort(function (a, b) {
+      return (b.createdAt || 0) - (a.createdAt || 0);
+    });
+    var _n = reportsList.length - REPORTS_MAX;
+    reportsList.length = REPORTS_MAX;
+    saveReports();
+    console.log('🧹 举报列表定期裁剪 ' + _n + ' 条');
+  } catch (e) {}
+}, 6 * 3600 * 1000);
 var reportCounter = 0;
 (function initReportCounter() {
   for (var _rfi = 0; _rfi < reportsList.length; _rfi++) {
@@ -3199,6 +4732,23 @@ var F_FEEDBACK = path.join(DATA_DIR, 'feedback.json');
 var feedbackList = loadJSON(F_FEEDBACK, []);
 if (!Array.isArray(feedbackList)) feedbackList = [];
 
+/* 反馈列表上限（5000 条），超出按时间裁剪 */
+var FEEDBACK_MAX_TOTAL = 5000;
+function _trimFeedback() {
+  try {
+    if (feedbackList.length <= FEEDBACK_MAX_TOTAL) return;
+    feedbackList.sort(function (a, b) {
+      return (b.createdAt || 0) - (a.createdAt || 0);
+    });
+    var _n = feedbackList.length - FEEDBACK_MAX_TOTAL;
+    feedbackList.length = FEEDBACK_MAX_TOTAL;
+    saveFeedback();
+    console.log('🧹 反馈列表裁剪 ' + _n + ' 条');
+  } catch (e) {}
+}
+setInterval(_trimFeedback, 6 * 3600 * 1000);
+setTimeout(_trimFeedback, 5000);
+
 var feedbackCounter = 0;
 (function initFeedbackCounter() {
   for (var _fi = 0; _fi < feedbackList.length; _fi++) {
@@ -3211,6 +4761,39 @@ var feedbackCounter = 0;
 })();
 
 function saveFeedback() { saveJSON(F_FEEDBACK, feedbackList); }
+
+/* 反馈列表上限 5000 条，超出按时间裁剪最老的（保护内存与磁盘） */
+(function _trimFeedbackListOnBoot() {
+  try {
+    var FEEDBACK_MAX = 5000;
+    if (feedbackList.length <= FEEDBACK_MAX) return;
+    feedbackList.sort(function (a, b) {
+      return (b.createdAt || 0) - (a.createdAt || 0);
+    });
+    var _removed = feedbackList.length - FEEDBACK_MAX;
+    feedbackList.length = FEEDBACK_MAX;
+    saveFeedback();
+    console.log('🧹 反馈列表超出 ' + FEEDBACK_MAX + ' 条，已裁剪最老的 ' +
+      _removed + ' 条');
+  } catch (e) {
+    console.warn('⚠️ 裁剪反馈列表失败:', e.message);
+  }
+})();
+
+/* 每 6 小时检查一次，避免长时间运行时无限增长 */
+setInterval(function () {
+  try {
+    var FEEDBACK_MAX = 5000;
+    if (feedbackList.length <= FEEDBACK_MAX) return;
+    feedbackList.sort(function (a, b) {
+      return (b.createdAt || 0) - (a.createdAt || 0);
+    });
+    var _removed = feedbackList.length - FEEDBACK_MAX;
+    feedbackList.length = FEEDBACK_MAX;
+    saveFeedback();
+    console.log('🧹 [定期] 反馈列表裁剪 ' + _removed + ' 条');
+  } catch (e) {}
+}, 6 * 3600 * 1000);
 
 function genFeedbackId() {
   feedbackCounter++;
@@ -3970,57 +5553,8 @@ var netSamples = {};
 
 console.log('🏷️ 已加载扩展数据层（标签/设备/定时/自动回复/群动态/关键词/快捷键/时间段主题）');
 
-function _isInteractionActive(rec) {
-  return !!(rec && rec.lastDate === todayStr() && rec.days > 1);
-}
-
-function updateInteractionBadge() {
-  var badge = document.getElementById('chatInteractionBadge');
-  if (!badge) return;
-  badge.style.display = 'none';
-  badge.innerHTML = '';
-  if (state.showInteraction === false) return;
-  if (!state.currentTarget || !state.currentType) return;
-  if (!state.interactions) state.interactions = { private: {}, group: {} };
-
-  if (state.currentType === 'private') {
-    var rec = state.interactions.private[state.currentTarget];
-    if (_isInteractionActive(rec)) {
-      badge.className = 'interaction-badge fire';
-      badge.innerHTML = '🔥 ' + rec.days + (state.lang === 'en' ? 'd' : '天');
-      badge.title = (state.lang === 'en')
-        ? ('Chat streak: ' + rec.days + ' days')
-        : ('连续聊天 ' + rec.days + ' 天');
-      badge.style.display = 'inline-flex';
-    }
-  } else if (state.currentType === 'group') {
-    return;
-  }
-}
-
-function initInteractionListener(socket) {
-  socket.on('interaction-update', function (d) {
-    if (!d) return;
-    if (!state.interactions) state.interactions = { private: {}, group: {} };
-    if (d.kind === 'private' && d.peerId) {
-      state.interactions.private[d.peerId] = {
-        days: d.days, lastDate: d.lastDate
-      };
-      if (state.currentType === 'private' && state.currentTarget === d.peerId) {
-        updateInteractionBadge();
-      }
-      renderContacts();
-    } else if (d.kind === 'group' && d.groupId) {
-      state.interactions.group[d.groupId] = {
-        days: d.days, lastDate: d.lastDate, dailyTop: d.dailyTop
-      };
-      if (state.currentType === 'group' && state.currentTarget === d.groupId) {
-        updateInteractionBadge();
-        if (typeof renderGroupSidePanel === 'function') renderGroupSidePanel();
-      }
-    }
-  });
-}
+/* ★ 修复：这三个「连续聊天徽章」函数属于浏览器客户端，却误落在服务端作用域。
+   已移入下方 HTML 客户端代码块（setupSocketEvents 之前），服务端不再引用 document/state。 */
 
 var _scheduledTimer = setInterval(function () {
   try {
@@ -4292,10 +5826,68 @@ var REGISTER_CODE_TTL = 5 * 60 * 1000;   /* 5 分钟 */
 var pendingRegistrations = {};           /* 注册验证码池 */
 var pendingTestAdmins = {};              /* ★ 测试账号验证码池 */
 
+/* ★ 安全修复：原实现是「全局固定盐 + 单轮 SHA-256」，彩虹表/GPU 秒破。
+   现改为每账户随机盐 + PBKDF2-SHA256(120000 轮)，格式：
+     pbkdf2$<iters>$<saltHex>$<hashHex>
+   旧格式（64 位十六进制）仍可校验，登录成功后自动升级。 */
+var HASH_ITERS = 120000;
+var HASH_KEYLEN = 32;
 function hashSecret(text) {
-  return crypto.createHash('sha256')
-    .update('lanchat::secret::' + String(text == null ? '' : text))
-    .digest('hex');
+  var pw = String(text == null ? '' : text);
+  var salt = crypto.randomBytes(16);
+  var dk = crypto.pbkdf2Sync(pw, salt, HASH_ITERS, HASH_KEYLEN, 'sha256');
+  return 'pbkdf2$' + HASH_ITERS + '$' + salt.toString('hex') + '$' + dk.toString('hex');
+}
+function isLegacyHash(h) {
+  return typeof h === 'string' && /^[0-9a-f]{64}$/i.test(h);
+}
+function isModernHash(h) {
+  return typeof h === 'string' && /^pbkdf2\$\d+\$[0-9a-f]+\$[0-9a-f]+$/i.test(h);
+}
+/* 统一的密钥校验：同时支持新 PBKDF2 与旧全局盐 SHA-256，并报告是否需要升级 */
+function verifySecret(text, stored) {
+  var pw = String(text == null ? '' : text);
+  if (!stored) return { ok: false, upgrade: false };
+  if (isModernHash(stored)) {
+    try {
+      var p = stored.split('$');
+      var iters = parseInt(p[1], 10);
+      var salt = Buffer.from(p[2], 'hex');
+      var want = Buffer.from(p[3], 'hex');
+      var dk = crypto.pbkdf2Sync(pw, salt, iters, want.length, 'sha256');
+      var ok = dk.length === want.length && crypto.timingSafeEqual(dk, want);
+      return { ok: ok, upgrade: false };
+    } catch (e) { return { ok: false, upgrade: false }; }
+  }
+  if (isLegacyHash(stored)) {
+    var old = crypto.createHash('sha256')
+      .update('lanchat::secret::' + pw).digest('hex');
+    var okOld = safeCompare(old, stored);
+    return { ok: okOld, upgrade: okOld };
+  }
+  return { ok: false, upgrade: false };
+}
+/* 统一校验入口：客户端可能传「明文」或「已 SHA-256 的 64 位 hex」。
+   两种都试（现代 PBKDF2 只对其中一个成立），保证新旧客户端都能登录。 */
+function verifySecretAny(input, stored) {
+  if (!stored) return { ok: false, upgrade: false, used: '' };
+  var r1 = verifySecret(input, stored);
+  if (r1.ok) return { ok: true, upgrade: r1.upgrade, used: input };
+  if (!looksLikeSha256Hex(input)) {
+    var r2 = verifySecret(crypto.createHash('sha256').update('lanchat::secret::' + String(input)).digest('hex'), stored);
+    if (r2.ok) return { ok: true, upgrade: r2.upgrade, used: input };
+  }
+  return { ok: false, upgrade: false, used: '' };
+}
+/* 登录成功后静默升级旧哈希 */
+function maybeUpgradeSecret(rec, field, plain) {
+  try {
+    if (!rec || !field) return;
+    if (!isLegacyHash(rec[field])) return;
+    rec[field] = hashSecret(plain);
+    saveUsers();
+    console.log('🔐 已升级口令哈希算法 → PBKDF2');
+  } catch (e) {}
 }
 
 /*恒时字符串比较（Timing-Safe Compare）*/
@@ -4312,12 +5904,7 @@ function safeCompare(a, b) {
   }
 }
 
-/* ============================================================
- *  🌐 外网状态 & 通话模式智能切换
- *  · 初始乐观 true（首探测失败 3s 内自动降级）
- *  · checkInternet 每 60s 探测一次
- *  · 状态翻转立即广播 call-config-updated 给全部客户端
- * ============================================================ */
+/* 外网状态 & 通话模式切换：初始乐观，每 60s 探测，翻转即广播 */
 var _hasInternet = true;
 
 /* ============ Cloudflare Calls TURN 动态凭证 ============ */
@@ -4447,12 +6034,22 @@ function buildIceServers() {
 
 /* 下发给客户端的统一「通话配置」 */
 function buildCallConfig() {
-  var usePeerJS = !_hasInternet;
+  /* ★ DSH 通话修复：局域网无外网时，buildIceServers() 在旧版本里会返回空数组，
+     但客户端硬编码的 CALL_ICE_SERVERS 仍包含 Google STUN，导致 ICE 收集卡死、
+     通话永远连不上。这里明确下发 lan 模式 + 空 ICE（纯 host candidate 直连），
+     并让客户端据此切到内置 PeerServer（/peerjs），不依赖任何公网服务。 */
+  /* 强制单模式：不再因外网探测结果在通话中途翻转 */
+  var usePeerJS = false;
+  var ice = dshIceServers();
   return {
-    iceServers: buildIceServers(),
+    iceServers: ice,
     usePeerJS: usePeerJS,
     hasInternet: _hasInternet,
-    mode: usePeerJS ? 'peerjs' : 'webrtc'
+    mode: usePeerJS ? 'peerjs-lan' : 'webrtc',
+    lanOnly: true,
+    peerServerPath: '/peerjs',
+    callRingTimeoutMs: dshT('callRingTimeoutMs'),
+    callMaxPeers: dshT('callMaxPeers')
   };
 }
 
@@ -4639,6 +6236,14 @@ function getHistoryKey(type, id1, id2) {
 }
 
 function saveMessage(type, key, msg) {
+  /* ★ DSH：写入全文索引 + 离线队列（不改变原持久化语义） */
+  try { dshDbUpsert(msg, key); } catch (e) {}
+  try {
+    if (msg && msg.to && dshT('enableOfflineQueue')) {
+      const _t = getUserById(msg.to);
+      if (!_t || !_t.online) dshQueueOffline(msg.to, 'private-message', msg);
+    }
+  } catch (e) {}
   if (!messageHistory[key]) messageHistory[key] = [];
   _maybeStripFileData(msg);
   /* ★ 统一补 ts（统计面板按天/周聚合依赖此字段） */
@@ -4651,21 +6256,32 @@ function saveMessage(type, key, msg) {
     if (history[i].msgId === msg.msgId) return;
   }
   history.push(msg);
-  if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
+  /* 超过内存阈值 → 溢出部分归档到磁盘（不丢数据） */
+  if (history.length > MEMORY_HISTORY_KEEP) {
+    var _over2 = history.length - MEMORY_HISTORY_KEEP;
+    var _oldMsgs = history.splice(0, _over2);
+    _archiveAppend(key, _oldMsgs);
+  }
   scheduleSaveHistory();
 }
 
-/* ★ v0.32.0：剥离超大 fileData，只保留元数据；客户端按需通过 history-load-more 拉取 */
+/* 剥离超大 fileData，客户端按需拉取 */
 function _stripFileData(msg) {
   if (!msg || typeof msg !== 'object') return msg;
-  if (!msg.fileData) return msg;
-  if (typeof msg.fileData !== 'string') return msg;
-  if (msg.fileData.length <= 8192) return msg;   /* 小数据（如表情包）保留 */
-  var m = {};
-  for (var k in msg) if (msg.hasOwnProperty(k)) m[k] = msg[k];
-  m.fileData = '[按需加载]';
-  m._needsFetch = true;
-  return m;
+
+  // ★ 关键修复：只返回副本，不修改 messageHistory 原对象
+  //   原代码直接给原 msg 添加 _needsFetch 字段，会被后续
+  //   scheduleSaveHistory / saveHistoryNow 持久化到磁盘
+  if (msg.fileId && !msg.fileData) {
+    var _copy = {};
+    for (var _k in msg) {
+      if (msg.hasOwnProperty(_k)) _copy[_k] = msg[_k];
+    }
+    _copy._needsFetch = true;
+    return _copy;
+  }
+
+  return msg;
 }
 function _stripFileDataArr(arr) {
   if (!Array.isArray(arr)) return arr;
@@ -4673,8 +6289,10 @@ function _stripFileDataArr(arr) {
   for (var i = 0; i < arr.length; i++) out[i] = _stripFileData(arr[i]);
   return out;
 }
+
 function getUserHistory(userId) {
   var priv = {}, grp = {};
+  var _strip = _stripFileDataArr;
   for (var key in messageHistory) {
     if (!messageHistory.hasOwnProperty(key)) continue;
     var arr = messageHistory[key];
@@ -4686,13 +6304,13 @@ function getUserHistory(userId) {
       var b = rest.substring(idx + 1);
       if (a === userId || b === userId) {
         priv[(a === userId) ? b : a] =
-          _stripFileDataArr(arr.slice(-HISTORY_PAGE_SIZE));
+          _strip(arr.slice(-HISTORY_PAGE_SIZE));
       }
     } else if (key.indexOf('group_') === 0) {
       var gid = key.substring(6);
       var g = groupMap.get(gid);
       if (g && g.members.has(userId)) {
-        grp[gid] = _stripFileDataArr(arr.slice(-HISTORY_PAGE_SIZE));
+        grp[gid] = _strip(arr.slice(-HISTORY_PAGE_SIZE));
       }
     }
   }
@@ -4760,7 +6378,7 @@ function sanitizeVerifiedForUser(id, verified) {
   return v;
 }
 
-/* ★ v0.32.0：广播用户列表加 100ms 去抖，避免短时间内多次全量广播 */
+/* 广播用户列表加 100ms 去抖，避免短时间内多次全量广播 */
 var _broadcastUserListTimer = null;
 function broadcastUserList() {
   if (_broadcastUserListTimer) return;
@@ -5280,7 +6898,7 @@ function deleteUserAccount(targetName, operatorName) {
 
 function log(type, data) {
   var now = new Date().toLocaleString('zh-CN', { hour12: false });
-  var typeMap = {
+  var typeMapZh = {
     CONNECTION: '连接', LOGIN_SUCCESS: '登录成功', LOGIN_RESUME: '继承旧账号',
     KICK_OLD: '踢除旧连接', DISCONNECT: '断开连接', PM_OFFLINE: '对方离线',
     CREATE_GROUP: '创建群', JOIN_GROUP: '加入群', LEAVE_GROUP: '离开群',
@@ -5291,16 +6909,48 @@ function log(type, data) {
     STICKER_UPLOAD: '表情包上传', CMD_SAVE: '命令行保存开关',
     CALL_REQUEST: '发起通话', CALL_ACCEPT: '接听通话',
     CALL_REJECT: '拒接通话', CALL_END: '结束通话',
-    MESSAGE_REACT: '表情回应',
-    PAT_PAT: '拍一拍',
+    MESSAGE_REACT: '表情回应', PAT_PAT: '拍一拍',
     BAN_USER: '封禁用户', UNBAN_USER: '解除封禁',
-    LOGIN_BANNED: '登录被拒（已封禁）',
-    DISBAND_GROUP: '解散群聊'
+    LOGIN_BANNED: '登录被拒（已封禁）', DISBAND_GROUP: '解散群聊'
   };
-  console.log('[' + now + '] [' + (typeMap[type] || type) + ']', data);
-  if (typeof TUI !== 'undefined' && TUI && TUI.active &&
-    typeof tuiPushLog === 'function') {
-    try { tuiPushLog(type, data); } catch (e) { }
+  var typeMapEn = {
+    CONNECTION: 'Connect', LOGIN_SUCCESS: 'Login Success', LOGIN_RESUME: 'Resume Session',
+    KICK_OLD: 'Kick Old', DISCONNECT: 'Disconnect', PM_OFFLINE: 'Peer Offline',
+    CREATE_GROUP: 'Create Group', JOIN_GROUP: 'Join Group', LEAVE_GROUP: 'Leave Group',
+    REMOVE_MEMBER: 'Remove Member', RECALL_GROUP_MSG: 'Recall Group Msg', RECALL_MSG: 'Recall Msg',
+    RENAME_GROUP: 'Rename Group', ADMIN_GLOBAL_ANNOUNCE: 'Global Announce',
+    GROUP_ANNOUNCE: 'Group Announce', QQ_FILE_UPLOAD: 'Group File Upload',
+    QQ_ALBUM_UPLOAD: 'Group Album Upload', QQ_VOTE_CREATE: 'Group Vote Create',
+    STICKER_UPLOAD: 'Sticker Upload', CMD_SAVE: 'Cmd Save Toggle',
+    CALL_REQUEST: 'Call Request', CALL_ACCEPT: 'Call Accept',
+    CALL_REJECT: 'Call Reject', CALL_END: 'Call End',
+    MESSAGE_REACT: 'React', PAT_PAT: 'Pat',
+    BAN_USER: 'Ban User', UNBAN_USER: 'Unban User',
+    LOGIN_BANNED: 'Login Banned', DISBAND_GROUP: 'Disband Group'
+  };
+
+  var zhType = typeMapZh[type] || type;
+  var enType = typeMapEn[type] || type;
+  var detail = formatLogData(data, SERVER_LANG);
+
+  // ★ 合并继承旧账号：如果类型是 LOGIN_RESUME，可以不打，因为 login-success 已经带了 resumed 标识
+  if (type === 'LOGIN_RESUME') {
+    return; // 直接拦截，不再输出第二行冗余日志
+  }
+
+  // 防刷屏处理（相同类型的事件 3 秒内不重复打印，除非包含特定关键词）
+  var throttleKey = 'log_' + type + '_' + (data && data.ip ? data.ip : '');
+  if (type === 'CONNECTION' || type === 'DISCONNECT') {
+    if (isSpamLog(throttleKey, 3000)) return;
+  }
+
+  sysLog('info', '[' + now + '] [' + zhType + '] ' + detail, '[' + now + '] [' + enType + '] ' + detail);
+
+  if (typeof TUI !== 'undefined' && TUI && TUI.active && typeof tuiPushLog === 'function') {
+    try {
+      tuiPushLog(type, data);
+      if (typeof tuiBumpEventCounter === 'function') tuiBumpEventCounter(type, data);
+    } catch (e) {}
   }
 }
 
@@ -5309,9 +6959,40 @@ const html = String.raw`<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<link rel="manifest" href="/manifest.json">
+<!-- iOS 14+ 兼容：manifest 的 display:standalone 之外的旧版识别入口 -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="微信·局域网">
 <title>微信 · 局域网</title>
 <!-- promise-polyfill removed: Safari Tracking Prevention blocks it; modern browsers support Promise natively -->
 <!-- 防查看源码保护：拦截右键 / 快捷键 / DevTools 检测；前端无法真正隐藏代码，仅提高门槛 -->
+<script>
+/* ★ 极简模式 UI 瘦身代理：拦截不存在元素的报错 */
+(function() {
+  var _origGet = document.getElementById.bind(document);
+  var _dummy = function() {
+    var el = document.createElement('div');
+    el.addEventListener = function() {}; // 拦截事件绑定
+    el.classList = { add:function(){}, remove:function(){}, toggle:function(){}, contains:function(){return false;} };
+    el.style = {};
+    el.appendChild = function(){};
+    el.removeAttribute = function(){};
+    el.setAttribute = function(){};
+    el.querySelector = function(){ return _dummy(); };
+    el.querySelectorAll = function(){ return []; };
+    return el;
+  };
+  document.getElementById = function(id) {
+    var el = _origGet(id);
+    if (!el) {
+      // 如果找不到元素，且当前是极简模式（或者初始化阶段），返回假对象
+      return _dummy();
+    }
+    return el;
+  };
+})();
+</script>
 <script>
 (function(){
   'use strict';
@@ -5326,6 +7007,9 @@ const html = String.raw`<!DOCTYPE html>
       var t = e.target;
       var tag = (t && t.tagName) ? t.tagName.toLowerCase() : '';
       if (tag === 'input' || tag === 'textarea' || (t && t.isContentEditable)) return;
+      /* ★ 移动端放行消息气泡，长按会走系统原生上下文/选择菜单 */
+      var _isMobileUA = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+      if (_isMobileUA && t && t.closest && t.closest('.msg .bubble')) return;
       e.preventDefault();
       return false;
     }, true);
@@ -5431,6 +7115,10 @@ const html = String.raw`<!DOCTYPE html>
       var t = e.target;
       var tag = (t && t.tagName) ? t.tagName.toLowerCase() : '';
       if (tag === 'input' || tag === 'textarea' || (t && t.isContentEditable)) return;
+      /* ★ 移动端放行消息气泡：允许系统长按选择/复制文本
+         桌面端保持拦截（保证右键菜单体验不被系统菜单覆盖） */
+      var _isMobileUA = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+      if (_isMobileUA && t && t.closest && t.closest('.msg .bubble')) return;
       if (e.preventDefault) e.preventDefault();
       return false;
     }, true);
@@ -6727,7 +8415,7 @@ html.is-mobile .header-collapse-btn{ display:none !important; }
   opacity:.85;
   pointer-events:none;
 }
-.sidebar .contact-item .avatar{width:36px;height:36px;border-radius:50%;background:var(--accent);
+.sidebar .contact-item .avatar{width:var(--sidebar-avatar-size,36px);height:var(--sidebar-avatar-size,36px);border-radius:50%;background:var(--accent);
   color:#fff;display:flex;align-items:center;justify-content:center;font-weight:bold;flex-shrink:0;font-size:16px;
   position:relative}
 .sidebar .contact-item .info{flex:1;min-width:0}
@@ -7536,11 +9224,16 @@ html.is-pc .mobile-group-manage-btn{ display:none !important; }
 .msg.self .msg-content{align-items:flex-end}
 .msg .bubble{padding:8px 14px;border-radius:var(--msg-border-radius, 16px);
   word-wrap:break-word;
-  word-break:break-word;      /* ★ v0.27.5：长英文/URL 也能换行 */
-  overflow-wrap:anywhere;      /* ★ v0.27.5：更激进的换行策略 */
-  hyphens:auto;                /* ★ v0.27.5：长单词连字符 */
+  word-break:break-word;      /* 长英文/URL 也能换行 */
+  overflow-wrap:anywhere;      /* 更激进的换行策略 */
+  hyphens:auto;                /* 长单词连字符 */
   position:relative;background:var(--bg-msg-other);color:var(--text-primary);
-  box-shadow:var(--shadow-msg);max-width:100%}
+  box-shadow:var(--shadow-msg);max-width:100%;
+  /* ★ 长按可选择文本（选择性复制），移动端系统长按手柄才可操作 */
+  -webkit-user-select:text;
+  user-select:text;
+  -webkit-touch-callout:default;
+  touch-action:pan-y}
 .msg.self .bubble{background:var(--bg-msg-self);color:#000;
   border-bottom-right-radius:4px}
 [data-theme="dark"] .msg.self .bubble{
@@ -7715,7 +9408,7 @@ html.is-pc .mobile-group-manage-btn{ display:none !important; }
   display:flex;
   justify-content:center;
   align-items:center;
-  width: 100%; /* ★ v0.29.0：强制占满整行以确保居中 */
+  width: 100%; /* 强制占满整行以确保居中 */
   margin:8px 0;
   user-select:none;
   animation: msgFadeIn .26s cubic-bezier(.16,1,.3,1) both;
@@ -12250,7 +13943,7 @@ html.is-mobile .settings-panel .btn-cancel {
 }
 
 /* PC 名片中等宽度修复：900px~1199px 使用三栏
-   ★ v0.33.2：全部加 html.is-pc 前缀，
+   全部加 html.is-pc 前缀，
      避免 960×540 电视被判为移动端后仍命中三栏规则 */
 @media (min-width: 900px) and (max-width: 1199px) {
   html.is-pc #profileCard.profile-card,
@@ -12333,7 +14026,7 @@ html.is-mobile .settings-panel .btn-cancel {
 }
 
 /* 极窄窗口（769~899px）：三栏退化为上下布局
-   ★ v0.33.2：加 html.is-pc 前缀，仅对 PC 生效 */
+   加 html.is-pc 前缀，仅对 PC 生效 */
 @media (min-width: 769px) and (max-width: 899px) {
   html.is-pc #profileCard.profile-card,
   html.is-pc #profileModal .profile-card {
@@ -12425,7 +14118,7 @@ html.is-mobile .settings-panel .btn-cancel {
 }
 
 /* 高度极矮时（如横屏分屏、小笔记本），紧凑布局
-   ★ v0.33.2：加 html.is-pc 前缀，让位给 html.is-mobile 的全屏移动布局 */
+   加 html.is-pc 前缀，让位给 html.is-mobile 的全屏移动布局 */
 @media (max-height: 650px) and (min-width: 769px) {
   html.is-pc #profileCard.profile-card,
   html.is-pc #profileModal .profile-card {
@@ -12462,7 +14155,7 @@ html.is-mobile .settings-panel .btn-cancel {
 }
 
 /* ★ 960×540 等 900px 以上、横屏极矮窗口专属优化
-   ★ v0.33.2：加 html.is-pc 前缀，只对 PC 生效；
+   加 html.is-pc 前缀，只对 PC 生效；
      960×540 电视判为 is-mobile 后走全屏移动布局 */
 @media (min-width: 900px) and (max-height: 650px) {
   html.is-pc #profileCard .profile-card-header,
@@ -20366,8 +22059,8 @@ html #app {
   }
 
   .sidebar .contact-item .avatar {
-    width: 40px !important;
-    height: 40px !important;
+    width: var(--sidebar-avatar-size, 40px) !important;
+    height: var(--sidebar-avatar-size, 40px) !important;
     border-radius: 6px !important;
     font-size: 16px !important;
     flex-shrink: 0;
@@ -21904,6 +23597,16 @@ html.is-watch[data-theme="dark"] #app { background: #000 !important; }
 
 @media (max-width: 768px) {
   .modal-overlay {
+    padding: 0 !important;
+  }
+  html.is-mobile #toolkitModal .modal-box {
+    width: 100vw !important;
+    max-width: 100vw !important;
+    height: 100vh !important;
+    height: 100dvh !important;
+    max-height: 100vh !important;
+    max-height: 100dvh !important;
+    border-radius: 0 !important;
     padding: 0 !important;
   }
   .modal-box,
@@ -24289,7 +25992,7 @@ body.readonly-mode .msg .bubble a {
   font-size: 15px;
   line-height: 1.5;
   min-height: 40px;
-  max-height: 120px;
+  max-height: var(--max-input-height, 120px);
   background: var(--bg-input);
   color: var(--text-primary);
   font-family: inherit;
@@ -25496,7 +27199,7 @@ html.is-tv .profile-card-actions button:focus-visible {
   z-index: 9999 !important;
 }
 
-/* ★ v0.33.4：小屏电视 / 嵌入式浏览器（≤1024×600，如 960×540） */
+/* 小屏电视 / 嵌入式浏览器（≤1024×600，如 960×540） */
 @media (max-width: 1024px) and (max-height: 600px) {
   #profileCard.profile-card,
   #profileModal .profile-card {
@@ -25778,7 +27481,7 @@ html.is-tv .profile-card-actions button:focus-visible {
   color: var(--text-secondary) !important;
 }
 
-/* ★ v0.32.1：暗色模式统一覆盖，消除散落的硬编码浅色块 */
+/* 暗色模式统一覆盖，消除散落的硬编码浅色块 */
 [data-theme="dark"] .modal-box,
 [data-theme="dark"] .wallet-card,
 [data-theme="dark"] .redpacket-card,
@@ -25872,9 +27575,88 @@ html.is-tv .profile-card-actions button:focus-visible {
   background-color: #ffca28;
   color: #333;
 }
-/* ★ v0.32.2：用户关闭气泡阴影 */
+/* 用户关闭气泡阴影 */
 html.no-msg-shadow .msg .bubble { box-shadow: none !important; }
 html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
+
+/* iOS WebKit 专属性能补丁 */
+@supports (-webkit-touch-callout: none) {
+  /* ① 关闭每条消息的入场动画：animation-fill-mode: both 会让 WebKit
+        为每条消息保留独立合成层，超过合成层预算后整页降级为软件渲染 */
+  .msg,
+  .date-divider {
+    animation: none !important;
+  }
+
+  /* ② 关闭消息的 box-shadow 过渡：prepend 后 hover 失焦会触发
+        批量 GPU 光栅化，大量元素同时过渡在 iOS 上直接掉帧 */
+  .msg,
+  .msg .bubble {
+    transition: none !important;
+  }
+
+  /* ③ 消息列表从 flex 改为 block：iOS WebKit 的 Flexbox 对大量
+        子元素的重排代价远高于 Chromium，每次 prepend 都触发全列表布局 */
+  .message-list {
+    display: block;
+  }
+  .message-list > .msg {
+    margin-bottom: var(--msg-gap, 6px);
+  }
+  /* 用 margin-left: auto 替代 flex 的 align-self: flex-end */
+  .message-list > .msg.self {
+    margin-left: auto;
+    margin-right: 0;
+    align-self: auto;
+  }
+  .message-list > .msg.other {
+    margin-left: 0;
+    margin-right: auto;
+    align-self: auto;
+  }
+
+  /* ④ prepend 期间给所有子元素加布局隔离，避免频繁向上重排 */
+  .message-list.fast-prepend > * {
+    contain: layout style;
+  }
+}
+
+.toolkit-btn-header {
+  background: rgba(33, 150, 243, .16);
+  border: 1px solid rgba(33, 150, 243, .55);
+  color: #1e88e5;
+  padding: 2px 10px;
+  border-radius: 20px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  line-height: 1.6;
+  font-family: inherit;
+  flex-shrink: 0;
+}
+.toolkit-btn-header:hover { background: rgba(33, 150, 243, .3); }
+.toolkit-btn-header:active { transform: scale(.96); }
+
+.toolkit-tab {
+  padding: 7px 16px; border: none; border-radius: 8px; background: transparent;
+  color: var(--text-secondary); font-size: 13.5px; font-weight: 600;
+  cursor: pointer; font-family: inherit; white-space: nowrap;
+  transition: background .15s, color .15s;
+}
+.toolkit-tab:hover { background: rgba(var(--accent-rgb), .1); color: var(--accent); }
+.toolkit-tab.active { background: var(--accent); color: #fff; }
+.toolkit-btn {
+  padding: 10px 24px; border: none; border-radius: 24px;
+  background: var(--bg-btn-primary); color: #fff; font-size: 14px;
+  font-weight: 600; cursor: pointer; font-family: inherit;
+  transition: filter .15s;
+}
+.toolkit-btn:hover { filter: brightness(.94); }
+.toolkit-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+.msg-highlight { animation: msgHi 2s ease; }
+@keyframes msgHi { 0%{background:rgba(7,193,96,.28);} 100%{background:transparent;} }
 </style>
 </head>
 <body>
@@ -26010,6 +27792,8 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
       <span class="network-status" id="networkStatus" style="display:none;"></span>
       <button class="admin-btn" id="adminBtn" data-i18n="adminBtnShort" data-i18n-title="ttAdminPanel" title="管理员面板">⚙️ 管理</button>
       <button class="wallet-btn" id="walletBtn" data-i18n-title="walletBtnTitle" title="我的钱包"><span style="pointer-events:none;">💰</span> <span data-i18n="walletBtnLabel">钱包</span></button>
+      <!-- 全局搜索入口 -->
+      <button class="wallet-btn" id="globalSearchBtn" style="background:rgba(30,136,229,.16);border-color:rgba(30,136,229,.55);color:#1e88e5;" title="全局搜索（Ctrl+Shift+F）">🔍 搜索</button>
       <button class="signin-btn" id="signinBtn" data-i18n-title="signinBtnTitle" title="每日签到 +10 经验">📅 签到 +10</button>
       <button class="space-btn" id="spaceBtn" data-i18n="spaceBtn" data-i18n-title="spaceBtnTitle" title="我的空间">🌟 空间</button>
       <button class="music-btn" id="musicBtn" data-i18n="musicBtn" data-i18n-title="musicBtnTitle" title="音乐库">🎵 音乐</button>
@@ -26023,12 +27807,13 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
       <button class="orientation-toggle" id="fullscreenToggle" aria-label="切换全屏" data-i18n-title="ttFullscreen" title="切换全屏">⛶</button>
       <button class="logout-btn" id="logoutBtn" data-i18n="logoutBtnShort">🚪 退出</button>
       <button class="header-collapse-btn" id="headerCollapseBtn" aria-label="收纳顶栏" title="收纳顶栏">«</button>
+      <button class="toolkit-btn-header" id="toolkitBtn" type="button" title="小工具（计算器 / 播放器 / 录音机 / 时钟）">🧰 工具</button>
       <button class="header-more-btn" id="headerMoreBtn" aria-label="更多" title="更多">⋯</button>
       <div class="header-more-menu" id="headerMoreMenu"></div>
     </div>
   </div>
 
-  <!-- ★ v0.30.0：只读模式横幅（仅 body.readonly-mode 时显示）
+  <!-- 只读模式横幅（仅 body.readonly-mode 时显示）
        ★ 暂时关闭：点 ✕ → 隐藏；延时后自动重弹（仍处于只读模式才弹） -->
   <div class="readonly-banner" id="readOnlyBanner" role="alert" aria-live="polite">
     <span class="rb-icon">🔒</span>
@@ -26042,7 +27827,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
 
   <div class="main">
     <div class="sidebar" id="sidebar">
-      <!-- ★ v0.24.61：移动端顶部标题栏 —— 显示「微信 · 局域网」并放置「＋」按钮 -->
+      <!-- 移动端顶部标题栏 —— 显示「微信 · 局域网」并放置「＋」按钮 -->
       <div class="mobile-sidebar-header">
         <span class="mobile-sidebar-title" data-i18n="appTitle">微信 · 局域网</span>
         <button class="mobile-sidebar-newgroup" id="sidebarNewGroupBtn"
@@ -26050,7 +27835,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
       </div>
       <div class="sidebar-search">
         <input type="text" id="contactSearchInput" placeholder="🔎 搜索联系人或群聊…">
-        <!-- ★ v0.24.23：移动端联系人列表上方的全局刷新按钮 -->
+        <!-- 移动端联系人列表上方的全局刷新按钮 -->
         <button class="sidebar-refresh-btn" id="sidebarRefreshBtn"
                 type="button" title="全局刷新" aria-label="全局刷新">🔄</button>
       </div>
@@ -26064,7 +27849,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
     <div class="sidebar-overlay" id="sidebarOverlay"></div>
     <div class="chat-header" id="chatHeader">
         <div class="top-row">
-          <!-- ★ v0.24.8：移动端专用返回按钮 -->
+          <!-- 移动端专用返回按钮 -->
           <button class="mobile-back-btn" id="mobileBackBtn" type="button"
                   title="返回联系人列表" aria-label="返回">←</button>
           <div class="chat-title-wrap">
@@ -26075,7 +27860,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
                     data-i18n-title="chatTitleEditTitle" title="重命名" style="display:none;">✏️</button>
           </div>
           <div class="header-actions">
-            <!-- ★ v0.24.29：移动端聊天头部的「联系人菜单」按钮
+            <!-- 移动端聊天头部的「联系人菜单」按钮
                  —— 取代原先右键联系人弹出的菜单 -->
             <button class="mobile-chat-menu-btn" id="mobileChatMenuBtn"
                     type="button" data-i18n-title="ttChatMenu"
@@ -26094,9 +27879,9 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             <button id="refreshBtn" data-i18n-title="ttRefresh" title="刷新全部">🔄</button>
             <button id="searchToggleBtn" data-i18n-title="ttSearchToggle" title="搜索当前会话消息 (Ctrl+F)">🔍</button>
             <button id="starredBtn" data-i18n-title="ttStarred" title="收藏夹">⭐</button>
-            <button id="settingsBtn" data-i18n-title="ttSettings" title="设置">🔧</button>
+            <button id="settingsBtn" data-i18n-title="ttSettings" title="设置（极简模式下唯一入口）">⚙️</button>
             <button id="clearChatBtn" data-i18n-title="ttClearChat" title="清空聊天记录">🗑️</button>
-            <!-- ★ v0.24.28：移动端群聊「群管理」按钮（仅群主/管理员可见） -->
+            <!-- 移动端群聊「群管理」按钮（仅群主/管理员可见） -->
             <button class="mobile-group-manage-btn" id="mobileGroupManageBtn"
                     type="button" data-i18n-title="ttGroupManage"
                     data-i18n-aria-label="ttGroupManage"
@@ -26139,7 +27924,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
         <button id="searchCloseBtn" data-i18n-title="ttSearchClose" title="关闭">✕</button>
       </div>
 
-      <!-- ★ v0.27.11：移动端下拉刷新指示器 -->
+      <!-- 移动端下拉刷新指示器 -->
       <div class="pull-indicator" id="pullIndicator">
         <span class="pull-icon">↓</span>
         <span class="pull-text">下拉刷新</span>
@@ -26154,7 +27939,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
 </button>
       </div>
 
-      <!-- ★ v0.27.11：手表端快捷短语 -->
+      <!-- 手表端快捷短语 -->
       <div class="watch-phrases" id="watchPhrases"></div>
       <div class="input-area">
         <div class="burn-banner" id="burnBanner">
@@ -26173,7 +27958,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
           <button id="redpacketBtn" data-i18n-title="ttRedpacket" title="发红包">🧧</button>
           <button id="fileBtn" data-i18n-title="ttFile" title="发送文件">📎</button>
           <button id="locationBtn" title="共享位置" aria-label="共享位置">📍</button>
-          <!-- ★ v0.27.11：移动端拍照按钮（仅移动端显示） -->
+          <!-- 移动端拍照按钮（仅移动端显示） -->
           <button id="captureBtn" title="拍照">📷</button>
           <button id="burnBtn" class="burn-btn" title="阅后即焚">🔥</button>
           <button id="voiceBtn" class="voice-btn" data-i18n-title="voiceBtnStartTitle" title="点击开始录音">🎤</button>
@@ -26186,11 +27971,28 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
           <div class="input-btn-row">
             <button id="newlineBtn" type="button" class="input-icon-btn" title="换行" aria-label="换行" style="display:none;">↵</button>
             <button id="expandInputBtn" type="button" class="input-icon-btn" title="扩展输入框" aria-label="扩展输入框">⤢</button>
+            <button id="scheduleSendBtn" type="button" class="input-icon-btn" title="定时发送" aria-label="定时发送">🕒</button>
             <button id="sendBtn" disabled>发送</button>
           </div>
         </div>
       </div>
       <div class="burn-picker" id="burnPicker"></div>
+      <div class="modal-overlay" id="scheduleSendModal">
+        <div class="modal-box" style="max-width:400px;">
+          <h3>🕒 定时发送</h3>
+          <div style="padding:8px 0;">
+            <div style="font-size:13px;color:var(--text-muted);margin-bottom:6px;">发送时间</div>
+            <input type="datetime-local" id="scheduleSendTime" style="width:100%;padding:8px 10px;border:1px solid var(--border-input);border-radius:8px;font-size:14px;">
+            <div style="font-size:12px;color:var(--text-muted);margin:10px 0 6px;">消息内容</div>
+            <textarea id="scheduleSendContent" rows="3" placeholder="输入要定时发送的内容…" style="width:100%;padding:8px 10px;border:1px solid var(--border-input);border-radius:8px;font-size:14px;resize:vertical;"></textarea>
+            <div id="scheduleSendList" style="margin-top:12px;max-height:180px;overflow-y:auto;font-size:12.5px;"></div>
+          </div>
+          <div class="modal-actions">
+            <button class="btn-cancel" id="scheduleSendCancel">取消</button>
+            <button class="btn-primary" id="scheduleSendOk">确定</button>
+          </div>
+        </div>
+      </div>
       <div class="emoji-picker" id="emojiPicker"></div>
       <div class="mention-list" id="mentionList"></div>
       <div class="quick-reply-panel" id="quickReplyPanel"></div>
@@ -26206,7 +28008,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
 
   <!-- @device:mobile-start -->
   <!-- ==================== 移动端「发现」页面 v0.24.11 ==================== -->
-  <section class="mobile-page" id="mobileDiscoverPage" aria-hidden="true">
+  <section class="mobile-page" id="mobileDiscoverPage">
     <header class="mp-topbar">
       <span class="mp-topbar-title" data-i18n="mpDiscoverTitle">发现</span>
     </header>
@@ -26254,7 +28056,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
   </section>
 
   <!-- ==================== 移动端「我」页面 v0.24.11 ==================== -->
-  <section class="mobile-page" id="mobileMePage" aria-hidden="true">
+  <section class="mobile-page" id="mobileMePage">
     <header class="mp-topbar">
       <span class="mp-topbar-title" data-i18n="mpMeTitle">我</span>
     </header>
@@ -26351,7 +28153,12 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
           <span class="mp-cell-label" data-i18n="mpFeedback">反馈中心</span>
           <span class="mp-cell-arrow">›</span>
         </button>
-        <!-- ★ v0.27.5：快捷键帮助入口（桌面端顶栏已有；移动端放入"我"页） -->
+        <!-- 快捷键帮助入口（桌面端顶栏已有；移动端放入"我"页） -->
+        <button class="mp-cell" type="button" id="mpToolkitBtn">
+          <span class="mp-cell-icon" style="background:#1e88e5;">🧰</span>
+          <span class="mp-cell-label">小工具</span>
+          <span class="mp-cell-arrow">›</span>
+        </button>
         <button class="mp-cell" type="button" id="mpShortcutsBtn">
           <span class="mp-cell-icon" style="background:#607d8b;">⌨️</span>
           <span class="mp-cell-label" data-i18n="shortcutsTitle">快捷键</span>
@@ -26404,6 +28211,56 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
     </button>
   </nav>
   <!-- @device:mobile-end -->
+
+  <!-- ==================== 小工具面板 ==================== -->
+  <div class="modal-overlay" id="toolkitModal">
+    <div class="modal-box" style="width:680px;max-width:96vw;height:560px;display:flex;flex-direction:column;padding:0;overflow:hidden;">
+      <div style="display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--border-modal);flex-shrink:0;">
+        <span style="font-size:16px;font-weight:700;color:var(--text-primary);">🧰 小工具</span>
+        <div style="flex:1;"></div>
+        <button type="button" id="toolkitCloseBtn" style="background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer;padding:4px 10px;border-radius:8px;">✕</button>
+      </div>
+      <div style="display:flex;gap:2px;padding:8px 12px;border-bottom:1px solid var(--border-modal);flex-shrink:0;overflow-x:auto;">
+        <button class="toolkit-tab active" data-tool="calc" type="button">🔢 计算器</button>
+        <button class="toolkit-tab" data-tool="player" type="button">🎵 播放器</button>
+        <button class="toolkit-tab" data-tool="recorder" type="button">🎤 录音机</button>
+        <button class="toolkit-tab" data-tool="clock" type="button">⏰ 时钟</button>
+      </div>
+      <div style="flex:1;min-height:0;overflow:hidden;position:relative;" id="toolkitBody">
+        <!-- 计算器 -->
+        <div class="toolkit-panel active" data-panel="calc" style="height:100%;padding:12px;display:flex;flex-direction:column;gap:10px;overflow:hidden;">
+          <div id="tkCalcHistory" style="max-height:56px;overflow-y:auto;font-size:12px;line-height:1.5;color:var(--text-muted);text-align:right;padding:0 4px;font-family:Consolas,monospace;"></div>
+          <input type="text" id="tkCalcDisplay" autocomplete="off" spellcheck="false" style="width:100%;padding:12px 16px;font-size:24px;text-align:right;font-family:Consolas,monospace;border:1px solid var(--border-input);border-radius:10px;background:var(--bg-input);color:var(--text-primary);outline:none;box-sizing:border-box;" value="0">
+          <div style="flex:1;min-height:0;display:flex;flex-direction:column;gap:8px;overflow-y:auto;">
+            <div id="tkCalcSciKeys" style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;"></div>
+            <div id="tkCalcBasicKeys" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;"></div>
+          </div>
+        </div>
+        <!-- 播放器 -->
+        <div class="toolkit-panel" data-panel="player" style="height:100%;padding:24px;display:none;flex-direction:column;align-items:center;justify-content:center;gap:16px;">
+          <div style="font-size:48px;">🎵</div>
+          <p style="color:var(--text-muted);font-size:14px;">选择本地音频文件或输入网络地址</p>
+          <input type="file" id="toolkitAudioFile" accept="audio/*" style="display:none;">
+          <button type="button" class="toolkit-btn" id="toolkitAudioPickBtn">📂 选择音频文件</button>
+          <audio id="toolkitAudio" controls style="width:100%;max-width:400px;"></audio>
+        </div>
+        <!-- 录音机 -->
+        <div class="toolkit-panel" data-panel="recorder" style="height:100%;padding:24px;display:none;flex-direction:column;align-items:center;justify-content:center;gap:16px;">
+          <div id="toolkitRecStatus" style="font-size:15px;color:var(--text-secondary);">准备录音</div>
+          <div style="display:flex;gap:12px;">
+            <button type="button" class="toolkit-btn" id="toolkitRecStartBtn">⏺ 开始录音</button>
+            <button type="button" class="toolkit-btn" id="toolkitRecStopBtn" disabled>⏹ 停止</button>
+          </div>
+          <audio id="toolkitRecAudio" controls style="width:100%;max-width:400px;display:none;"></audio>
+        </div>
+        <!-- 时钟 -->
+        <div class="toolkit-panel" data-panel="clock" style="height:100%;padding:24px;display:none;flex-direction:column;align-items:center;justify-content:center;gap:12px;">
+          <div id="toolkitClockTime" style="font-size:56px;font-weight:300;font-variant-numeric:tabular-nums;letter-spacing:2px;color:var(--text-primary);">00:00:00</div>
+          <div id="toolkitClockDate" style="font-size:16px;color:var(--text-secondary);"></div>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="modal-overlay" id="adminModal">
@@ -26629,22 +28486,22 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
         <!-- ---------- 外观与显示 ---------- -->
           <div class="settings-section active" data-section="appearance">
           <div class="setting-row">
-            <span>时间显示方式</span>
+            <span data-i18n="setTimeMode">时间显示方式</span>
             <select id="setTimeMode">
-              <option value="both">时间 + 相对</option>
-              <option value="clock">仅显示时间</option>
-              <option value="rel">仅显示相对</option>
+              <option value="both" data-i18n="setTimeBoth">时间 + 相对</option>
+              <option value="clock" data-i18n="setTimeClock">仅显示时间</option>
+              <option value="rel" data-i18n="setTimeRel">仅显示相对</option>
             </select>
           </div>
           <div class="setting-row">
-            <span>字体大小</span>
+            <span data-i18n="setFontSize">字体大小</span>
             <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
               <input type="range" id="setFontSize" min="12" max="24" step="1" style="width:120px;">
               <span id="setFontSizeVal" style="font-size:13px;color:var(--text-secondary);min-width:40px;text-align:right;">15px</span>
             </div>
           </div>
           <div class="setting-row">
-            <span>主题色</span>
+            <span data-i18n="setAccentColor">主题色</span>
             <div class="color-swatches" id="colorSwatches">
               <span class="color-swatch" data-color="#07c160" style="background:#07c160" data-i18n-title="colorWechatGreen" title="微信绿"></span>
               <span class="color-swatch" data-color="#1976d2" style="background:#1976d2" data-i18n-title="colorBlue" title="蓝色"></span>
@@ -26658,7 +28515,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             </div>
           </div>
           <div class="setting-row">
-            <span>主题模式</span>
+            <span data-i18n="setThemeMode">主题模式</span>
             <select id="setThemeMode">
               <option value="light">浅色</option>
               <option value="dark">深色</option>
@@ -26668,9 +28525,9 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
           <div class="setting-row">
             <span>液态玻璃 <small style="color:var(--text-muted);font-weight:normal;">（iOS 26/27 风格）</small></span>
             <select id="setLiquidGlass">
-              <option value="off">关闭</option>
-              <option value="standard">标准</option>
-              <option value="enhanced">增强（SVG 折射）</option>
+              <option value="off" data-i18n="setMotionOff">关闭</option>
+              <option value="standard" data-i18n="setSoundBeep">标准</option>
+              <option value="enhanced" data-i18n="setLiquidGlassEnhanced">增强（SVG 折射）</option>
             </select>
           </div>
           <div class="setting-row">
@@ -26681,14 +28538,14 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             <span style="line-height:1.5;">液态玻璃与磨砂玻璃互斥，开启其中一个会自动关闭另一个。</span>
           </div>
           <div class="setting-row">
-            <span>显示网络状态</span>
+            <span data-i18n="setShowNetworkStatus">显示网络状态</span>
             <label class="switch"><input type="checkbox" id="setShowNetworkStatus"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>界面动效</span>
+            <span data-i18n="setMotionLevel">界面动效</span>
             <select id="setMotionLevel">
               <option value="full">标准</option>
-              <option value="reduced">精简</option>
+              <option value="reduced" data-i18n="setMotionReduced">精简</option>
               <option value="off">关闭</option>
             </select>
           </div>
@@ -26696,7 +28553,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             <span>紧凑侧边栏 <small style="color:var(--text-muted);font-weight:normal;">（节省空间）</small></span>
             <label class="switch"><input type="checkbox" id="setCompactSidebar"><span class="slider"></span></label>
           </div>
-          <!-- ★ v0.32.3：强制切换布局模式（自动 / 强制电脑 / 强制手机） -->
+          <!-- 强制切换布局模式（自动 / 强制电脑 / 强制手机） -->
           <div class="setting-row">
             <span>强制布局模式
               <small style="color:var(--text-muted);font-weight:normal;">
@@ -26704,16 +28561,16 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
               </small>
             </span>
             <select id="setForceLayoutMode">
-              <option value="auto">自动识别</option>
-              <option value="pc">强制电脑模式</option>
-              <option value="mobile">强制手机模式</option>
+              <option value="auto" data-i18n="setLayoutAuto">自动识别</option>
+              <option value="pc" data-i18n="setLayoutPc">强制电脑模式</option>
+              <option value="mobile" data-i18n="setLayoutMobile">强制手机模式</option>
             </select>
           </div>
           <div class="setting-row">
             <span>隐藏系统账号 <small style="color:var(--text-muted);font-weight:normal;">（微信团队 / 微信支付 / 系统）</small></span>
             <label class="switch"><input type="checkbox" id="setHideSystemUsers"><span class="slider"></span></label>
           </div>
-          <!-- ★ v0.27.3：PC 侧栏宽度可调（仅 PC 生效） -->
+          <!-- PC 侧栏宽度可调（仅 PC 生效） -->
           <div class="setting-row" id="pcSidebarWidthRow">
             <span>联系人栏宽度
               <small style="color:var(--text-muted);font-weight:normal;">
@@ -26727,7 +28584,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
               <span id="setPcSidebarWidthVal"
                     style="font-size:13px;color:var(--text-secondary);
                            min-width:50px;text-align:right;
-                           font-variant-numeric:tabular-nums;">默认</span>
+                           font-variant-numeric:tabular-nums;" data-i18n="bgDefault">默认</span>
               <button type="button" class="btn-cancel" id="resetPcSidebarWidth"
                       style="padding:2px 10px;font-size:12px;">重置</button>
             </div>
@@ -26751,25 +28608,52 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             </div>
           </div>
           <div class="setting-row">
+            <span data-i18n="setSidebarAvatarSize">侧边栏头像大小</span>
+            <select id="setSidebarAvatarSize">
+              <option value="32" data-i18n="setSidebarAvatarSizeSmall">小（32px）</option>
+              <option value="36" data-i18n="setSidebarAvatarSizeMedium">中（36px）</option>
+              <option value="40" data-i18n="setSidebarAvatarSizeNormal">标准（40px）</option>
+              <option value="48" data-i18n="setSidebarAvatarSizeLarge">大（48px）</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <span data-i18n="setSidebarAvatarSize">侧边栏头像大小</span>
+            <select id="setSidebarAvatarSize">
+              <option value="32" data-i18n="setSidebarAvatarSizeSmall">小（32px）</option>
+              <option value="36" data-i18n="setSidebarAvatarSizeMedium">中（36px）</option>
+              <option value="40" data-i18n="setSidebarAvatarSizeNormal">标准（40px）</option>
+              <option value="48" data-i18n="setSidebarAvatarSizeLarge">大（48px）</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <span data-i18n="setSidebarAvatarSize">侧边栏头像大小</span>
+            <select id="setSidebarAvatarSize">
+              <option value="32" data-i18n="setSidebarAvatarSizeSmall">小（32px）</option>
+              <option value="36" data-i18n="setSidebarAvatarSizeMedium">中（36px）</option>
+              <option value="40" data-i18n="setSidebarAvatarSizeNormal">标准（40px）</option>
+              <option value="48" data-i18n="setSidebarAvatarSizeLarge">大（48px）</option>
+            </select>
+          </div>
+          <div class="setting-row">
             <span>界面字体</span>
             <select id="setFontFamily">
-              <option value="system">系统默认</option>
-              <option value="sans">无衬线（Sans）</option>
-              <option value="serif">衬线（Serif）</option>
-              <option value="mono">等宽（Mono）</option>
-              <option value="rounded">圆体（Rounded）</option>
-              <option value="custom">自定义字体</option>
+              <option value="system" data-i18n="fontSystem">系统默认</option>
+              <option value="sans" data-i18n="fontSans">无衬线（Sans）</option>
+              <option value="serif" data-i18n="fontSerif">衬线（Serif）</option>
+              <option value="mono" data-i18n="fontMono">等宽（Mono）</option>
+              <option value="rounded" data-i18n="fontRounded">圆体（Rounded）</option>
+              <option value="custom" data-i18n="fontCustom">自定义字体</option>
             </select>
           </div>
           <div class="setting-row" id="customFontRow" style="display:none;">
-            <span>字体文件</span>
+            <span data-i18n="setCustomFontFile">字体文件</span>
             <div class="font-upload-row">
               <input type="file" id="setCustomFontFile"
                      accept=".ttf,.otf,.woff,.woff2,font/*"
                      class="visually-hidden-file">
               <label for="setCustomFontFile" class="avatar-btn"
                      style="padding:4px 12px;">选择字体</label>
-              <span class="font-upload-name" id="setCustomFontName">未选择</span>
+              <span class="font-upload-name" id="setCustomFontName" data-i18n="setCustomFontNone">未选择</span>
               <button type="button" id="setCustomFontClear" class="avatar-btn"
                       style="padding:4px 10px;">清除</button>
             </div>
@@ -26783,15 +28667,15 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             <label class="switch"><input type="checkbox" id="setNotify"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>声音提醒</span>
+            <span data-i18n="setSound">声音提醒</span>
             <label class="switch"><input type="checkbox" id="setSound"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>未读标题闪烁</span>
+            <span data-i18n="setTitleFlash">未读标题闪烁</span>
             <label class="switch"><input type="checkbox" id="setTitleFlash"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>免打扰时仍提醒 @</span>
+            <span data-i18n="setDndAllowMention">免打扰时仍提醒 @</span>
             <label class="switch"><input type="checkbox" id="setDndAllowMention"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
@@ -26799,17 +28683,17 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             <label class="switch"><input type="checkbox" id="setNotifyPrivacy"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>提示音</span>
+            <span data-i18n="setSoundType">提示音</span>
             <select id="setSoundType">
               <option value="beep">标准</option>
-              <option value="drop">水滴</option>
-              <option value="bell">铃声</option>
+              <option value="drop" data-i18n="setSoundDrop">水滴</option>
+              <option value="bell" data-i18n="setSoundBell">铃声</option>
               <option value="none">静音</option>
             </select>
           </div>
-          <!-- ★ v0.30.0：提示音音量 -->
+          <!-- 提示音音量 -->
           <div class="setting-row">
-            <span>提示音音量</span>
+            <span data-i18n="setSoundVolume">提示音音量</span>
             <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
               <input type="range" id="setSoundVolume" min="0" max="100" step="5" value="80" style="width:120px;">
               <span id="setSoundVolumeVal" style="font-size:13px;color:var(--text-secondary);min-width:48px;text-align:right;">80%</span>
@@ -26821,7 +28705,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
           <label class="switch"><input type="checkbox" id="setDoNotDisturb"><span class="slider"></span></label>
         </div>
         <div class="setting-row" id="dndTempRow">
-          <span>临时免打扰</span>
+          <span data-i18n="dndTempRowLabel">临时免打扰</span>
           <div style="display:flex;gap:6px;">
             <button class="btn-cancel" id="dndTemp1h" style="padding:3px 12px;">1 小时</button>
             <button class="btn-cancel" id="dndTemp2h" style="padding:3px 12px;">2 小时</button>
@@ -26832,7 +28716,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             <span data-i18n="setQuietEnabled">夜间免打扰</span>
             <label class="switch"><input type="checkbox" id="setQuietEnabled"><span class="slider"></span></label>
           </div>
-          <!-- ★ v0.27.0：免打扰临时快捷按钮 -->
+          <!-- 免打扰临时快捷按钮 -->
           <div class="setting-row">
             <span>临时开启免打扰</span>
             <div style="display:flex;gap:6px;flex:1;justify-content:flex-end;">
@@ -26845,35 +28729,52 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             <span id="dndTempHint" style="line-height:1.5;">当前未设置临时免打扰</span>
           </div>
           <div class="setting-row">
-            <span>免打扰时段</span>
+            <span data-i18n="setQuietRange">免打扰时段</span>
             <div style="display:flex;align-items:center;gap:6px;flex:1;justify-content:flex-end;">
               <input type="time" id="setQuietStart" value="22:00" style="padding:4px 8px;border:1px solid var(--border-input);border-radius:8px;background:var(--bg-input);color:var(--text-primary);">
               <span style="opacity:.6;">—</span>
               <input type="time" id="setQuietEnd" value="07:00" style="padding:4px 8px;border:1px solid var(--border-input);border-radius:8px;background:var(--bg-input);color:var(--text-primary);">
             </div>
           </div>
+
+          <!-- ★ Web Push 订阅卡片 -->
+          <div id="pushSubCard" style="display:none;padding:14px 16px;margin:12px 0;
+            background:rgba(var(--accent-rgb),.06);border:1px solid rgba(var(--accent-rgb),.2);
+            border-radius:12px;">
+            <div style="font-size:13px;color:var(--text-secondary);line-height:1.6;
+              margin-bottom:10px;white-space:pre-wrap;" id="pushSubHint">
+              开启后，即使关闭页面也能收到新消息通知
+            </div>
+            <button type="button" id="pushSubBtn" style="padding:8px 20px;border:none;
+              border-radius:20px;background:var(--bg-btn-primary);color:#fff;font-size:13.5px;
+              font-weight:600;cursor:pointer;font-family:inherit;">🔔 开启通知</button>
+            <button type="button" id="pushUnsubBtn" style="display:none;margin-left:8px;
+              padding:8px 16px;border:1px solid var(--border-input);border-radius:20px;
+              background:transparent;color:var(--text-secondary);font-size:13px;
+              cursor:pointer;font-family:inherit;">关闭通知</button>
+          </div>
         </div>
 
         <!-- ---------- 消息显示 ---------- -->
         <div class="settings-section" data-section="messages">
           <div class="setting-row">
-            <span>显示头像</span>
+            <span data-i18n="setShowAvatar">显示头像</span>
             <label class="switch"><input type="checkbox" id="setShowAvatar"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>连续消息合并</span>
+            <span data-i18n="setMergeMessages">连续消息合并</span>
             <label class="switch"><input type="checkbox" id="setMergeMessages"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>扁平气泡风格</span>
+            <span data-i18n="setFlatStyle">扁平气泡风格</span>
             <label class="switch"><input type="checkbox" id="setFlatStyle"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>12 小时制</span>
+            <span data-i18n="setHour12">12 小时制</span>
             <label class="switch"><input type="checkbox" id="setHour12"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>新消息自动滚到底部</span>
+            <span data-i18n="setAutoScroll">新消息自动滚到底部</span>
             <label class="switch"><input type="checkbox" id="setAutoScroll"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
@@ -26881,7 +28782,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             <label class="switch"><input type="checkbox" id="setShowReadReceipt"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>链接自动预览</span>
+            <span data-i18n="setLinkPreview">链接自动预览</span>
             <label class="switch"><input type="checkbox" id="setLinkPreview"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
@@ -26889,15 +28790,15 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             <label class="switch"><input type="checkbox" id="setShowInteraction" checked><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>消息时间精确到秒</span>
+            <span data-i18n="setTimeShowSeconds">消息时间精确到秒</span>
             <label class="switch"><input type="checkbox" id="setTimeShowSeconds"><span class="slider"></span></label>
           </div>
-          <!-- ★ v0.30.0：消息预览 -->
+          <!-- 消息预览 -->
           <div class="setting-row">
             <span>在侧边栏显示消息预览 <small style="color:var(--text-muted);font-weight:normal;">（关闭后仅显示"新消息"）</small></span>
             <label class="switch"><input type="checkbox" id="setShowMsgPreview" checked><span class="slider"></span></label>
           </div>
-          <!-- ★ v0.30.0：侧边栏动画 -->
+          <!-- 侧边栏动画 -->
           <div class="setting-row">
             <span>侧边栏悬停动画 <small style="color:var(--text-muted);font-weight:normal;">（关闭可提升低端设备流畅度）</small></span>
             <label class="switch"><input type="checkbox" id="setSidebarAnim" checked><span class="slider"></span></label>
@@ -26907,83 +28808,113 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             <label class="switch"><input type="checkbox" id="setGspAnim" checked><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>消息气泡圆角</span>
+            <span data-i18n="setBubbleRadius">消息气泡圆角</span>
             <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
               <input type="range" id="setBubbleRadius" min="0" max="24" step="1" value="16" style="width:120px;">
               <span id="setBubbleRadiusVal" style="font-size:13px;color:var(--text-secondary);min-width:40px;text-align:right;">16px</span>
             </div>
           </div>
           <div class="setting-row">
-            <span>消息间距</span>
+            <span data-i18n="setMsgGap">消息间距</span>
             <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
               <input type="range" id="setMsgGap" min="0" max="20" step="1" value="6" style="width:120px;">
               <span id="setMsgGapVal" style="font-size:13px;color:var(--text-secondary);min-width:40px;text-align:right;">6px</span>
             </div>
           </div>
-          <!-- ★ v0.32.2：新增 8 个显示类设置 -->
+          <!-- 新增 8 个显示类设置 -->
           <div class="setting-row">
-            <span>消息字体粗细</span>
+            <span data-i18n="setMsgFontWeight">消息字体粗细</span>
             <select id="setMsgFontWeight">
-              <option value="400">正常</option>
-              <option value="500">中等</option>
-              <option value="600">粗体</option>
+              <option value="400" data-i18n="setMsgFontWeightNormal">正常</option>
+              <option value="500" data-i18n="setMsgFontWeightMedium">中等</option>
+              <option value="600" data-i18n="setMsgFontWeightBold">粗体</option>
             </select>
           </div>
           <div class="setting-row">
-            <span>消息头像大小</span>
+            <span data-i18n="setMsgAvatarSize">消息头像大小</span>
             <select id="setMsgAvatarSize">
-              <option value="28">小（28px）</option>
-              <option value="32">中（32px）</option>
-              <option value="38">标准（38px）</option>
-              <option value="44">大（44px）</option>
+              <option value="28" data-i18n="setMsgAvatarSizeSmall">小（28px）</option>
+              <option value="32" data-i18n="setMsgAvatarSizeMedium">中（32px）</option>
+              <option value="38" data-i18n="setMsgAvatarSizeNormal">标准（38px）</option>
+              <option value="44" data-i18n="setMsgAvatarSizeLarge">大（44px）</option>
             </select>
           </div>
           <div class="setting-row">
-            <span>消息气泡阴影</span>
+            <span data-i18n="setMsgBubbleShadow">消息气泡阴影</span>
             <label class="switch"><input type="checkbox" id="setMsgBubbleShadow" checked><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>图片点击预览方式</span>
+            <span data-i18n="setImagePreviewMode">图片点击预览方式</span>
             <select id="setImagePreviewMode">
-              <option value="modal">弹窗预览</option>
-              <option value="newtab">新窗口打开</option>
+              <option value="modal" data-i18n="setImagePreviewModal">弹窗预览</option>
+              <option value="newtab" data-i18n="setImagePreviewNewTab">新窗口打开</option>
             </select>
           </div>
           <div class="setting-row">
-            <span>视频消息默认静音</span>
+            <span data-i18n="setVideoMute">视频消息默认静音</span>
             <label class="switch"><input type="checkbox" id="setVideoMute" checked><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>复制消息时包含发送者</span>
+            <span data-i18n="setCopyWithSender">复制消息时包含发送者</span>
             <label class="switch"><input type="checkbox" id="setCopyWithSender" checked><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>会话列表时间格式</span>
+            <span data-i18n="setContactTimeFormat">会话列表时间格式</span>
             <select id="setContactTimeFormat">
-              <option value="smart">智能（推荐）</option>
-              <option value="relative">相对时间</option>
-              <option value="absolute">绝对时间</option>
-              <option value="hidden">隐藏</option>
+              <option value="smart" data-i18n="setContactTimeSmart">智能（推荐）</option>
+              <option value="relative" data-i18n="setContactTimeRelative">相对时间</option>
+              <option value="absolute" data-i18n="setContactTimeAbsolute">绝对时间</option>
+              <option value="hidden" data-i18n="setContactTimeHidden">隐藏</option>
             </select>
           </div>
           <div class="setting-row">
-            <span>输入框自动保存草稿</span>
+            <span data-i18n="setAutoSaveDraft">输入框自动保存草稿</span>
             <label class="switch"><input type="checkbox" id="setAutoSaveDraft" checked><span class="slider"></span></label>
+          </div>
+
+          <!-- 通话 -->
+          <div class="setting-row">
+            <span data-i18n="callForceTurn">强制走中继（TURN）</span>
+            <label class="switch"><input type="checkbox" id="setCallForceTurn"><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <span data-i18n="callQualityShow">显示通话质量</span>
+            <label class="switch"><input type="checkbox" id="setCallQualityShow" checked><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <span data-i18n="callAutoAnswer">自动接听</span>
+            <label class="switch"><input type="checkbox" id="setCallAutoAnswer"><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <span data-i18n="callDefaultVideo">默认视频通话</span>
+            <label class="switch"><input type="checkbox" id="setCallDefaultVideo"><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <span data-i18n="callRingTimeout">响铃超时（秒）</span>
+            <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
+              <input type="number" id="setCallRingTimeout" min="10" max="120" value="30" style="width:70px;">
+            </div>
+          </div>
+          <div class="setting-row">
+            <span data-i18n="callReconnect">断线重连次数</span>
+            <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
+              <input type="number" id="setCallReconnect" min="0" max="10" value="3" style="width:70px;">
+            </div>
           </div>
         </div>
 
-        <!-- ---------- 窗口与背景 ---------- -->
+      <!-- ---------- 窗口与背景 ---------- -->
         <div class="settings-section" data-section="window">
           <div class="setting-row">
-            <span>窗口亚克力</span>
+            <span data-i18n="setAcrylic">窗口亚克力</span>
             <label class="switch"><input type="checkbox" id="setAcrylic"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>二级窗口亚克力</span>
+            <span data-i18n="setAcrylicSecondary">二级窗口亚克力</span>
             <label class="switch"><input type="checkbox" id="setAcrylicSecondary"><span class="slider"></span></label>
           </div>
           <div class="setting-row" id="acrylicSecondaryAlphaRow">
-            <span>二级亚克力透明度</span>
+            <span data-i18n="setAcrylicSecondaryAlpha">二级亚克力透明度</span>
             <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
               <input type="range" id="setAcrylicSecondaryAlpha" min="20" max="100" step="1" value="72" style="width:120px;">
               <span id="setAcrylicSecondaryAlphaVal" style="font-size:13px;color:var(--text-secondary);min-width:48px;text-align:right;">72%</span>
@@ -27002,7 +28933,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             </select>
           </div>
           <div class="setting-row" id="bgUrlRow" style="display:none;">
-            <span>背景图片</span>
+            <span data-i18n="setBackgroundFileLabel">背景图片</span>
             <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;min-width:0;">
               <input type="file" id="setBackgroundFile" accept="image/*" class="visually-hidden-file">
               <label for="setBackgroundFile" class="avatar-btn" style="padding:4px 12px;">选择图片</label>
@@ -27015,14 +28946,14 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             </div>
           </div>
           <div class="setting-row">
-            <span>背景模糊度</span>
+            <span data-i18n="setBackgroundBlurLabel">背景模糊度</span>
             <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
               <input type="range" id="setBackgroundBlur" min="0" max="30" step="1" value="0" style="width:120px;">
-              <span id="setBackgroundBlurVal" style="font-size:13px;color:var(--text-secondary);min-width:48px;text-align:right;">不模糊</span>
+              <span id="setBackgroundBlurVal" style="font-size:13px;color:var(--text-secondary);min-width:48px;text-align:right;" data-i18n="noBlurLabel">不模糊</span>
             </div>
           </div>
           <div class="setting-row">
-            <span>背景透明度</span>
+            <span data-i18n="setBackgroundOpacityLabel">背景透明度</span>
             <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
               <input type="range" id="setBackgroundOpacity" min="10" max="100" step="1" value="100" style="width:120px;">
               <span id="setBackgroundOpacityVal" style="font-size:13px;color:var(--text-secondary);min-width:48px;text-align:right;">100%</span>
@@ -27033,17 +28964,24 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
         <!-- ---------- 排版 ---------- -->
         <div class="settings-section" data-section="typography">
           <div class="setting-row">
-            <span>行距</span>
+            <span data-i18n="setLineHeight">行距</span>
             <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
               <input type="range" id="setLineHeight" min="12" max="22" step="1" style="width:120px;">
               <span id="setLineHeightVal" style="font-size:13px;color:var(--text-secondary);min-width:40px;text-align:right;">15</span>
             </div>
           </div>
           <div class="setting-row">
-            <span>气泡最大宽度</span>
+            <span data-i18n="setBubbleWidth">气泡最大宽度</span>
             <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
               <input type="range" id="setBubbleWidth" min="40" max="95" step="1" style="width:120px;">
               <span id="setBubbleWidthVal" style="font-size:13px;color:var(--text-secondary);min-width:40px;text-align:right;">85%</span>
+            </div>
+          </div>
+          <div class="setting-row">
+            <span>输入框最大高度 <small style="color:var(--text-muted);font-weight:normal;">（自动增长上限）</small></span>
+            <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
+              <input type="range" id="setMaxInputHeight" min="60" max="300" step="10" style="width:120px;">
+              <span id="setMaxInputHeightVal" style="font-size:13px;color:var(--text-secondary);min-width:48px;text-align:right;">120px</span>
             </div>
           </div>
         </div>
@@ -27051,23 +28989,23 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
         <!-- ---------- 输入与语音 ---------- -->
         <div class="settings-section" data-section="input">
           <div class="setting-row">
-            <span>发送键</span>
+            <span data-i18n="setSendKey">发送键</span>
             <select id="setSendKey">
-              <option value="enter">Enter 发送</option>
-              <option value="ctrl">Ctrl+Enter 发送</option>
+              <option value="enter" data-i18n="sendKeyEnter">Enter 发送</option>
+              <option value="ctrl" data-i18n="sendKeyCtrl">Ctrl+Enter 发送</option>
             </select>
           </div>
           <div class="setting-row">
-            <span>语音最长时长</span>
+            <span data-i18n="setVoiceMaxDuration">语音最长时长</span>
             <select id="setVoiceMaxDuration">
-              <option value="30">30 秒</option>
-              <option value="60" selected>60 秒</option>
-              <option value="120">2 分钟</option>
-              <option value="300">5 分钟</option>
+              <option value="30" data-i18n="voiceDuration30">30 秒</option>
+              <option value="60" selected data-i18n="voiceDuration60">60 秒</option>
+              <option value="120" data-i18n="voiceDuration120">2 分钟</option>
+              <option value="300" data-i18n="voiceDuration300">5 分钟</option>
             </select>
           </div>
           <div class="setting-row">
-            <span>语音默认倍速</span>
+            <span data-i18n="setVoiceSpeed">语音默认倍速</span>
             <select id="setVoiceSpeed">
               <option value="1" selected>1x</option>
               <option value="1.5">1.5x</option>
@@ -27075,14 +29013,14 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             </select>
           </div>
           <div class="setting-row">
-            <span>录音后自动发送</span>
+            <span data-i18n="setVoiceAutoSend">录音后自动发送</span>
             <label class="switch"><input type="checkbox" id="setVoiceAutoSend"><span class="slider"></span></label>
           </div>
           <div class="setting-row">
-            <span>语音录制方式</span>
+            <span data-i18n="setVoiceMode">语音录制方式</span>
             <select id="setVoiceMode">
-              <option value="click">点击开始 / 停止</option>
-              <option value="hold">按住说话，松开发送</option>
+              <option value="click" data-i18n="setVoiceModeClick">点击开始 / 停止</option>
+              <option value="hold" data-i18n="setVoiceModeHold">按住说话，松开发送</option>
             </select>
           </div>
           <div class="setting-row">
@@ -27104,20 +29042,20 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
           <div class="setting-row">
             <span data-i18n="presenceLabel">我的状态</span>
             <select id="setPresence">
-              <option value="online">🟢 在线</option>
-              <option value="away">🟡 离开</option>
-              <option value="busy">🔴 忙碌</option>
-              <option value="dnd">🟣 勿扰</option>
-              <option value="listening">🎵 听歌中</option>
-              <option value="gaming">🎮 游戏中</option>
-              <option value="working">💼 工作中</option>
-              <option value="studying">📚 学习中</option>
-              <option value="eating">🍜 干饭中</option>
-              <option value="sleeping">😴 睡觉中</option>
+              <option value="online" data-i18n="presenceOnline">🟢 在线</option>
+              <option value="away" data-i18n="presenceAway">🟡 离开</option>
+              <option value="busy" data-i18n="presenceBusy">🔴 忙碌</option>
+              <option value="dnd" data-i18n="presenceDnd">🟣 勿扰</option>
+              <option value="listening" data-i18n="presenceListening">🎵 听歌中</option>
+              <option value="gaming" data-i18n="presenceGaming">🎮 游戏中</option>
+              <option value="working" data-i18n="presenceWorking">💼 工作中</option>
+              <option value="studying" data-i18n="presenceStudying">📚 学习中</option>
+              <option value="eating" data-i18n="presenceEating">🍜 干饭中</option>
+              <option value="sleeping" data-i18n="presenceSleeping">😴 睡觉中</option>
             </select>
           </div>
           <div class="setting-row">
-            <span>界面语言</span>
+            <span data-i18n="setLanguage">界面语言</span>
 <select id="setLanguage">
   <option value="zh">简体中文</option>
   <option value="zh-TW">繁體中文</option>
@@ -27125,12 +29063,12 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
   <option value="en">English</option>
 </select>
           </div>
-          <!-- ★ v0.24.46：语言翻译完善度提示 -->
+          <!-- 语言翻译完善度提示 -->
           <div class="setting-row" style="font-size:12px;color:var(--text-muted);border-bottom:none;padding-top:0;">
             <span style="line-height:1.5;"
                   data-i18n="langWarning">除中文外，其它语言翻译并不完善，可能存在部分缺失或语句生硬的情况。</span>
           </div>
-          <!-- ★ v0.24.39：自动登录开关 -->
+          <!-- 自动登录开关 -->
           <div class="setting-row">
             <span><span data-i18n="setAutoLogin">自动登录</span>
               <small style="color:var(--text-muted);font-weight:normal;"
@@ -27186,6 +29124,17 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             <span>🔍 详细调试模式</span>
             <label class="switch"><input type="checkbox" id="setDebugMode"><span class="slider"></span></label>
           </div>
+
+          <!-- 审计日志 -->
+          <div class="setting-row" style="flex-direction:column;align-items:stretch;">
+            <div style="display:flex;align-items:center;justify-content:space-between;">
+              <span data-i18n="auditLogTitle">审计日志</span>
+              <button type="button" class="btn-mini" id="dshAuditRefresh"
+                      style="font-size:12px;padding:3px 10px;" data-i18n="auditRefresh">刷新</button>
+            </div>
+            <div id="dshAuditList" style="max-height:180px;overflow-y:auto;margin-top:6px;
+                 border:1px solid rgba(0,0,0,.06);border-radius:8px;padding:4px;"></div>
+          </div>
           <div class="setting-row" style="opacity:.62;">
             <span>🛡️ 界面保护 <small style="color:var(--text-muted);font-weight:normal;">(强制开启)</small></span>
             <label class="switch" style="pointer-events:none;">
@@ -27204,10 +29153,11 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
             <div style="display:flex;gap:6px;">
               <button class="btn-cancel" id="exportTxtBtn" style="padding:3px 12px;">TXT</button>
               <button class="btn-cancel" id="exportJsonBtn" style="padding:3px 12px;">JSON</button>
+              <button class="btn-cancel" id="exportHtmlBtn" style="padding:3px 12px;">HTML</button>
             </div>
           </div>
           <div class="setting-row">
-            <span>导出设置</span>
+            <span data-i18n="exportSettingsBtn">导出设置</span>
             <div style="display:flex;gap:6px;">
               <button class="btn-cancel" id="exportSettingsBtn" style="padding:3px 12px;">导出</button>
               <button class="btn-cancel" id="importSettingsBtn" style="padding:3px 12px;">导入</button>
@@ -27690,7 +29640,8 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
           <li><b>群组操作</b>：查看群聊天记录 / 发群消息 / 发群公告 / 解散群组。</li>
           <li><b>消息浏览</b>：<kbd>↑</kbd> 看更早、<kbd>↓</kbd> 看更新、<kbd>Esc</kbd> 返回。</li>
           <li><b>事件流</b>：底部实时显示最近事件（登录、红包、通话、封禁等）。</li>
-          <li>快捷键：<kbd>R</kbd> 刷新、<kbd>P</kbd> 暂停 / 恢复服务器、<kbd>Q</kbd> 退出 TUI。</li>
+      '  <li>快捷键：<kbd>R</kbd> 刷新、<kbd>P</kbd> 暂停 / 恢复服务器、<kbd>Q</kbd> 退出 TUI。</li>' +
+      '<li><b>增强项</b>：实时事件计数、最近 200 条事件环形缓冲、按用户/群组过滤日志、内存与连接数迷你图、快捷键 <kbd>F</kbd> 过滤、<kbd>/</kbd> 搜索用户。</li>',
         </ul>
 
         <h4 data-i18n-html="aboutWebTermTitle">🖥️ Web 终端（浏览器访问）</h4>
@@ -28068,7 +30019,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
   </div>
 </div>
 
-<!-- ★ v0.24.63：未读跳转按钮已移除（Alt+N 仍可跳转） -->
+<!-- 未读跳转按钮已移除（Alt+N 仍可跳转） -->
 <div class="toast-notification" id="toastContainer"></div>
 
 <!-- 液态玻璃 SVG 折射滤镜
@@ -28116,7 +30067,6 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
   </div>
 </div>
 <div class="popup-stack" id="popupStack"></div>
-
 <div class="space-modal" id="spaceModal">
   <div class="space-wrap">
     <div class="space-topbar">
@@ -28522,7 +30472,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
         <input type="text" id="editMood" maxlength="20" data-i18n-ph="profileMoodPh" placeholder="自定义心情…">
       </label>
 
-      <!-- ★ v0.32.0：MBTI 性格选择 -->
+      <!-- MBTI 性格选择 -->
       <div>
         <div style="font-size:13px;color:var(--text-secondary);margin-bottom:5px;">
           <span data-i18n="profilePersonality">性格（MBTI）</span>
@@ -28624,7 +30574,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
     </button>
     <button class="call-btn" id="callMuteBtn" style="display:none;">
       <span id="callMuteIcon">🎙️</span>
-      <span class="call-btn-label" id="callMuteLabel">静音</span>
+      <span class="call-btn-label" id="callMuteLabel" data-i18n="setSoundNone">静音</span>
     </button>
     <button class="call-btn" id="callVideoToggleBtn" style="display:none;">
       <span id="callVideoToggleIcon">📹</span>
@@ -28709,7 +30659,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
 </div>
 
 <!-- IE11 完整支持需要 socket.io 2.5.0；若已降级服务端，请把下面 CDN 版本号改为 2.5.0 -->
-<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script src="/socket.io/socket.io.js"></script>
 <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
 <script>
 (function () {
@@ -29233,7 +31183,7 @@ html.no-msg-shadow .msg:hover .bubble { box-shadow: none !important; }
 <script>
 "use strict";
 
-/*Blob URL 自动回收（Blob Auto Revoke）*/
+/* Blob URL 自动回收 */
 var __blobRegistry = new Set();
 (function () {
   try {
@@ -29706,15 +31656,14 @@ var MBTI_TYPES = {
 };
 
 var state = {
-  /* ★ v0.32.2：新增消息显示类设置默认值（会被 localStorage 覆盖） */
-  imagePreviewMode: 'modal',       /* 图片预览：modal | newtab */
-  videoMute: true,                 /* 视频消息默认静音 */
-  copyWithSender: true,            /* 复制消息时带发送者 */
-  contactTimeFormat: 'smart',      /* 会话列表时间：smart | relative | absolute | hidden */
-  autoSaveDraft: true,             /* 输入自动保存草稿 */
-  msgFontWeight: 400,              /* 消息字体粗细 */
-  msgAvatarSize: 38,               /* 消息头像大小 */
-  msgBubbleShadow: true,           /* 消息气泡阴影 */
+  imagePreviewMode: 'modal',
+  videoMute: true,
+  copyWithSender: true,
+  contactTimeFormat: 'smart',
+  autoSaveDraft: true,
+  msgFontWeight: 400,
+  msgAvatarSize: 38,
+  msgBubbleShadow: true,
   callConfig: {
     iceServers: [],
     usePeerJS: false,
@@ -29722,6 +31671,7 @@ var state = {
     mode: 'webrtc'
   },
   socket: null,
+  httpDlBase: '',
   myId: '', myName: '', myLevel: 0, myVip: false, isAdmin: false, muted: false,
   myVerified: '',
   sourceGuardAllowed: false,
@@ -29757,22 +31707,22 @@ var state = {
   bulkMode: false,
   bulkSelected: {},
   lastSendCache: {},
-  maxFileSize: 50 * 1024 * 1024, /* 默认 50MB，登录后由服务端覆盖 */
+  maxFileSize: 50 * 1024 * 1024,
   wallet: { balance: 0, records: [] },
   walletLoaded: false,
   redPacketCache: {},
-  redPacketPending: {},     /* 已发出 redpacket-info 请求但未收到响应的 packetId */
+  redPacketPending: {},
   redPacketCurrent: null,
   redPacketType: 'lucky',
   call: {
     active: false,
-    type: null,             /* 'voice' | 'video' */
+    type: null,
     peerId: null,
     peerName: '',
     peerAvatar: '',
     peerVerified: '',
-    direction: null,        /* 'outgoing' | 'incoming' */
-    status: null,           /* 'calling' | 'ringing' | 'connecting' | 'active' */
+    direction: null,
+    status: null,
     startTime: 0,
     timerId: null,
     localStream: null,
@@ -29800,17 +31750,17 @@ var state = {
     lastQualityClass: '',
     lastIceRestartAt: 0,
     connectedAt: 0,
-    facingMode: 'user',       /* 'user' 前置 | 'environment' 后置 */
-    _isCaller: false,          /* 本端是否为 SDP offer 发起方 */
-    _makingOffer: false,       /* 正在 createOffer 中（glare 防重入） */
-    _ignoreOffer: false,       /* glare 时对方 offer 被忽略 */
-    _hangupped: false,         /* 已主动挂断，避免异步回调重入 */
-    _mediaStreamStopped: false,/* 本地流已停止 */
-    _lastMuteAt: 0,            /* 最近一次静音状态变更时间 */
-    _silentSince: 0,           /* 通话中静音起始时间戳 */
-    _callQualityText: '',      /* 当前质量文本，避免重复 DOM 操作 */
-    _permDenied: false,        /* 权限拒绝标记，用于显示详细指引 */
-    _pendingOffer: null        /* ★ v0.33.1：被叫在 getUserMedia 期间收到的 offer 缓存 */
+    facingMode: 'user',
+    _isCaller: false,
+    _makingOffer: false,
+    _ignoreOffer: false,
+    _hangupped: false,
+    _mediaStreamStopped: false,
+    _lastMuteAt: 0,
+    _silentSince: 0,
+    _callQualityText: '',
+    _permDenied: false,
+    _pendingOffer: null
   },
   gcall: {
     active: false,
@@ -29821,10 +31771,10 @@ var state = {
     isMuted: false,
     videoEnabled: false,
     localStream: null,
-    peers: {},            /* peerId -> { pc, stream, name, avatar, verified, audioEl, videoEl, cellEl } */
+    peers: {},
     startedAt: 0,
     timerId: null,
-    incoming: null        /* { groupId, groupName, hostId, hostName, hostAvatar, hostVerified, type } */
+    incoming: null
   },
   lang: 'zh',
   typingUsers: {},
@@ -29861,7 +31811,11 @@ var state = {
   _draftSyncTimer: null, replyPreview: null,
   netDetailsOpen: false,
   netStats: { samples: [], min: 0, max: 0, avg: 0, count: 0, uptime: 0, reconnects: 0 },
-  readOnly: false
+  readOnly: false,
+  dsh: { features: {}, snapshot: null },
+  dshSync: null,
+  groupMeta: {},
+  starTags: {}
 };
 
 window.state = state;
@@ -29869,7 +31823,7 @@ window.state = state;
 try { state.lang = localStorage.getItem('lang') || 'zh'; } catch (e) {}
 if (['zh', 'zh-TW', 'zh-wenyan', 'en'].indexOf(state.lang) === -1) state.lang = 'zh';
 
-/* ★ v0.32.3：强制布局模式（auto / pc / mobile），localStorage 持久化 */
+/* 强制布局模式（auto / pc / mobile），localStorage 持久化 */
 try {
   var _flm = localStorage.getItem('set_forceLayoutMode') || 'auto';
   if (['auto', 'pc', 'mobile'].indexOf(_flm) === -1) _flm = 'auto';
@@ -29919,7 +31873,7 @@ if (!state.chatSoundMap || typeof state.chatSoundMap !== 'object') state.chatSou
 
 var CLIENT_MAX_HISTORY = 500;
 
-var CLIENT_HISTORY_PAGE = 50;
+var CLIENT_HISTORY_PAGE = 30;
 
 function _trimClientHistory(arr) {
   if (!Array.isArray(arr)) return arr;
@@ -30067,21 +32021,30 @@ function promptChatBg(id, type) {
       if (f.size > 3 * 1024 * 1024) { showToast('图片太大（≤ 3MB）'); return; }
       var rd = new FileReader();
       rd.onload = function (ev) {
-        var data = ev.target.result;
-        if (data.length > 1.6e6) {
-          showToast('图片处理后仍然过大，请换一张更小的');
-          return;
-        }
-        state.chatBgMap[key] = data;
-        saveChatBgMap();
-        if (state.currentTarget === id && state.currentType === type) {
-          applyChatBackground();
-        }
-        showToast('✅ 会话背景已设置');
+        /* 压缩到 1280px / 0.7，控制在 400KB 内，避免 localStorage 爆配额 */
+        compressImage(ev.target.result, 1280, 0.68).then(function (data) {
+          /* 400KB 上限，超了降级再压一次 */
+          if (data.length > 400 * 1024) {
+            return compressImage(data, 960, 0.55);
+          }
+          return data;
+        }).then(function (data) {
+          if (!data || data.length > 400 * 1024) {
+            showToast('图片处理后仍然过大（> 400KB），请换一张更小的');
+            return;
+          }
+          state.chatBgMap[key] = data;
+          saveChatBgMap();
+          if (state.currentTarget === id && state.currentType === type) {
+            applyChatBackground();
+          }
+          showToast('✅ 会话背景已设置');
+        }).catch(function () {
+          showToast('❌ 图片处理失败，请换一张');
+        });
       };
       rd.readAsDataURL(f);
-    },
-    { width: '420px', confirmText: '保存' }
+    }, { width: '420px', confirmText: '保存' }
   );
 }
 try { state.keywordAlerts = JSON.parse(localStorage.getItem('keyword_alerts') || '[]'); } catch (e) { state.keywordAlerts = []; }
@@ -31180,6 +33143,91 @@ var I18N = {
     setLanguage: '界面语言',
     langWarning: '除中文外，其它语言翻译并不完善，可能存在部分缺失或语句生硬的情况。',
     setShowMsgPreview: '在侧边栏显示消息预览',
+  /* ======== 新增字典补全 ======== */
+    setBubbleRadius: '消息气泡圆角',
+    setMsgGap: '消息间距',
+    setMsgFontWeight: '消息字体粗细',
+    setMsgFontWeightNormal: '正常',
+    setMsgFontWeightMedium: '中等',
+    setMsgFontWeightBold: '粗体',
+    setMsgAvatarSize: '消息头像大小',
+    setMsgAvatarSizeSmall: '小（28px）',
+    setMsgAvatarSizeMedium: '中（32px）',
+    setMsgAvatarSizeNormal: '标准（38px）',
+    setMsgAvatarSizeLarge: '大（44px）',
+    setMsgBubbleShadow: '消息气泡阴影',
+    setImagePreviewMode: '图片点击预览方式',
+    setImagePreviewModal: '弹窗预览',
+    setImagePreviewNewTab: '新窗口打开',
+    setVideoMute: '视频消息默认静音',
+    setCopyWithSender: '复制消息时包含发送者',
+    setContactTimeFormat: '会话列表时间格式',
+    setContactTimeSmart: '智能（推荐）',
+    setContactTimeRelative: '相对时间',
+    setContactTimeAbsolute: '绝对时间',
+    setContactTimeHidden: '隐藏',
+    setAutoSaveDraft: '输入框自动保存草稿',
+    setMaxInputHeight: '输入框最大高度',
+    setSidebarAvatarSize: '侧边栏头像大小',
+    setSidebarAvatarSizeSmall: '小（32px）',
+    setSidebarAvatarSizeMedium: '中（36px）',
+    setSidebarAvatarSizeNormal: '标准（40px）',
+    setSidebarAvatarSizeLarge: '大（48px）',
+    rpTargetLabel: '专属收款人',
+    rpAll: '-- 所有人可领（拼手气/普通） --',
+    setResetWidth: '重置',
+    setPcSidebarWidthRow: '联系人栏宽度',
+    setPcGspWidthRow: '群聊侧栏宽度',
+    setMotionLevel: '界面动效',
+    setMotionFull: '标准',
+    setMotionReduced: '精简',
+    setMotionOff: '关闭',
+    setForceLayoutMode: '强制布局模式',
+    setLayoutAuto: '自动识别',
+    setLayoutPc: '强制电脑模式',
+    setLayoutMobile: '强制手机模式',
+    setLiquidGlass: '液态玻璃',
+    setLiquidGlassOff: '关闭',
+    setLiquidGlassStandard: '标准',
+    setLiquidGlassEnhanced: '增强（SVG 折射）',
+    setFrostedGlass: '磨砂玻璃',
+    setNotifyPrivacy: '通知隐私模式',
+    setDndAllowMention: '免打扰时仍提醒 @',
+    dndTempRowLabel: '临时免打扰',
+    dnd1h: '1 小时',
+    dnd2h: '2 小时',
+    dndCancel: '取消',
+    setBubbleRadius: '消息气泡圆角',
+    setMsgGap: '消息间距',
+    rpTargetLabel: '专属收款人',
+    rpAll: '-- 所有人可领（拼手气/普通） --',
+    setMsgFontWeight: '消息字体粗细',
+    setMsgFontWeightNormal: '正常',
+    setMsgFontWeightMedium: '中等',
+    setMsgFontWeightBold: '粗体',
+    setMsgAvatarSize: '消息头像大小',
+    setMsgAvatarSizeSmall: '小（28px）',
+    setMsgAvatarSizeMedium: '中（32px）',
+    setMsgAvatarSizeNormal: '标准（38px）',
+    setMsgAvatarSizeLarge: '大（44px）',
+    setMsgBubbleShadow: '消息气泡阴影',
+    setImagePreviewMode: '图片点击预览方式',
+    setImagePreviewModal: '弹窗预览',
+    setImagePreviewNewTab: '新窗口打开',
+    setVideoMute: '视频消息默认静音',
+    setCopyWithSender: '复制消息时包含发送者',
+    setContactTimeFormat: '会话列表时间格式',
+    setContactTimeSmart: '智能（推荐）',
+    setContactTimeRelative: '相对时间',
+    setContactTimeAbsolute: '绝对时间',
+    setContactTimeHidden: '隐藏',
+    setAutoSaveDraft: '输入框自动保存草稿',
+    setMaxInputHeight: '输入框最大高度',
+    setSidebarAvatarSize: '侧边栏头像大小',
+    setSidebarAvatarSizeSmall: '小（32px）',
+    setSidebarAvatarSizeMedium: '中（36px）',
+    setSidebarAvatarSizeNormal: '标准（40px）',
+    setSidebarAvatarSizeLarge: '大（48px）',
     setShowMsgPreviewHint: '（关闭后仅显示"新消息"）',
     setSidebarAnim: '侧边栏悬停动画',
     setSidebarAnimHint: '（关闭可提升低端设备流畅度）',
@@ -31468,7 +33516,7 @@ var I18N = {
       '<li>面板顶部三个按钮：「状态」弹出状态快照、「复制」把全部日志复制到剪贴板、「清空」清空缓冲。</li>' +
       '<li>调试模式通过 localStorage 持久化，刷新后自动恢复。控制台可调用 <code>window.__debugLog(level, tag, msg)</code> 手动写日志。</li>',
 
-    aboutCliConsoleTitle: '🖥️ 命令行控制台（TUI）',
+    aboutCliConsoleTitle: '🖥️ 命令行控制台（TUI · 增强版）',
     aboutCliConsoleIntro: '在服务器命令行窗口输入 <code>ui</code>（或 <code>menu</code> / <code>dashboard</code> / <code>console</code>）打开全屏控制台，零依赖的纯 ANSI 实现。',
     aboutCliConsoleBody:
       '<li><b>顶栏</b>：服务器运行状态（▶ 运行中 / ⏸ 已暂停）。</li>' +
@@ -32221,6 +34269,7 @@ var I18N = {
     searchInputPh: '搜索当前会话的消息…',
     searchCountEmpty: '0/0',
 
+    /* ── 粘贴 i18n-patch.js 中的 zh 段到这里 ── */
     headerNotLogged: '未登录',
     adminBtnShort: '⚙️ 管理',
     logoutBtnShort: '🚪 退出',
@@ -32331,7 +34380,67 @@ var I18N = {
     draftLabel: '草稿',
     toastDraftSaved: '草稿已保存',
     toastNoMoreChats: '没有更多会话',
-    currentChatLabel: '当前会话'
+    currentChatLabel: '当前会话',
+    toastOfflineFlushed: '已补发 {n} 条离线消息',
+    toastGroupAnnounce: '{who} 发布了新群公告',
+    toastMentionAll: '{who} 提到了所有人：{text}',
+    toastCallFull: '通话人数已达上限',
+    toastScreenSharing: '{who} 开始共享屏幕',
+    callNoAnswer: '对方无应答',
+    quotaMeter: '存储配额',
+    syncEnabled: '多端同步',
+    readReceipt: '已读回执',
+    starTags: '收藏标签',
+    groupAnnounce: '群公告',
+    groupTodos: '群待办',
+    mdPreview: 'Markdown 预览',
+    msgEditFailed: '消息编辑失败',
+    toastMusicDeleted: '音乐已删除',
+    toastReadonlyOn: '服务器已进入只读模式',
+    callSettingsTitle: '通话设置',
+    callForceTurn: '强制走中继（TURN）',
+    callForceTurnHint: '開啟後所有通話都經伺服器中繼，跨網段可用但更耗流量',
+    callQualityShow: '显示通话质量',
+    callQualityShowHint: '通话中显示延迟与丢包',
+    callAutoAnswer: '自动接听',
+    callAutoAnswerHint: '收到來電時自動接聽（僅限可信環境）',
+    callDefaultVideo: '默认视频通话',
+    callDefaultVideoHint: '发起通话时默认开启摄像头',
+    callReconnect: '断线重连次数',
+    callRingTimeout: '响铃超时（秒）',
+    callMaxPeers: '群通话人数上限',
+    turnUrl: 'TURN 服务器地址',
+    turnUser: 'TURN 用户名',
+    turnCred: 'TURN 密码',
+    turnConfigured: '已配置中继，支持跨网段',
+    turnNotConfigured: '未配置中继，仅局域网可用',
+    callChat: '通话中发消息',
+    callChatPh: '输入消息…',
+    callSend: '发送',
+    callRecordTitle: '通话记录',
+    callRecordEmpty: '暂无通话记录',
+    callStatsTotal: '总计',
+    callStatsEnded: '已接通',
+    callStatsMissed: '未接',
+    callStatsRejected: '已拒绝',
+    screenShareStart: '共享屏幕',
+    screenShareStop: '停止共享',
+    screenSharing: '正在共享屏幕',
+    groupFiles: '群文件',
+    auditLogTitle: '审计日志',
+    auditRefresh: '刷新'
+  ,
+    editHistoryTitle: '编辑记录',
+    jumpToOrigin: '跳到原消息',
+    noEditHistory: '该消息没有编辑记录',
+    scheduleSend: '定时发送',
+    scheduleSendTime: '发送时间',
+    scheduleSendContent: '消息内容',
+    scheduleSendEmpty: '暂无定时消息',
+    scheduleSendOk: '已添加到定时发送',
+    scheduleSendFuture: '请选择未来的时间',
+    scheduleCancel: '取消',
+    msgHighlight: '已定位到原消息'
   },
   en: {
     appTitle: 'WeChat · LAN',
@@ -32585,6 +34694,91 @@ var I18N = {
     setLanguage: 'Language',
     langWarning: 'Translations for languages other than Chinese are incomplete and may contain missing or awkward phrasing.',
     setShowMsgPreview: 'Show message previews in sidebar',
+    setBubbleRadius: 'Bubble radius',
+    /* ======== 新增字典补全 ======== */
+    setBubbleRadius: 'Bubble radius',
+    setMsgGap: 'Message gap',
+    setMsgFontWeight: 'Message font weight',
+    setMsgFontWeightNormal: 'Normal',
+    setMsgFontWeightMedium: 'Medium',
+    setMsgFontWeightBold: 'Bold',
+    setMsgAvatarSize: 'Message avatar size',
+    setMsgAvatarSizeSmall: 'Small (28px)',
+    setMsgAvatarSizeMedium: 'Medium (32px)',
+    setMsgAvatarSizeNormal: 'Normal (38px)',
+    setMsgAvatarSizeLarge: 'Large (44px)',
+    setMsgBubbleShadow: 'Bubble shadow',
+    setImagePreviewMode: 'Image preview mode',
+    setImagePreviewModal: 'Modal',
+    setImagePreviewNewTab: 'New tab',
+    setVideoMute: 'Mute video by default',
+    setCopyWithSender: 'Include sender when copying',
+    setContactTimeFormat: 'Chat list time format',
+    setContactTimeSmart: 'Smart',
+    setContactTimeRelative: 'Relative',
+    setContactTimeAbsolute: 'Absolute',
+    setContactTimeHidden: 'Hidden',
+    setAutoSaveDraft: 'Auto-save drafts',
+    setMaxInputHeight: 'Max input height',
+    setSidebarAvatarSize: 'Sidebar avatar size',
+    setSidebarAvatarSizeSmall: 'Small (32px)',
+    setSidebarAvatarSizeMedium: 'Medium (36px)',
+    setSidebarAvatarSizeNormal: 'Normal (40px)',
+    setSidebarAvatarSizeLarge: 'Large (48px)',
+    rpTargetLabel: 'Recipient',
+    rpAll: '-- Everyone --',
+    setResetWidth: 'Reset',
+    setPcSidebarWidthRow: 'Sidebar width',
+    setPcGspWidthRow: 'Group panel width',
+    setMotionLevel: 'Motion',
+    setMotionFull: 'Standard',
+    setMotionReduced: 'Reduced',
+    setMotionOff: 'Off',
+    setForceLayoutMode: 'Force layout',
+    setLayoutAuto: 'Auto',
+    setLayoutPc: 'Force desktop',
+    setLayoutMobile: 'Force mobile',
+    setLiquidGlass: 'Liquid Glass',
+    setLiquidGlassOff: 'Off',
+    setLiquidGlassStandard: 'Standard',
+    setLiquidGlassEnhanced: 'Enhanced',
+    setFrostedGlass: 'Frosted Glass',
+    setNotifyPrivacy: 'Notification privacy',
+    setDndAllowMention: 'Notify on @ even when DND',
+    dndTempRowLabel: 'Temp DND',
+    dnd1h: '1 hour',
+    dnd2h: '2 hours',
+    dndCancel: 'Cancel',
+    setMsgGap: 'Message gap',
+    rpTargetLabel: 'Recipient',
+    rpAll: '-- Everyone (Lucky/Standard) --',
+    setMsgFontWeight: 'Message font weight',
+    setMsgFontWeightNormal: 'Normal',
+    setMsgFontWeightMedium: 'Medium',
+    setMsgFontWeightBold: 'Bold',
+    setMsgAvatarSize: 'Message avatar size',
+    setMsgAvatarSizeSmall: 'Small (28px)',
+    setMsgAvatarSizeMedium: 'Medium (32px)',
+    setMsgAvatarSizeNormal: 'Normal (38px)',
+    setMsgAvatarSizeLarge: 'Large (44px)',
+    setMsgBubbleShadow: 'Bubble shadow',
+    setImagePreviewMode: 'Image preview mode',
+    setImagePreviewModal: 'Modal',
+    setImagePreviewNewTab: 'New tab',
+    setVideoMute: 'Mute video by default',
+    setCopyWithSender: 'Include sender when copying',
+    setContactTimeFormat: 'Chat list time format',
+    setContactTimeSmart: 'Smart (recommended)',
+    setContactTimeRelative: 'Relative',
+    setContactTimeAbsolute: 'Absolute',
+    setContactTimeHidden: 'Hidden',
+    setAutoSaveDraft: 'Auto-save drafts',
+    setMaxInputHeight: 'Max input height',
+    setSidebarAvatarSize: 'Sidebar avatar size',
+    setSidebarAvatarSizeSmall: 'Small (32px)',
+    setSidebarAvatarSizeMedium: 'Medium (36px)',
+    setSidebarAvatarSizeNormal: 'Normal (40px)',
+    setSidebarAvatarSizeLarge: 'Large (48px)',
     setShowMsgPreviewHint: '(when off, shows "New message" only)',
     setSidebarAnim: 'Sidebar hover animations',
     setSidebarAnimHint: '(disable for better performance on low-end devices)',
@@ -33729,7 +35923,72 @@ var I18N = {
     draftLabel: 'Draft',
     toastDraftSaved: 'Draft saved',
     toastNoMoreChats: 'No more chats',
-    currentChatLabel: 'Current chat'
+    currentChatLabel: 'Current chat',
+    toastOfflineFlushed: '{n} offline messages delivered',
+    toastGroupAnnounce: '{who} posted a new announcement',
+    toastMentionAll: '{who} mentioned everyone: {text}',
+    toastCallFull: 'Call is full',
+    toastScreenSharing: '{who} started screen sharing',
+    callNoAnswer: 'No answer',
+    quotaMeter: 'Storage quota',
+    syncEnabled: 'Multi-device sync',
+    readReceipt: 'Read receipts',
+    starTags: 'Star tags',
+    groupAnnounce: 'Announcements',
+    groupTodos: 'Group todos',
+    mdPreview: 'Markdown preview',
+    msgEditFailed: 'Failed to edit message',
+    toastMusicDeleted: 'Music deleted',
+    toastReadonlyOn: 'Server entered read-only mode',
+langWarningEn: 'Switching to English may leave some labels untranslated',
+    devicesLabel: 'Devices',
+    devicesBtn: 'Manage devices',
+    rpgSysTag: 'System',
+    rpgSysTagTitle: 'System account',
+    callSettingsTitle: 'Call settings',
+    callForceTurn: 'Force relay (TURN)',
+    callForceTurnHint: '開啟後所有通話都經伺服器中繼，跨網段可用但更耗流量',
+    callQualityShow: 'Show call quality',
+    callQualityShowHint: 'Display latency and packet loss during calls',
+    callAutoAnswer: 'Auto answer',
+    callAutoAnswerHint: '收到來電時自動接聽（僅限可信環境）',
+    callDefaultVideo: 'Video call by default',
+    callDefaultVideoHint: 'Enable camera when starting a call',
+    callReconnect: 'Reconnect attempts',
+    callRingTimeout: 'Ring timeout (seconds)',
+    callMaxPeers: 'Max group call participants',
+    turnUrl: 'TURN server URL',
+    turnUser: 'TURN username',
+    turnCred: 'TURN password',
+    turnConfigured: 'Relay configured, cross-network calls supported',
+    turnNotConfigured: 'No relay configured, LAN only',
+    callChat: 'Send message during call',
+    callChatPh: 'Type a message…',
+    callSend: 'Send',
+    callRecordTitle: 'Call history',
+    callRecordEmpty: 'No call records',
+    callStatsTotal: 'Total',
+    callStatsEnded: 'Connected',
+    callStatsMissed: 'Missed',
+    callStatsRejected: 'Rejected',
+    screenShareStart: 'Share screen',
+    screenShareStop: 'Stop sharing',
+    screenSharing: 'Sharing screen',
+    groupFiles: 'Group files',
+    auditLogTitle: 'Audit log',
+    auditRefresh: 'Refresh'
+  ,
+    editHistoryTitle: 'Edit history',
+    jumpToOrigin: 'Jump to original',
+    noEditHistory: 'No edit history',
+    scheduleSend: 'Schedule send',
+    scheduleSendTime: 'Send at',
+    scheduleSendContent: 'Message',
+    scheduleSendEmpty: 'No scheduled messages',
+    scheduleSendOk: 'Added to schedule',
+    scheduleSendFuture: 'Pick a future time',
+    scheduleCancel: 'Cancel',
+    msgHighlight: 'Jumped to original'
   },
 
   'zh-TW': {
@@ -33964,6 +36223,87 @@ var I18N = {
     setLanguage: '介面語言',
     langWarning: '除中文外，其它語言翻譯並不完善，可能存在部分缺失或語句生硬的情況。',
     setShowMsgPreview: '在側邊欄顯示訊息預覽',
+    /* ======== 新增字典补全 ======== */
+    setBubbleRadius: '訊息氣泡圓角',
+    setMsgGap: '訊息間距',
+    setMsgFontWeight: '訊息字體粗細',
+    setMsgFontWeightNormal: '正常',
+    setMsgFontWeightMedium: '中等',
+    setMsgFontWeightBold: '粗體',
+    setMsgAvatarSize: '訊息頭像大小',
+    setMsgAvatarSizeSmall: '小（28px）',
+    setMsgAvatarSizeMedium: '中（32px）',
+    setMsgAvatarSizeNormal: '標準（38px）',
+    setMsgAvatarSizeLarge: '大（44px）',
+    setMsgBubbleShadow: '訊息氣泡陰影',
+    setImagePreviewMode: '圖片點擊預覽方式',
+    setImagePreviewModal: '彈窗預覽',
+    setImagePreviewNewTab: '新視窗打開',
+    setVideoMute: '視頻訊息默認靜音',
+    setCopyWithSender: '複製訊息時包含發送者',
+    setContactTimeFormat: '會話列表時間格式',
+    setContactTimeSmart: '智能（推薦）',
+    setContactTimeRelative: '相對時間',
+    setContactTimeAbsolute: '絕對時間',
+    setContactTimeHidden: '隱藏',
+    setAutoSaveDraft: '輸入框自動保存草稿',
+    setMaxInputHeight: '輸入框最大高度',
+    setSidebarAvatarSize: '側邊欄頭像大小',
+    setSidebarAvatarSizeSmall: '小（32px）',
+    setSidebarAvatarSizeMedium: '中（36px）',
+    setSidebarAvatarSizeNormal: '標準（40px）',
+    setSidebarAvatarSizeLarge: '大（48px）',
+    rpTargetLabel: '專屬收款人',
+    rpAll: '-- 所有人可領（拼手氣/普通） --',
+    setResetWidth: '重置',
+    setPcSidebarWidthRow: '聯絡人欄寬度',
+    setPcGspWidthRow: '群聊側欄寬度',
+    setMotionLevel: '介面動效',
+    setMotionFull: '標準',
+    setMotionReduced: '精簡',
+    setMotionOff: '關閉',
+    setForceLayoutMode: '強制佈局模式',
+    setLayoutAuto: '自動識別',
+    setLayoutPc: '強制電腦模式',
+    setLayoutMobile: '強制手機模式',
+    setLiquidGlass: '液態玻璃',
+    setLiquidGlassOff: '關閉',
+    setLiquidGlassStandard: '標準',
+    setLiquidGlassEnhanced: '增強（SVG 折射）',
+    setFrostedGlass: '磨砂玻璃',
+    setNotifyPrivacy: '通知隱私模式',
+    setDndAllowMention: '勿擾時仍提醒 @',
+    dndTempRowLabel: '臨時勿擾',
+    dnd1h: '1 小時',
+    dnd2h: '2 小時',
+    dndCancel: '取消',
+    setBubbleRadius: '訊息氣泡圓角',
+    setMsgGap: '訊息間距',
+    rpTargetLabel: '專屬收款人',
+    rpAll: '-- 所有人可領（拼手氣/普通） --',
+    setMsgFontWeight: '訊息字體粗細',
+    setMsgFontWeightNormal: '正常',
+    setMsgFontWeightMedium: '中等',
+    setMsgFontWeightBold: '粗體',
+    setMsgAvatarSize: '訊息頭像大小',
+    setMsgAvatarSizeSmall: '小（28px）',
+    setMsgAvatarSizeMedium: '中（32px）',
+    setMsgAvatarSizeNormal: '標準（38px）',
+    setMsgAvatarSizeLarge: '大（44px）',
+    setMsgBubbleShadow: '訊息氣泡陰影',
+    setImagePreviewMode: '圖片點擊預覽方式',
+    setImagePreviewModal: '彈窗預覽',
+    setImagePreviewNewTab: '新視窗打開',
+    setVideoMute: '視頻訊息默認靜音',
+    setCopyWithSender: '複製訊息時包含發送者',
+    setContactTimeFormat: '會話列表時間格式',
+    setContactTimeSmart: '智能（推薦）',
+    setContactTimeRelative: '相對時間',
+    setContactTimeAbsolute: '絕對時間',
+    setContactTimeHidden: '隱藏',
+    setAutoSaveDraft: '輸入框自動保存草稿',
+    setMaxInputHeight: '輸入框最大高度',
+    setSidebarAvatarSize: '側邊欄頭像大小',
     setShowMsgPreviewHint: '（關閉後僅顯示「新訊息」）',
     setSidebarAnim: '側邊欄懸停動畫',
     setSidebarAnimHint: '（關閉可提升低端裝置流暢度）',
@@ -34355,7 +36695,907 @@ var I18N = {
     moodStudying: '學習',
     moodMusic: '聽歌',
     moodEating: '吃飯',
-    moodSleeping: '睡覺'
+    moodSleeping: '睡覺',
+settingsNavVideo: '看視頻',
+    setShowInteraction: '顯示互動標識',
+    setTimeShowSeconds: '訊息時間精確到秒',
+    setClearSendHistory: '傳送后清空輸入历史',
+    setBiliQuality: '預設清晰度',
+    setBiliDanmaku: '預設開启弹幕',
+    setBiliAutoplay: '自動播放',
+    loginSecTls: '🔒 传输已加密（TLS / WSS）',
+    loginSecLocal: '🔒 本機访問（localhost）',
+    loginSecNone: '⚠️ 未加密传输（HTTP）—— 密碼已本地哈希，建議启用 HTTPS',
+    setupTitle: '🔐 首次登入安全設置',
+    setupDesc: '为保障帳號安全，請設置登入密碼与密保問題。密碼用於下次登入，密保用於遗忘密碼時自助找回。',
+    setupAccountLabel: '帳號',
+    setupPasswordPh: '設置密碼（至少 6 位）',
+    setupSecurityQPh: '密保問題（如：我的生日？）',
+    setupSecurityAPh: '密保答案（用於找回密碼）',
+    setupSubmit: '完成設置并登入',
+    setupDone: '✅ 安全設置已完成，正在登入…',
+    loginPasswordRemembered: '🔐 此裝置已记住登入，可留空',
+    langWarningEn: 'Translations for languages other than Chinese may be incomplete.',
+    spacePosted: '{name} 發布了新動态',
+    colorWechatGreen: '微信绿',
+    colorBlue: '蓝色',
+    colorPurple: '紫色',
+    colorPink: '玫红',
+    colorOrange: '橙色',
+    colorTeal: '青色',
+    colorNavy: '藏青',
+    colorSlate: '灰蓝',
+    toastAccentApplied: '主題色已应用',
+    devicesLabel: '登入裝置管理',
+    devicesBtn: '查看 / 管理',
+    storageCountMsg: '{n} 條',
+    storageCountImg: '{n} 张',
+    storageCountVid: '{n} 个',
+    storageCountVoi: '{n} 條',
+    storageCountFil: '{n} 个',
+    storageCleanChats: '清空聊天记錄',
+    storageCleanMedia: '清理媒體數據',
+    storageCleanStarred: '清理收藏',
+    storageCleanDrafts: '清理草稿',
+    storageCleanStickers: '清理表情包',
+    storageCleanAll: '一鍵清理全部',
+    storageCleanConfirm: '確定要清理吗？此操作不可撤销。',
+    storageCleanMediaConfirm: '將清除所有圖片 / 視頻 / 語音 / 檔案的原始數據（訊息文本与元數據保留），確定吗？',
+    storageCleaned: '✅ 已清理',
+    storageEmpty: '暫無數據占用',
+    storageUnitCount: '項',
+    ttGroupPanel: '群信息面板',
+    gspFiles: '群檔案',
+    gspAlbum: '群相冊',
+    gspVote: '群投票',
+    gspManage: '群管理',
+    gspMembers: '群成員',
+    gspAnnounce: '群公告',
+    gspNoAnnounce: '暫無群公告',
+    gspMemberCount: '{n} 位成員',
+    gspOwner: '群主',
+    gspCollapse: '收起面板',
+    sendKeyEnter: 'Enter 傳送',
+    sendKeyCtrl: 'Ctrl+Enter 傳送',
+    voiceDuration30: '30 秒',
+    voiceDuration60: '60 秒',
+    voiceDuration120: '2 分鐘',
+    voiceDuration300: '5 分鐘',
+    setVoiceSpeed1x: '1x',
+    setVoiceSpeed15x: '1.5x',
+    setVoiceSpeed2x: '2x',
+    toastGroupMenuHint: '点击開啟選單，雙击進入聊天',
+    verifyLabel: '官方認證',
+    verifySetBtn: '✓ 認證',
+    verifyClearBtn: '取消認證',
+    verifyInputPh: '認證文本（如：微信·局域网 官方）',
+    verifyPresetTitle: '预設：',
+    verifyPreset1: '微信·局域网 官方',
+    verifyPreset2: '官方認證',
+    verifyPreset3: '管理員認證',
+    verifyPreset4: '企业認證',
+    verifyPreset5: '优质使用者',
+    verifyPreset6: '超级管理員',
+    toastVerified: '✅ 已認證',
+    toastUnverified: '已取消認證',
+    toastVerifyTextEmpty: '請輸入認證文本',
+    verifySectionTitle: '🔵 已認證使用者',
+    mentionYouTag: '有人@你',
+    popupMentionBadge: '@了你',
+    recallOtherMsgBy: '撤回了',
+    msgRejected: '訊息已傳送，但被對方拒收了。',
+    msgRejectedSelf: '你已拉黑對方，訊息未能送达。',
+    msgRejectedTitle: '訊息被拒收',
+    msgBlockedUser: '已拉黑',
+    msgBlockUser: '🚫 拉黑',
+    msgUnblockUser: '🚫 取消拉黑',
+    btnBan: '封禁',
+    btnUnban: '解封',
+    adminBanBadge: '已封禁',
+    profileBanned: '该帳號已被封禁',
+    confirmBan: '確認封禁 ',
+    confirmUnban: '確認解除 ',
+    confirmBanSuffix: ' 的封禁？',
+    confirmBlock: '確定拉黑该使用者吗？拉黑后將不再收到對方的訊息。',
+    confirmUnblock: '確定取消拉黑吗？',
+    toastBlocked: '🚫 已拉黑该使用者',
+    toastUnblocked: '已取消拉黑',
+    ttRedpacket: '發红包',
+    blockOnlyPrivate: '仅支持在私聊中拉黑',
+    rpgCreating: '红包正在创建，請稍候…',
+    rpgReconnecting: '正在重连，請稍后再試',
+    musicNoMatch: '没有匹配的歌曲',
+    musicDeleted: '已刪除',
+    musicTooLarge: '單曲不能超過 {n}MB',
+    musicPickAudio: '請選擇音頻檔案',
+    musicOnlyAudio: '仅支持音頻檔案',
+    musicUploadFail: '上传失敗',
+    aboutBtn: 'ℹ️ 關於',
+    ttAbout: '關於与使用教程',
+    aboutTitle: 'ℹ️ 關於本应用',
+    changelogTitle: '📋 更新日誌',
+    changelogBtnTitle: '查看更新日誌',
+    changelogEmpty: '暫無更新记錄',
+    changelogNonChinese: '請切換到中文查看更新日誌，并交给翻譯软件翻譯內容。',
+    changelogMeta: '共 <b>{total}</b> 个版本 · 从 v{from} 到 v{to} · 最新更新 {date}',
+    changelogSecAdded: '新增',
+    changelogSecChanged: '变更',
+    changelogSecFixed: '修復',
+    changelogSecSecurity: '安全',
+    changelogLatest: '最新',
+    changelogShowOlder: '顯示更早版本',
+    changelogHideOlder: '收起更早版本',
+    updateBannerText: '服务器已重启，請重新整理頁面以应用最新功能与修復',
+    updateBannerBtn: '立即重新整理',
+    updateBannerClose: '關閉提示',
+    aboutTagline: '局域网即時通讯演示',
+    aboutDesc: '基於 Node.js + Socket.IO + WebRTC 构建的局域网聊天工具。支持私聊、群聊、語音/視頻通話、空間動态、红包、錢包、檔案传输、音樂分享、多裝置登入、設置云同步、反饋中心、下載中心、官网頁面等功能。所有數據儲存在服务端本地 files 目錄，不依赖任何公网服务，完全離線运行。',
+    aboutTabBasic: '📖 基础',
+    aboutTabGroup: '👥 群聊',
+    aboutTabAdvanced: '🚀 進阶',
+    aboutTabShortcuts: '⌨️ 快捷鍵',
+    aboutTabPrivacy: '🔒 隱私',
+    aboutOurLabel: '🌐 官网',
+    aboutOurOpen: '開啟',
+    aboutOurCopy: '復制链接',
+    aboutOnlineLabel: '📖 線上關於',
+    aboutOnlineOpen: '開啟',
+    aboutOnlineCopy: '復制链接',
+    aboutPrivacyLabel: '🔒 隱私政策',
+    aboutPrivacyOpen: '開啟',
+    aboutPrivacyCopy: '復制链接',
+    aboutSysAccountsTitle: '👥 系統内置帳號',
+    aboutNetStatusTitle: '📡 網路状态',
+    aboutDebugModeTitle: '🔍 详細调試模式',
+    aboutCliConsoleTitle: '🖥️ 命令行控制臺（TUI · 增强版）',
+    aboutCliConsoleIntro: '在服务器命令行窗口輸入 <code>ui</code>（或 <code>menu</code> / <code>dashboard</code> / <code>console</code>）開啟全屏控制臺，零依赖的纯 ANSI 实現。',
+    aboutWebTermTitle: '🖥️ Web 终端（浏览器访問）',
+    aboutWebTermIntro: '浏览器開啟 <a href="#" class="about-inline-link" data-about-root>https://&lt;本機IP&gt;/root</a>，輸入访問碼后即可執行与服务器命令行完全一致的所有命令。',
+    aboutServerPauseTitle: '⏸️ 服务器暫停 / 還原',
+    aboutTimedBanTitle: '⏱ 限時封禁',
+    aboutAccountBanTitle: '🚫 帳號封禁',
+    aboutWebTermSecTitle: '🖥️ Web 终端安全',
+    presenceListening: '🎵 聽歌中',
+    presenceGaming: '🎮 游戏中',
+    presenceWorking: '💼 工作中',
+    presenceStudying: '📚 学習中',
+    presenceEating: '🍜 干饭中',
+    presenceSleeping: '😴 睡覺中',
+    presenceListeningShort: '聽歌',
+    presenceGamingShort: '游戏',
+    presenceWorkingShort: '工作',
+    presenceStudyingShort: '学習',
+    presenceEatingShort: '干饭',
+    presenceSleepingShort: '睡覺',
+    rpgConnecting: '正在連線服务器…',
+    rpgLoading: '載入中…',
+    rpgNoOneYet: '还没有人领取',
+    rpgExpired: '该红包已過期',
+    rpgYourOwn: '也可以抢一下自己的红包',
+    rpgEmpty: '来晚了，红包已被抢完',
+    rpgSysTag: '【红包】',
+    rpgSysTagTitle: '查看该红包',
+    roleAdminLabel: '管理員',
+    callOffline: '對方不線上',
+    callFailed: '呼叫失敗',
+    callPickContact: '請先選擇联系人',
+    callOnlyPrivate: '仅支持与好友私聊通話',
+    callMicDenied: '無法访問麦克风',
+    callCameraDenied: '無法访問攝影機',
+    callUnsupported: '当前浏览器不支持通話',
+    gcUserCount: '{n} 人',
+    errEnterAmount: '請輸入有效金額',
+    errInsufficientBalance: '余額不足',
+    errAmountLessThanCount: '金額需 ≥ 份數（每份至少 ¥0.01）',
+    errInvalidAmount: '金額無效',
+    errSelectUser: '請選擇轉賬對象',
+    transferDonePrefix: '✅ 已向 ',
+    transferDoneMid: ' 轉賬 ¥',
+    transferReceivedPrefix: '💰 ',
+    transferReceivedMid: ' 向你轉賬 ¥',
+    rpgGotAmountPrefix: '🧧 抢到 ¥',
+    rpgGotAmountSuffix: '！',
+    rpgAlreadyAmountPrefix: '你已领取過 ¥',
+    rpgSysTemplate: '"{grabber}"收了"{from}"的红包，领取了 ¥{amount}',
+    adminSetNonNegative: '金額須为非负數字',
+    adminApplying: '正在应用…',
+    adminSettingPrefix: '正在設置 ',
+    adminAdjustingPrefix: '正在调整 ',
+    adminCurrentBalance: '当前余額：',
+    adminBalanceLabel: ' 余額：',
+    adminBalanceSetMid: ' 余額已設为 ',
+    adminBatchDonePrefix: '✅ 已为 ',
+    adminBatchDoneMid: ' 位使用者設置余額 → ',
+    adminBatchConfirmPrefix: '確認把 ',
+    adminBatchConfirmMid: ' 位線上使用者的余額統一設置为 ¥',
+    adminBatchConfirmSuffix: '？',
+    recTransferOut: '轉賬给 {name}{note}',
+    recTransferIn: '收到来自 {name} 的轉賬{note}',
+    recRedpacketSend: '發红包 · {greeting}',
+    recRedpacketGrab: '抢红包 · {from}',
+    recAdminAdd: '管理員充值 · {by}',
+    recAdminSub: '管理員扣款 · {by}',
+    recAdminBatchAdd: '管理員批量充值 · {by}',
+    recAdminBatchSub: '管理員批量扣款 · {by}',
+    recCmdSet: '命令行调整',
+    recCmdAdd: '命令行充值',
+    recCmdSub: '命令行扣款',
+    recCmdBatch: '命令行全員调整',
+    bannerUserOnline: '👤 {name} 上線了',
+    bannerUserOffline: '👤 {name} 離線了',
+    bannerGroupCreated: '群聊 "{name}" 已创建',
+    bannerGroupName: '群聊',
+    toastChatClosed: '已退出当前会話',
+    toastNoUnread: '没有未讀訊息',
+    toastJumpedTo: '已跳轉到 ',
+    toastMentioned: '已提及 ',
+    groupMembersCount: '{n} 人',
+    groupMembersCountEn: '{n} members',
+    msgEditTitle: '编輯',
+    spaceNoBio: '这个人很懒，什么都没寫~',
+    spaceStatPosts: '動态',
+    spaceStatLikes: '获赞',
+    spaceStatVisitors: '访客',
+    spacePostPlaceholder: '这一刻的想法…',
+    spaceImageTooLarge: '圖片太大',
+    spaceVisitorLabel: '访客记錄',
+    spaceVisitorEmpty2: '还没有访客～',
+    spaceFeedEmpty2: '广場还没有動态～',
+    spaceUserEmpty2: '还没有動态～',
+    forwardNoChats: '暫無可轉發会話',
+    forwardSelectHint: '選擇轉發目標',
+    forwardPreview: '轉發內容',
+    exportChatLabel: '会話',
+    exportTime: '匯出時間',
+    exportChat: '匯出当前会話',
+    exportNoMsgs: '会話为空',
+    adminInvalidAmount: '請輸入有效金額（元）',
+    adminMaxAmount: '金額上限 ¥1000000',
+    adminUserLabel: '使用者',
+    adminBalanceShort: '余額：',
+    qqFileNoFile: '暫無檔案',
+    qqAlbumNoPhoto: '暫無照片',
+    qqVoteNoVote: '暫無投票',
+    qqVoteQuestionReq: '請輸入投票問題',
+    qqVoteMinOptionsReq: '至少需要 2 个選項',
+    qqVoteCreatingMsg: '投票创建中...',
+    qqUploadingMsg: '上传中...',
+    qqFileHint2: '支持任意类型檔案，單檔案不超過服务端上限',
+    qqAlbumHint2: '仅支持圖片檔案，超過 1280px 自動压缩',
+    qqFilePickTip: '請選擇檔案',
+    qqImagePickTip: '請選擇圖片',
+    qqImageOnlyTip: '請上传圖片',
+    qqFileTooLargePrefix: '檔案太大（上限 ',
+    qqFileTooLargeSuffix: 'MB）',
+    qqFileTotalPre: '共 ',
+    qqFileTotalSuf: ' 个檔案',
+    qqAlbumTotalPre: '共 ',
+    qqAlbumTotalSuf: ' 张照片',
+    qqVoteCreatorPre: ' (创建者: ',
+    qqVoteCreatorSuf: ')',
+    qqVoteDone: '✔ 您已投票',
+    groupManageTitleTpl: '群管理',
+    groupManageTitlePrefix: '群管理',
+    groupNoInvitable2: '無其他可邀請的線上使用者',
+    groupNoOnlineUsers2: '暫無其他線上使用者',
+    sessionRestored: '已還原上次的聊天记錄与身份',
+    nicknameClickProfile: '查看名片',
+    nicknameClickProfileEn: 'View profile',
+    browserBack: '返回',
+    browserRefresh: '重新整理',
+    browserGo: '開啟',
+    browserExternal: '在新標籤頁開啟',
+    browserClose: '退出',
+    browserUrlPh: '輸入网址或搜尋…',
+    browserLoading: '載入中…',
+    browserBlocked: '该网站禁止在窗口内顯示，請点击下方按鈕在新標籤頁中開啟。',
+    browserOpenNewTab: '在新標籤頁開啟',
+    profileCardLabel: '个人名片',
+    profileEditTitle: '✏️ 编輯名片',
+    profileSave: '儲存',
+    profileSignature: '个性籤名',
+    profileSignaturePh: '介绍一下你自己…',
+    profileGender: '性別',
+    profileGenderHidden: '保密',
+    profileGenderMale: '♂ 男',
+    profileGenderFemale: '♀ 女',
+    profileGenderOther: '⚧ 其他',
+    profileBirthday: '生日',
+    profileZodiac: '星座',
+    profileLocation: '所在地',
+    profileLocationPh: '如：北京',
+    regionProvincePlaceholder: '省份',
+    regionCityPlaceholder: '城市 / 地区',
+    regionProvinceTip: '選擇省份',
+    regionCityTip: '選擇城市 / 地区',
+    profileWebsite: '个人主頁',
+    profileWebsitePh: 'https://...',
+    profileIdLabel: '使用者 ID',
+    profileCopyId: '復制',
+    profileNoSignature: '这个人很懒，什么都没寫~',
+    profileCreatedAt: '註冊時間',
+    profileLastActive: '最后活躍',
+    profileUploadAvatar: '更換头像',
+    profileClearAvatar: '清除',
+    profileSendMsg: '發訊息',
+    profileMood: '心 情',
+    profileMoodPh: '自 定 心 情…',
+    profilePersonality: '性格（MBTI）',
+    profilePersonalityPh: '自定義或留空（如：INTJ）',
+    profileCopyCard: '復制名片',
+    toastProfileSaved: '✅ 名片已儲存',
+    toastAvatarTooLarge: '头像太大（≤ 2MB）',
+    recallOtherMsgSuffix: '的訊息',
+    setShortcuts: '快捷鍵帮助',
+    closeBtn: '關閉',
+    forwardedLabel: '轉發的訊息',
+    msgPin: '置頂',
+    msgSpeak: '朗讀',
+    msgCopy: '復制',
+    toastCopyFail: '復制失敗',
+    toastRecalled: '已撤回',
+    toastDeleted: '已刪除',
+    disabledInput: '對方離線，訊息可能不会立刻送达',
+    draftHint: '草稿',
+    toastSending: '正在傳送，請稍后',
+    toastPickContact: '請先選擇联系人',
+    toastMutedByGroup: '您已被禁言',
+    toastAllMuted: '全員禁言中',
+    toastRecallOnlySelf: '只能撤回自己的訊息',
+    toastRecallTimeout: '超過 2 分鐘，無法撤回',
+    toastQuoted: '已引用訊息',
+    toastFileTooLarge50: '檔案太大（上限 50MB）',
+    toastFileTooLarge20: '檔案太大（上限 20MB）',
+    toastFileReadFail: '讀取檔案失敗',
+    toastFilePick: '請選擇檔案',
+    toastStickerTooLarge: '表情包請小於 600KB',
+    toastStickerUpdated: '表情包已更新',
+    toastVoiceNotSupported: '浏览器不支持錄音',
+    toastVoiceFormatFail: '浏览器不支持錄音格式',
+    toastVoiceCanceled: '已取消錄音',
+    toastVoiceTooShort: '錄音太短（至少 1 秒）',
+    toastMicDenied: '無法访問麦克风',
+    toastVoiceSent: '語音已傳送',
+    toastVoiceAutoplayBlocked: '浏览器阻止了自動播放，請再点一次',
+    toastVoicePlayFail: '語音播放失敗',
+    toastVoiceMaxReached: '已达最長時長，自動傳送',
+    toastGroupNameRequired: '請輸入群名稱',
+    toastInviteSelect: '請選擇要邀請的使用者',
+    toastInvited: '邀請已傳送',
+    toastGroupRenamed: '群名稱已更新',
+    toastAnnounceUpdated: '群公告已更新',
+    toastGroupOnly: '仅在群聊中使用',
+    toastNotAdmin: '您不是管理員',
+    toastUserOffline: '使用者不線上',
+    toastLevelRange: '等级須 1-1000',
+    dailySigninLabel: '每日籤到',
+    signinBtnTitle: '每日籤到 +10 經驗（已籤到后点击查看日历）',
+    signinCalendarTitle: '📅 籤到日历',
+    signinCalendarBtnTitle: '籤到日历',
+    toastAnnounceRequired: '請輸入公告內容',
+    toastImagePick: '請選擇圖片',
+    toastImageOnly: '請上传圖片',
+    toastVoteQuestion: '請輸入投票問題',
+    toastVoteMinOptions: '至少需要 2 个選項',
+    toastVoteCreating: '投票创建中...',
+    toastPinned: '已置頂',
+    toastUnpinned: '已取消置頂',
+    toastClearedLocal: '已清空本地记錄',
+    toastMutedChat: '已靜音该会話',
+    toastUnmutedChat: '已取消靜音',
+    toastForwarded: '已轉發',
+    toastBulkEnter: '已進入批量模式，点击訊息選擇',
+    toastBulkPick: '請先選擇訊息',
+    toastBulkDeleted: '已刪除',
+    toastMsgNotFound: '原訊息不在当前视圖',
+    toastDownloadFail: '下載失敗',
+    toastNotifyUnsupported: '当前浏览器不支持桌面通知',
+    toastNotifyDenied: '通知權限已被拒绝，請到浏览器設置中開启',
+    toastNotifyOn: '桌面通知已開启',
+    toastNotifyOff: '桌面通知已關閉',
+    toastTTSUnsupported: '浏览器不支持朗讀',
+    toastTTSReading: '正在朗讀...',
+    toastTTSFail: '朗讀失敗',
+    toastSelectChat: '請先選擇会話',
+    toastChatEmpty: '会話为空',
+    toastExported: '已匯出',
+    qrTitle: '⚡ 快捷回復',
+    qrAdd: '＋ 新增',
+    qrPrompt: '輸入快捷回復內容（最多 200 字）：',
+    qrEmpty: '暫無快捷回復，点击「＋ 新增」添加',
+    qrDuplicated: '已存在相同內容',
+    qrLimit: '最多 30 條',
+    sysOffline: '⚠️ 對方不線上，訊息已儲存但暫未送达',
+    sysNotExist: '⚠️ 對方不存在',
+    confirmLeaveGroup: '確定退出群聊吗？',
+    confirmDeleteSticker: '刪除这个表情包？',
+    confirmClearStarred: '確認清空全部收藏吗？此操作不可撤销。',
+    confirmLogout: '確定退出吗？',
+    confirmKick: '確認踢出 ',
+    confirmRemoveMember: '確認移除 ',
+    loginErrIO: '❌ Socket.IO 未載入，請检查網路/CDN',
+    loginErrInit: '❌ 無法初始化連線：',
+    loginErrConnect: '⚠️ 無法連線服务端: ',
+    loginFailed: '登入失敗',
+    loginTimeout: '⏱️ 登入超時，請確認服务端已启動并可访問',
+    groupJoinedSuffix: ' 加入了群聊',
+    groupLeftSuffix: ' 離開了群聊',
+    globalAnnouncePrefix: '📢 全局公告：',
+    toastRefreshOk: '已重新整理',
+    uiGuardTitle: '介面保护已触發',
+    uiGuardDescDelete: '检测到關鍵介面元素被刪除。',
+    uiGuardDescMove: '检测到關鍵介面元素被移動到其它位置。',
+    uiGuardDescPaste: '检测到粘貼了重復的關鍵介面元素。',
+    uiGuardDescAttribute: '检测到關鍵元素属性 {attr} 被修改。',
+    uiGuardReload: '連線已中断，頁面將在 {n} 秒后自動重新整理…',
+    uiGuardAdminExempt: '管理員触發介面保护（已豁免統计）',
+    uiGuardBanReason: '多次触發介面保护',
+    uiGuardBanBy: '系統（介面保护）',
+    announceReadStatus: '已讀：{n}/{t} ({p}%)',
+    announceNoData: '暫無公告',
+    groupActivityTitle: '📜 群動态',
+    groupActivityEmpty: '暫無動态',
+    groupActivityCreate: '创建了群聊',
+    groupActivityJoin: '加入了群聊',
+    groupActivityLeave: '退出了群聊',
+    groupActivityKick: '被移出群聊',
+    groupActivityRename: '修改了群名',
+    groupActivityAnnounce: '發布了群公告',
+    groupActivityTitle2: '修改了群头衔',
+    groupActivityMuteAll: '切換了全員禁言',
+    autoReplyTitle: '🤖 離線自動回復',
+    autoReplyDesc: '当你離線時，自動回復预設訊息给傳送者。',
+    autoReplyEnabled: '启用',
+    autoReplyKeywords: '關鍵词（逗號分隔）',
+    autoReplyMessage: '自動回復內容',
+    autoReplyMatchAll: '需同時匹配所有關鍵词',
+    autoReplyAddRule: '+ 添加规则',
+    autoReplySaved: '自動回復规则已儲存',
+    scheduledTitle: '⏰ 定時訊息',
+    scheduledEmpty: '暫無定時訊息',
+    scheduledAdd: '+ 新建定時訊息',
+    scheduledTargetPrompt: '目標使用者/群 ID：',
+    scheduledTimePrompt: '傳送時間（YYYY-MM-DD HH:MM:SS）：',
+    scheduledContentPrompt: '訊息內容：',
+    scheduledTimeInvalid: '時間格式錯誤',
+    scheduledSaved: '定時訊息已儲存',
+    keywordTitle: '🔔 關鍵词规则',
+    keywordAlerts: '强提醒關鍵词（每行一个）：',
+    keywordAlertsHint: '触發响铃+桌面通知+標題闪烁，無视靜音/免打擾',
+    keywordHighlights: '高亮關鍵词（每行一个）：',
+    keywordHighlightsHint: '命中關鍵词的訊息会高亮顯示',
+    keywordSaved: '關鍵词规则已儲存',
+    shortcutsCustomTitle: '⌨️ 自定義快捷鍵',
+    shortcutsCustomHint: '点击右侧鍵位，然后按下新組合鍵。修改立即生效。',
+    shortcutsReset: '還原預設',
+    shortcutsResetToast: '快捷鍵已還原預設',
+    shortcutsPressKey: '按下新鍵位...',
+    timeThemeTitle: '🌙 時間段主題',
+    timeThemeEnable: '启用時間段主題',
+    timeThemeDay: '白天時段：',
+    timeThemeHint: '白天時段使用浅色主題，其余時段自動切換深色主題',
+    timeThemeSaved: '時間段主題已儲存',
+    announceReadsTitle: '群公告已讀状态',
+    netDetailTitle: '📡 網路详情',
+    netDetailConnection: '連線信息',
+    netDetailStatus: '状态',
+    netDetailServer: '服务器',
+    netDetailProtocol: '協議',
+    netDetailEncrypted: '加密状态',
+    netDetailSocketId: 'Socket ID',
+    netDetailTransport: '传输方式',
+    netDetailUptime: '已連線',
+    netDetailLatency: '延遲統计',
+    netDetailCurrent: '当前延遲',
+    netDetailMinMaxAvg: '最小 / 最大 / 平均',
+    netDetailSamples: '采样次數',
+    netDetailReconnects: '重连次數',
+    netDetailDevice: '裝置 / 环境',
+    netDetailPageLoaded: '頁面已載入',
+    netDetailVisibility: '頁面可見性',
+    netDetailBrowserNet: '浏览器網路',
+    netDetailJsHeap: 'JS 堆内存',
+    netDetailUserAgent: '浏览器',
+    netDetailTestNow: '立即测速',
+    netDetailResetStats: '重置統计',
+    netDetailCopyDiag: '復制诊断信息',
+    netDetailCopied: '诊断信息已復制',
+    netDetailStatsCleared: '統计已清零',
+    netDetailTesting: '正在测速…',
+    netDetailConnected: '已連線',
+    netDetailDisconnected: '未連線',
+    netDetailVisible: '可見',
+    netDetailHidden: '隱藏',
+    netDetailOnline: '🟢 線上',
+    netDetailOffline: '🔴 離線',
+    storageItemsCount: '{n} 項',
+    devCurrentTag: '当前裝置',
+    devOfflineTag: '離線',
+    devOnlineTag: '線上',
+    devRemoveBtn: '🚪 移出该裝置',
+    devRemoveOthers: '🚪 移出所有其它裝置',
+    devRemoveConfirm: '移出裝置「{name}」？\n该裝置將立即被强制退出登入。',
+    devRemoveOthersConfirm: '確定移出其它 {n} 臺裝置吗？\n它们將立即被强制退出登入。',
+    devRemoved: '已移出：{name}',
+    devRemovedAll: '✅ 已移出 {n} 臺其它裝置',
+    devNoOthers: '没有其它登入裝置',
+    devEmpty: '暫無裝置记錄',
+    devLogin: '登入：',
+    devActive: '活躍：',
+    devDesktop: '桌面端',
+    devMobile: '移動端',
+    devTablet: '平板',
+    feedbackReplyTitle: '💬 回復使用者（使用者可見）',
+    feedbackReplyPlaceholder: '輸入回復內容…',
+    feedbackReplySend: '傳送',
+    feedbackReplySent: '✅ 回復已傳送',
+    mpConfirmRemoveDevice: '確認移出该裝置？',
+    tagPickerTitle: '为「{name}」設置標籤',
+    tagPickerHint: '勾選该联系人所属的標籤，也可在下方新建標籤。',
+    tagPickerNew: '新建標籤（16 字内）',
+    tagPickerCreate: '新建',
+    tagPickerSave: '儲存',
+    tagPickerCancel: '取消',
+    tagPickerCreated: '✅ 標籤已创建',
+    tagPickerSaved: '✅ 標籤已儲存',
+    tagPickerExists: '標籤已存在',
+    tagPickerMax: '標籤數量上限（30）',
+    tagPickerEmpty: '請輸入標籤名',
+    tagPickerNoTags: '暫無標籤，請在下方新建。',
+    tagPickerDelete: '確定刪除標籤「{name}」？\n標籤將从所有联系人中移除。',
+    remarkTitle: '備註名',
+    remarkPrompt: '为「{name}」設置備註名。留空点儲存即刪除。',
+    remarkPlaceholder: '例如：同事小王（留空 = 刪除）',
+    remarkSaved: '✅ 備註名已儲存',
+    remarkRemoved: '✅ 備註名已刪除',
+    archiveLabel: '📦 归檔会話',
+    unarchiveLabel: '📦 取消归檔',
+    archivedToast: '已归檔',
+    unarchivedToast: '已取消归檔',
+    blockLabel: '🚫 拉黑',
+    unblockLabel: '🚫 取消拉黑',
+    msgReact2: '表情回应',
+    menuPinChat: '📌 置頂会話',
+    menuUnpinChat: '📌 取消置頂',
+    menuMuteChat: '🔕 靜音会話',
+    menuUnmuteChat: '🔕 取消靜音',
+    menuRemark: '✏️ 設置備註名',
+    menuTag: '🏷️ 設置標籤',
+    menuSound: '🔔 提示音',
+    menuArchive: '📦 归檔会話',
+    menuUnarchive: '📦 取消归檔',
+    menuClearHistory: '🗑️ 清空记錄',
+    menuBlock: '🚫 拉黑',
+    menuUnblock: '🚫 取消拉黑',
+    pinnedToast: '已置頂',
+    unpinnedToast: '已取消置頂',
+    menuManageGroup: '管理群',
+    menuDisbandGroup: '解散群聊',
+    menuLeaveGroup: '退出群聊',
+    btnOk: '確定',
+    btnConfirm2: '確認',
+    btnApply2: '应用',
+    btnSave2: '儲存',
+    btnClose2: '關閉',
+    btnDelete2: '刪除',
+    cancel: '取消',
+    confirm: '確認',
+    yes: '是',
+    no: '否',
+    loading: '載入中…',
+    processing: '处理中…',
+    toastDisconnected: '⚠️ 与服务器中斷連線',
+    userSuffixOffline: ' (離線)',
+    onlineSuffix: '人線上',
+    roleOwnerLabel: '群主',
+    recalledSuffix: ' 撤回了一條訊息',
+    readLabel: '已讀：',
+    listJoin: '、',
+    tagFile: '[檔案]',
+    tagSticker: '[表情]',
+    tagVoice: '[語音]',
+    tagImage: '[圖片]',
+    tagVideo: '[視頻]',
+    tagRecalled: '[已撤回]',
+    replyHintPrefix: '引用: ',
+    atAll: '@全體成員',
+    stickerUploadTitle: '上传表情包',
+    stickerTip: '点击傳送 / 右鍵刪除',
+    toastVoiceReadFail: '讀取錄音失敗',
+    voicePlayTitle: '播放/暫停',
+    voiceSpeedTitle: '切換倍速',
+    toastVoiceMaxSet: '語音最長時長：',
+    groupManageTitle: '管理群聊',
+    groupMenuManage: '管理群',
+    groupMenuLeave: '退出群聊',
+    groupMenuDisband: '解散群聊',
+    confirmDisbandGroup: '確定解散该群聊吗？\n\n此操作不可還原，所有成員將被移出。',
+    toastDisbanded: '群聊已解散',
+    btnRemove: '移除',
+    titlePlaceholder: '头衔',
+    noInvitable: '無其他可邀請的線上使用者',
+    noOnlineUsers: '暫無其他線上使用者',
+    groupMembersTitle: '群成員',
+    btnUnsetSVIP: '取消SVIP',
+    btnSetSVIP: '設为SVIP',
+    btnKick: '踢',
+    btnUnmute: '解禁',
+    btnMute: '禁言',
+    btnRevokeAdmin: '撤管',
+    btnGrantAdmin: '授管',
+    tagAdminShort: '[管理]',
+    tagMutedShort: '[禁言]',
+    toastUploading: '上传中...',
+    noFiles: '暫無檔案',
+    noPhotos: '暫無照片',
+    noVotes: '暫無投票',
+    btnDownload: '下載',
+    btnPreview: '预览',
+    btnVote: '投票',
+    voteCreatorPrefix: ' (创建者: ',
+    votesUnit: '票',
+    voteDone: '✔ 您已投票',
+    btnDelete: '刪除',
+    bulkSelected: '已選 ',
+    confirmBulkDeletePre: '確認刪除選中的 ',
+    confirmBulkDeletePost: ' 條訊息吗？（仅本地）',
+    starredEmpty: '还没有收藏任何訊息\n在訊息上点击 ☆ 即可收藏',
+    scopePrivate: '私聊',
+    scopeGroupPrefix: '群聊 · ',
+    starOff: '取消收藏',
+    starOn: '收藏该訊息',
+    toastLoginFirst: '請先登入',
+    toastRefreshing: '正在全局重新整理...',
+    toastContactsRefreshed: '已重新整理联系人',
+    toastLangChanged: '介面語言已切換',
+    toastTimeMode: '時間顯示已切換',
+    toastGlobalAnnounceSent: '✅ 全局公告已傳送',
+    globalRefreshBtn: '🔄 全局重新整理',
+    globalRefreshTitle: '全局重新整理',
+    ttMenuBtn: '切換侧边栏',
+    ttAdminPanel: '管理員面板',
+    ttTimeMode: '切換時間顯示',
+    ttTheme: '切換主題',
+    ttOrientation: '切換橫豎屏',
+    ttFullscreen: '切換全屏',
+    toastFullscreenOn: '已進入全屏',
+    toastFullscreenOff: '已退出全屏',
+    ttMembers: '群成員',
+    ttQQFile: '群檔案',
+    ttQQAlbum: '群相冊',
+    ttQQVote: '群投票',
+    ttScrollToggle: '自動滚動開關',
+    ttRefresh: '重新整理全部',
+    ttSearchToggle: '搜尋当前会話訊息 (Ctrl+F)',
+    ttStarred: '收藏夹',
+    ttClearChat: '清空聊天记錄',
+    ttCloseChat: '關閉当前会話 (Esc)',
+    chatTitleEditTitle: '重命名群聊',
+    onlineCountTitle: '查看全部使用者',
+    onlineUsersTitle: '👥 全部使用者',
+    ttMention: '@提及',
+    ttQuickReply: '快捷回復',
+    ttEmoji: '表情',
+    ttFile: '傳送檔案',
+    ttVoiceCancel: '取消錄音',
+    ttSearchPrev: '上一个',
+    ttSearchNext: '下一个',
+    ttSearchClose: '關閉',
+    searchInputPh: '搜尋当前会話的訊息…',
+    searchCountEmpty: '0/0',
+    headerNotLogged: '未登入',
+    adminBtnShort: '⚙️ 管理',
+    logoutBtnShort: '🚪 退出',
+    imagePreviewAlt: '预览',
+    downloadImgBtnTxt: '📥 下載圖片',
+    voiceRecordingHint: '正在錄音…',
+    voiceBtnStartTitle: '点击開始錄音',
+    voiceBtnStopTitle: '再次点击傳送語音',
+    replyHintCancelTitle: '取消引用',
+    globalAnnounceTitle: '📢 全局公告',
+    globalAnnounceInputPh: '輸入全局公告內容',
+    btnSend: '傳送',
+    btnApply: '应用',
+    adminMaxFileTitle: '📦 最大檔案大小（MB）',
+    adminMaxFileHint: '范围：1 ~ 500 MB，對所有使用者生效',
+    adminMoneyTitle: '💰 批量設置余額（元）',
+    adminMoneyHint: '對所有線上使用者生效；單个使用者可在下方單独設置',
+    btnCancel: '取消',
+    btnConfirm: '创建',
+    btnClose: '關閉',
+    btnSave: '儲存',
+    btnPublish: '發布',
+    qqFileTitle: '📁 群檔案',
+    qqAlbumTitle: '🖼️ 群相冊',
+    qqVoteTitle: '🗳️ 群投票',
+    qqUploadBtn: '上传',
+    qqVoteQuestionPh: '投票問題',
+    qqVoteOptionPh: '選項',
+    qqVoteOptionDefaultPh: '選項',
+    qqVoteAddOptionBtn: '添加選項',
+    qqVoteCreateBtn: '创建投票',
+    qqFileUploadTitle: '選擇檔案',
+    qqUploadTitle: '上传檔案',
+    qqAlbumUploadTitle: '選擇圖片',
+    qqUploadingHint: '上传中…',
+    qqFileEmptyTitle: '暫無檔案',
+    qqAlbumEmptyTitle: '暫無照片',
+    qqVoteEmptyTitle: '暫無投票',
+    qqFileHint: '支持任意类型檔案，單檔案不超過 20MB',
+    qqAlbumHint: '仅支持圖片檔案，超過 1280px 自動压缩',
+    qqFileTotalLabel: '共 ',
+    qqFileTotalSuffix: ' 个檔案',
+    qqAlbumTotalLabel: '共 ',
+    qqAlbumTotalSuffix: ' 张照片',
+    fileChoose: '選擇檔案',
+    fileChooseImage: '選擇圖片',
+    fileNoFile: '未選擇檔案',
+    fileChosen: '已選擇：',
+    createGroupTitle: '创建群聊',
+    groupNamePh: '群名稱',
+    groupManageTitle2: '群管理',
+    renameLabel: '修改群名稱',
+    renameInputPh: '新群名稱',
+    announceLabel: '📢 群公告（持久儲存）',
+    announceInputPh: '輸入群公告',
+    allMuteLabel: '全員禁言',
+    groupMembersLabel: '群成員',
+    inviteLabel: '邀請新成員',
+    inviteBtn: '邀請選中的成員',
+    starredTitle: '⭐ 我的收藏',
+    btnClearStarred: '清空收藏',
+    shortcutsTitle: '⌨️ 快捷鍵',
+    scSearch: '在当前会話中搜尋',
+    scSendEnter: '傳送訊息（預設）',
+    scSendCtrl: '傳送訊息（設置后）',
+    scNewline: '輸入換行',
+    scEsc: '關閉搜尋 / 弹窗',
+    scPageUp: '向上翻一屏訊息',
+    scPageDown: '向下翻一屏訊息',
+    scSidebar: '切換侧边栏',
+    scTheme: '切換主題',
+    scGlass: '切換磨砂玻璃',
+    scLatest: '回到最新訊息',
+    scQuickReply: '快捷回復',
+    scMute: '靜音当前会話',
+    scBulk: '批量模式',
+    scFullscreen: '切換全屏',
+    scNextUnread: '跳到下一个未讀（@优先）',
+    scMyProfile: '查看我的名片',
+    scSwitchChat: '快速切換会話',
+    forwardTitle: '↪️ 轉發訊息',
+    forwardEmpty: '暫無可轉發会話',
+    onlineShort: 'Online',
+    offlineShort: 'Offline',
+    setTitle: '🔧 設置',
+    notifyHint: '（窗口失焦時）',
+    themeModeLight: '浅色',
+    themeModeDark: '深色',
+    themeModeAuto: '跟随系統',
+    draftLabel: '草稿',
+    toastDraftSaved: '草稿已儲存',
+    toastNoMoreChats: '没有更多会話',
+    currentChatLabel: '当前会話',
+    toastOfflineFlushed: '已补發 {n} 條離線訊息',
+    toastGroupAnnounce: '{who} 發布了新群公告',
+    toastMentionAll: '{who} 提到了所有人：{text}',
+    toastCallFull: '通話人數已达上限',
+    toastScreenSharing: '{who} 開始分享螢幕',
+    callNoAnswer: '對方無应答',
+    quotaMeter: '存储配額',
+    syncEnabled: '多端同步',
+    readReceipt: '已讀回執',
+    starTags: '收藏標籤',
+    groupAnnounce: '群公告',
+    groupTodos: '群待辦',
+    mdPreview: 'Markdown 预览',
+    msgEditFailed: '訊息编輯失敗',
+    toastMusicDeleted: '音樂已刪除',
+    toastReadonlyOn: '服务器已進入只讀模式',
+aboutSysAccountsBody:
+      '<li><b>微信团队</b>、<b>微信支付</b>、<b>SYSTEM</b> 均為内置官方帳號，且行為完全一致：</li>' +
+      '<li>· 開啟會話時<b>停用輸入框與全部工具列</b>（表情 / 檔案 / 通話 / 紅包等一律不可用）；</li>' +
+      '<li>· 不接受私聊訊息、紅包、轉帳；在轉帳目標清單中也不出現；</li>' +
+      '<li>· 統一规格：官方標 + 藍色認證 + 金色 👑LV1000 + 藍色雙环頭像。</li>' +
+      '<li>紅包播報、群通話系統訊息、通話记錄、對方離線提示、Web 終端訊息等均由 <b>SYSTEM</b> 帳號發出；點頭像可查看官方名片。</li>',
+
+    aboutNetStatusBody:
+      '<li>設置面板 →「外观與顯示」→「顯示網路狀態」開启後，頂欄顯示網路徽章（🟢/🟡/🟠/🔴 加延遲值）。</li>' +
+      '<li><b>點擊徽章開啟「網路详情」面板</b>，查看連線信息、延遲統計、裝置環境三組數據。</li>' +
+      '<li>面板開啟時每秒自動重新整理動态字段，取樣週期从預設 30 秒加速到 10 秒；關閉後自動還原。</li>' +
+      '<li>面板内提供「立即測速」「重設統計」「複製診斷信息」三個操作按鈕。</li>',
+
+    aboutDebugModeBody:
+      '<li>設置面板 →「數據與帮助」→ 開啟「详細偵錯模式」開關，右下角出現 🐞 浮動按鈕。</li>' +
+      '<li>點擊 🐞 開啟偵錯面板，實時展示：Socket 事件（52 種）、window.onerror、未捕获的 Promise 異常、瀏覽器上下線、頁面可見性等日誌。</li>' +
+      '<li>日誌上限 500 條，按等級著色（绿 / 蓝 / 黄 / 红 / 紫），自動捲動到底部。</li>' +
+      '<li>面板頂部三個按鈕：「狀態」弹出狀態快照、「複製」把全部日誌複製到剪貼簿、「清空」清空緩衝。</li>' +
+      '<li>偵錯模式通過 localStorage 持久化，重新整理後自動還原。主控臺可调用 <code>window.__debugLog(level, tag, msg)</code> 手動寫日誌。</li>',
+    callSettingsTitle: '通話設定',
+    callForceTurn: '強制走中繼（TURN）',
+    callForceTurnHint: '開啟後所有通話都經伺服器中繼，跨網段可用但更耗流量',
+    callQualityShow: '顯示通話品質',
+    callQualityShowHint: '通話中顯示延遲與丟包',
+    callAutoAnswer: '自動接聽',
+    callAutoAnswerHint: '收到來電時自動接聽（僅限可信環境）',
+    callDefaultVideo: '預設視訊通話',
+    callDefaultVideoHint: '發起通話時預設開啟攝影機',
+    callReconnect: '斷線重連次數',
+    callRingTimeout: '響鈴逾時（秒）',
+    callMaxPeers: '群通話人數上限',
+    turnUrl: 'TURN 伺服器位址',
+    turnUser: 'TURN 使用者名稱',
+    turnCred: 'TURN 密碼',
+    turnConfigured: '已設定中繼，支援跨網段',
+    turnNotConfigured: '未設定中繼，僅區域網路可用',
+    callChat: '通話中傳訊息',
+    callChatPh: '輸入訊息…',
+    callSend: '傳送',
+    callRecordTitle: '通話紀錄',
+    callRecordEmpty: '尚無通話紀錄',
+    callStatsTotal: '總計',
+    callStatsEnded: '已接通',
+    callStatsMissed: '未接',
+    callStatsRejected: '已拒絕',
+    screenShareStart: '分享螢幕',
+    screenShareStop: '停止分享',
+    screenSharing: '正在分享螢幕',
+aboutCliConsoleBody:
+      '<li><b>頂欄</b>：伺服器執行狀態（▶ 執行中 / ⏸ 已暫停）。</li>' +
+      '<li><b>狀態区</b>：在線 / 使用者總數、群組數、訊息總數、會話數、執行時長。</li>' +
+      '<li><b>使用者 / 群組面板</b>：按 <kbd>Tab</kbd> 切換；<kbd>↑↓</kbd> 選擇、<kbd>Enter</kbd> 打開操作菜單。</li>' +
+      '<li><b>使用者操作</b>：查看聊天记錄 / 發私聊訊息 / 踢出 / 封禁（可設時長）/ 解封 / 設管理員 / 禁言 / 認證 / 升級 / 改余額 / 刪除帳號。</li>' +
+      '<li><b>群組操作</b>：查看群聊天记錄 / 發群訊息 / 發群公告 / 解散群組。</li>' +
+      '<li><b>訊息浏览</b>：<kbd>↑</kbd> 看更早、<kbd>↓</kbd> 看更新、<kbd>Esc</kbd> 返回。</li>' +
+      '<li><b>事件流</b>：底部實時顯示最近事件（登錄、红包、通話、封禁等）。</li>' +
+      '<li>快捷鍵：<kbd>R</kbd> 重新整理、<kbd>P</kbd> 暫停 / 恢復伺服器、<kbd>Q</kbd> 退出 TUI。</li>',
+
+    aboutWebTermBody:
+      '<li><b>存取碼</b>：伺服器啟動時隨機產生并列印在命令列橫幅裡；<b>5 分鐘</b>内有效。</li>' +
+      '<li>頁面上的「取得驗證碼」按鈕可重新產生一個存取碼（同樣 5 分鐘有效，30 秒冷卻）。</li>' +
+      '<li>每次請求都會列印到服務端命令列，附帶請求者 IP 與時間，便於稽核。</li>' +
+      '<li>支援 <kbd>↑</kbd> / <kbd>↓</kbd> 浏览历史命令；<code>exit</code> 被拦截以避免誤關伺服器。</li>',
+
+    aboutServerPauseBody:
+      '<li>命令列執行 <code>pause</code> → 中斷所有連線、釋放連接埠、拒絕新访問；Node 進程繼續執行。</li>' +
+      '<li>命令列執行 <code>resume</code> → 在同一連接埠重新監聽，用戶端自動重連，無需手動重新整理。</li>' +
+      '<li>TUI 主控臺内按 <kbd>P</kbd> 可一鍵暫停 / 恢復。</li>',
+
+    aboutTimedBanBody:
+      '<li>命令列：<code>ban &lt;使用者名&gt; [時長] [原因]</code>，時長支援 <code>30m</code> / <code>1h</code> / <code>1d</code> / <code>7d</code> / <code>1w</code> / <code>30d</code> / <code>1y</code>，<code>i</code> 表示永久封禁。</li>' +
+      '<li>TUI 主控臺：封禁時進入输入框，實時顯示解析结果，留空回車 = 永久。</li>' +
+      '<li>限時封禁到期後，使用者下次登錄時服務端自動解封并广播 <code>user-unbanned</code>；所有在線用戶端、以及停在登錄頁的設備都會立即重新整理。</li>' +
+      '<li>封禁提示包含原因、操作人、到期時間；在線被踢出的弹窗同樣顯示這些信息。</li>',
+
+    aboutAccountBanBody:
+      '<li>管理員可在管理面板、命令列或 TUI 主控臺封禁違規帳號。</li>' +
+      '<li><b>支援限時封禁</b>：<code>30m</code> / <code>1h</code> / <code>1d</code> / <code>7d</code> / <code>1w</code> / <code>30d</code> / <code>1y</code>；输入 <code>i</code> 或留空表示永久封禁。</li>' +
+      '<li>限時封禁到期後，使用者下次登錄時自動解封，并广播给所有在線用戶端。</li>' +
+      '<li>被封禁帳號無法登錄；若帳號当前在線，會立即被强制中斷并跳轉至登錄頁。</li>' +
+      '<li>被封禁帳號的名片頂部顯示红色橫幅（含原因 / 操作人 / 到期時間），侧边栏昵稱變红并带头像角標 🚫。</li>' +
+      '<li>解封時其他在線用戶端的侧边栏顏色、头像角標、名片橫幅、管理面板徽章立即恢復正常。</li>' +
+      '<li>系統内置帳號（微信团队 / 微信支付 / SYSTEM）不可被封禁。</li>',
+    aboutWebTermSecBody:
+      '<li>Web 終端存取碼每次啟動隨機產生（6 位數字），<b>5 分鐘有效</b>。</li>' +
+      '<li>點擊頁面上的「取得驗證碼」可重新產生，30 秒冷卻防止刷屏。</li>' +
+      '<li>每次授權成功 / 失敗、以及執行的每條命令，都會列印到服務端命令列（含請求者 IP 與時間），便於稽核。</li>' +
+      '<li>Web 終端的 <code>exit</code> 命令被攔截，避免誤關伺服器；<code>restart</code> / <code>pause</code> / <code>resume</code> 等破壞性命令仍可執行（屬於管理員預期操作）。</li>' +
+      '<li>每個瀏覽器會話獨立授權，重新整理頁面後需要重新輸入存取碼。</li>',
+    groupFiles: '群文件',
+    auditLogTitle: '审计日志',
+    auditRefresh: '刷新'
+  ,
+    editHistoryTitle: '编辑记录',
+    jumpToOrigin: '跳到原消息',
+    noEditHistory: '该消息没有编辑记录',
+    scheduleSend: '定时发送',
+    scheduleSendTime: '发送时间',
+    scheduleSendContent: '消息内容',
+    scheduleSendEmpty: '暂无定时消息',
+    scheduleSendOk: '已添加到定时发送',
+    scheduleSendFuture: '请选择未来的时间',
+    scheduleCancel: '取消',
+    msgHighlight: '已定位到原消息'
   },
 
   'zh-wenyan': {
@@ -35132,7 +38372,860 @@ var I18N = {
     voiceBtnStartTitle: '點 開 始 錄',
     voiceBtnStopTitle: '再 點 而 送',
     downloadImgBtnTxt: '📥 載 圖',
-    imagePreviewAlt: '覽'
+    imagePreviewAlt: '覽',
+settingsNavVideo: '看影',
+    setShowInteraction: '示互动标识',
+    setTimeShowSeconds: '信時精确到秒',
+    setClearSendHistory: '發后清空入历史',
+    setBiliQuality: '默认清晰度',
+    setBiliDanmaku: '默认开启弹幕',
+    setBiliAutoplay: '自动奏',
+    loginSecTls: '🔒 传输已加密（TLS / WSS）',
+    loginSecLocal: '🔒 本机访问（localhost）',
+    loginSecNone: '⚠️ 未加密传输（HTTP）—— 密码已本地哈希，建议启用 HTTPS',
+    setupTitle: '🔐 首次登录安設置',
+    setupDesc: '为保障账号安，请設置登录密码与密保虞。密码用于下次登录，密保用于遗忘密码时自助找回。',
+    setupAccountLabel: '账号',
+    setupPasswordPh: '設置密码（至少 6 位）',
+    setupSecurityQPh: '密保虞（如：我的生日？）',
+    setupSecurityAPh: '密保答案（用于找回密码）',
+    setupSubmit: '完成設置并登录',
+    setupDone: '✅ 安設置既成，方登录…',
+    loginPasswordRemembered: '🔐 此设备已记住登录，可留空',
+    setBubbleRadius: '信气泡圆角',
+    setMsgGap: '信间距',
+    setMsgFontWeight: '信字体粗细',
+    setMsgFontWeightNormal: '正常',
+    setMsgFontWeightMedium: '中等',
+    setMsgFontWeightBold: '粗体',
+    setMsgAvatarSize: '信头像大小',
+    setMsgAvatarSizeSmall: '小（28px）',
+    setMsgAvatarSizeMedium: '中（32px）',
+    setMsgAvatarSizeNormal: '标准（38px）',
+    setMsgAvatarSizeLarge: '大（44px）',
+    setMsgBubbleShadow: '信气泡阴影',
+    setImagePreviewMode: '圖點擊预览方式',
+    setImagePreviewModal: '弹窗预览',
+    setImagePreviewNewTab: '新窗口啟',
+    setVideoMute: '影信默认静音',
+    setCopyWithSender: '复制信时包含發者',
+    setContactTimeFormat: '会话列表時格式',
+    setContactTimeSmart: '智能（推荐）',
+    setContactTimeRelative: '相对時',
+    setContactTimeAbsolute: '绝对時',
+    setContactTimeHidden: '隐藏',
+    setAutoSaveDraft: '入框自动存草稿',
+    setMaxInputHeight: '入框最大高度',
+    setSidebarAvatarSize: '侧边栏头像大小',
+    setSidebarAvatarSizeSmall: '小（32px）',
+    setSidebarAvatarSizeMedium: '中（36px）',
+    setSidebarAvatarSizeNormal: '标准（40px）',
+    setSidebarAvatarSizeLarge: '大（48px）',
+    rpTargetLabel: '专属收款人',
+    rpAll: '-- 凡人可领（拼手气/普通） --',
+    setResetWidth: '重置',
+    setPcSidebarWidthRow: '联系人栏宽度',
+    setPcGspWidthRow: '群聊侧栏宽度',
+    setMotionLevel: '界面动效',
+    setMotionFull: '标准',
+    setMotionReduced: '精简',
+    setMotionOff: '閉',
+    setForceLayoutMode: '强制布局模式',
+    setLayoutAuto: '自动识别',
+    setLayoutPc: '强制电脑模式',
+    setLayoutMobile: '强制手机模式',
+    setLiquidGlass: '液态玻璃',
+    setLiquidGlassOff: '閉',
+    setLiquidGlassStandard: '标准',
+    setLiquidGlassEnhanced: '增强（SVG 折射）',
+    setFrostedGlass: '磨砂玻璃',
+    setNotifyPrivacy: '通知隱模式',
+    setDndAllowMention: '免打扰时仍提醒 @',
+    dndTempRowLabel: '临时免打扰',
+    dnd1h: '1 時辰',
+    dnd2h: '2 時辰',
+    dndCancel: '罷',
+    langWarningEn: 'Translations for languages other than Chinese may be incomplete.',
+    spacePosted: '{name} 发布了新动态',
+    colorWechatGreen: '微信绿',
+    colorBlue: '蓝色',
+    colorPurple: '紫色',
+    colorPink: '玫红',
+    colorOrange: '橙色',
+    colorTeal: '青色',
+    colorNavy: '藏青',
+    colorSlate: '灰蓝',
+    toastAccentApplied: '主题色已应用',
+    devicesLabel: '登录设备理',
+    devicesBtn: '查看 / 理',
+    storageCountMsg: '{n} 条',
+    storageCountImg: '{n} 张',
+    storageCountVid: '{n} 个',
+    storageCountVoi: '{n} 条',
+    storageCountFil: '{n} 个',
+    storageCleanChats: '清空聊天记录',
+    storageCleanMedia: '清理媒体数据',
+    storageCleanStarred: '清理收藏',
+    storageCleanDrafts: '清理草稿',
+    storageCleanStickers: '清理表情包',
+    storageCleanAll: '一键清理悉',
+    storageCleanConfirm: '定要清理吗？此操作不可撤销。',
+    storageCleanMediaConfirm: '将清除凡圖 / 影 / 聲 / 檔的原始数据（信文本与元数据保留），定吗？',
+    storageCleaned: '✅ 已清理',
+    storageEmpty: '暂无数据占用',
+    storageUnitCount: '项',
+    voiceDuration30: '30 秒',
+    voiceDuration60: '60 秒',
+    voiceDuration120: '2 分',
+    voiceDuration300: '5 分',
+    setVoiceSpeed1x: '1x',
+    setVoiceSpeed15x: '1.5x',
+    setVoiceSpeed2x: '2x',
+    toastGroupMenuHint: '點擊啟菜单，双击进入聊天',
+    verifyPresetTitle: '预设：',
+    verifyPreset1: '微信·局域网 官方',
+    verifyPreset2: '官方认证',
+    verifyPreset3: '理员认证',
+    verifyPreset4: '企业认证',
+    verifyPreset5: '优质人',
+    verifyPreset6: '超级理员',
+    toastVerified: '✅ 已认证',
+    toastUnverified: '已罷认证',
+    toastVerifyTextEmpty: '请入认证文本',
+    recallOtherMsgBy: '撤回了',
+    blockOnlyPrivate: '仅支持在私聊中拉黑',
+    musicNoMatch: '無匹配的歌曲',
+    musicDeleted: '已去',
+    musicTooLarge: '单曲不可超过 {n}MB',
+    musicPickAudio: '请选择音频檔',
+    musicOnlyAudio: '仅支持音频檔',
+    musicUploadFail: '上传敗矣',
+    aboutBtn: 'ℹ️ 關於',
+    ttAbout: '關於与使用教程',
+    aboutTitle: 'ℹ️ 關於本应用',
+    aboutTagline: '局域网即时通讯演示',
+    aboutDesc: '基于 Node.js + Socket.IO + WebRTC 构建的局域网聊天工具。支持私聊、群聊、聲/影通话、空间动态、红包、钱包、檔传输、樂共享、多设备登录、設置云同步、反馈中心、下载中心、官网页面等功能。凡数据存在服务端本地 files 目录，不依赖任何公网服务，完全离线运行。',
+    aboutTabBasic: '📖 基础',
+    aboutTabGroup: '👥 群聊',
+    aboutTabAdvanced: '🚀 进阶',
+    aboutTabShortcuts: '⌨️ 快捷键',
+    aboutTabPrivacy: '🔒 隱',
+    aboutOurLabel: '🌐 官网',
+    aboutOurOpen: '啟',
+    aboutOurCopy: '复制链接',
+    aboutOnlineLabel: '📖 在线關於',
+    aboutOnlineOpen: '啟',
+    aboutOnlineCopy: '复制链接',
+    aboutPrivacyLabel: '🔒 隱政策',
+    aboutPrivacyOpen: '啟',
+    aboutPrivacyCopy: '复制链接',
+    aboutSysAccountsTitle: '👥 系统内置账号',
+    aboutNetStatusTitle: '📡 网络状态',
+    aboutDebugModeTitle: '🔍 详细调试模式',
+    aboutCliConsoleTitle: '🖥️ 命令行控制台（TUI · 增强版）',
+    aboutCliConsoleIntro: '在服务器命令行窗口入 <code>ui</code>（或 <code>menu</code> / <code>dashboard</code> / <code>console</code>）啟全屏控制台，零依赖的纯 ANSI 实现。',
+    aboutWebTermTitle: '🖥️ Web 终端（浏览器访问）',
+    aboutWebTermIntro: '浏览器啟 <a href="#" class="about-inline-link" data-about-root>https://&lt;本机IP&gt;/root</a>，入访问码后即可执行与服务器命令行完全一致的凡命令。',
+    aboutServerPauseTitle: '⏸️ 服务器止 / 恢复',
+    aboutTimedBanTitle: '⏱ 限时封禁',
+    aboutAccountBanTitle: '🚫 账号封禁',
+    aboutWebTermSecTitle: '🖥️ Web 终端安',
+    presenceListening: '🎵 听歌中',
+    presenceGaming: '🎮 游戏中',
+    presenceWorking: '💼 工作中',
+    presenceStudying: '📚 学习中',
+    presenceEating: '🍜 干饭中',
+    presenceSleeping: '😴 睡觉中',
+    presenceListeningShort: '听歌',
+    presenceGamingShort: '游戏',
+    presenceWorkingShort: '工作',
+    presenceStudyingShort: '学习',
+    presenceEatingShort: '干饭',
+    presenceSleepingShort: '睡觉',
+    rpgSysTag: '【红包】',
+    rpgSysTagTitle: '查看该红包',
+    callOffline: '对方不在线',
+    callFailed: '呼叫敗矣',
+    callPickContact: '请先选择联系人',
+    callOnlyPrivate: '仅支持与好友私聊通话',
+    callMicDenied: '无法访问麦克风',
+    callCameraDenied: '无法访问摄像头',
+    callUnsupported: '当前浏览器不支持通话',
+    rpgSysTemplate: '"{grabber}"收了"{from}"的红包，领取了 ¥{amount}',
+    adminBatchDonePrefix: '✅ 已为 ',
+    adminBatchDoneMid: ' 位人設置余额 → ',
+    adminBatchConfirmPrefix: '确认把 ',
+    adminBatchConfirmMid: ' 位在线人的余额统一設置为 ¥',
+    adminBatchConfirmSuffix: '？',
+    recTransferOut: '转账给 {name}{note}',
+    recTransferIn: '收到来自 {name} 的转账{note}',
+    recRedpacketSend: '发红包 · {greeting}',
+    recRedpacketGrab: '抢红包 · {from}',
+    recAdminAdd: '理员充值 · {by}',
+    recAdminSub: '理员扣款 · {by}',
+    recAdminBatchAdd: '理员批量充值 · {by}',
+    recAdminBatchSub: '理员批量扣款 · {by}',
+    recCmdSet: '命令行调整',
+    recCmdAdd: '命令行充值',
+    recCmdSub: '命令行扣款',
+    recCmdBatch: '命令行全员调整',
+    bannerUserOnline: '👤 {name} 上线了',
+    bannerUserOffline: '👤 {name} 离线了',
+    bannerGroupCreated: '群聊 "{name}" 已创建',
+    bannerGroupName: '群聊',
+    toastChatClosed: '已退出当前会话',
+    toastNoUnread: '無未读信',
+    toastJumpedTo: '已跳转到 ',
+    toastMentioned: '已提及 ',
+    groupMembersCount: '{n} 人',
+    groupMembersCountEn: '{n} members',
+    msgEditTitle: '编辑',
+    spaceNoBio: '此人很懒，何都没写~',
+    spaceStatPosts: '动态',
+    spaceStatLikes: '获赞',
+    spaceStatVisitors: '访客',
+    spacePostPlaceholder: '这一刻的想法…',
+    spaceImageTooLarge: '圖太大',
+    spaceVisitorLabel: '访客记录',
+    spaceVisitorEmpty2: '还無访客～',
+    spaceFeedEmpty2: '广场还無动态～',
+    spaceUserEmpty2: '还無动态～',
+    forwardNoChats: '暂无可转发会话',
+    forwardSelectHint: '选择转发目标',
+    forwardPreview: '转发文',
+    exportChatLabel: '会话',
+    exportTime: '导出時',
+    exportChat: '导出当前会话',
+    exportNoMsgs: '会话为空',
+    adminInvalidAmount: '请入有效金额（元）',
+    adminMaxAmount: '金额上限 ¥1000000',
+    adminUserLabel: '人',
+    adminBalanceShort: '余额：',
+    qqFileNoFile: '暂无檔',
+    qqAlbumNoPhoto: '暂无照片',
+    qqVoteNoVote: '暂无投票',
+    qqVoteQuestionReq: '请入投票虞',
+    qqVoteMinOptionsReq: '至少須 2 个选项',
+    qqVoteCreatingMsg: '投票创建中...',
+    qqUploadingMsg: '上传中...',
+    qqFileHint2: '支持任意类型檔，单檔不超过服务端上限',
+    qqAlbumHint2: '仅支持圖檔，超过 1280px 自动压缩',
+    qqFilePickTip: '请选择檔',
+    qqImagePickTip: '请选择圖',
+    qqImageOnlyTip: '请上传圖',
+    qqFileTooLargePrefix: '檔太大（上限 ',
+    qqFileTooLargeSuffix: 'MB）',
+    qqFileTotalPre: '共 ',
+    qqFileTotalSuf: ' 个檔',
+    qqAlbumTotalPre: '共 ',
+    qqAlbumTotalSuf: ' 张照片',
+    qqVoteCreatorPre: ' (创建者: ',
+    qqVoteCreatorSuf: ')',
+    qqVoteDone: '✔ 您已投票',
+    groupManageTitleTpl: '群理',
+    groupManageTitlePrefix: '群理',
+    groupNoInvitable2: '无其他可邀请的在线人',
+    groupNoOnlineUsers2: '暂无其他在线人',
+    sessionRestored: '已恢复上次的聊天记录与身份',
+    nicknameClickProfile: '查看名片',
+    nicknameClickProfileEn: 'View profile',
+    browserBack: '返回',
+    browserRefresh: '刷新',
+    browserGo: '啟',
+    browserExternal: '在新标签页啟',
+    browserClose: '退出',
+    browserUrlPh: '入网址或搜索…',
+    browserLoading: '載中…',
+    browserBlocked: '该网站禁止在窗口内示，请點擊下方鈕在新标签页中啟。',
+    browserOpenNewTab: '在新标签页啟',
+    profileCardLabel: '个人名片',
+    profileEditTitle: '✏️ 编辑名片',
+    profileSave: '存',
+    profileSignature: '个性签名',
+    profileSignaturePh: '介绍一下你自己…',
+    profileGender: '性别',
+    profileGenderHidden: '保密',
+    profileGenderMale: '♂ 男',
+    profileGenderFemale: '♀ 女',
+    profileGenderOther: '⚧ 其他',
+    profileBirthday: '生日',
+    profileZodiac: '星座',
+    profileLocation: '所在地',
+    profileLocationPh: '如：北京',
+    regionProvincePlaceholder: '省份',
+    regionCityPlaceholder: '城市 / 地区',
+    regionProvinceTip: '选择省份',
+    regionCityTip: '选择城市 / 地区',
+    profileWebsite: '个人主页',
+    profileWebsitePh: 'https://...',
+    profileIdLabel: '人 ID',
+    profileCopyId: '复制',
+    profileNoSignature: '此人很懒，何都没写~',
+    profileCreatedAt: '注册時',
+    profileLastActive: '最后活跃',
+    profileUploadAvatar: '更换头像',
+    profileClearAvatar: '清除',
+    profileSendMsg: '发信',
+    profileMood: '心 情',
+    profileMoodPh: '自 定 心 情…',
+    profilePersonality: '性格（MBTI）',
+    profilePersonalityPh: '自定义或留空（如：INTJ）',
+    profileCopyCard: '复制名片',
+    toastProfileSaved: '✅ 名片已存',
+    toastAvatarTooLarge: '头像太大（≤ 2MB）',
+    recallOtherMsgSuffix: '的信',
+    setShortcuts: '快捷键助',
+    closeBtn: '閉',
+    forwardedLabel: '转发的信',
+    msgPin: '置顶',
+    msgSpeak: '朗读',
+    msgCopy: '复制',
+    toastCopied: '已复制',
+    toastCopyFail: '复制敗矣',
+    toastRecalled: '已撤回',
+    toastDeleted: '已去',
+    disabledInput: '对方离线，信可能不会立刻送达',
+    draftHint: '草稿',
+    toastSending: '方發，请稍后',
+    toastPickContact: '请先选择联系人',
+    toastMutedByGroup: '您已被禁言',
+    toastAllMuted: '全员禁言中',
+    toastRecallOnlySelf: '只能撤回自己的信',
+    toastRecallTimeout: '超过 2 分，无法撤回',
+    toastQuoted: '已引用信',
+    toastFileTooLarge50: '檔太大（上限 50MB）',
+    toastFileTooLarge20: '檔太大（上限 20MB）',
+    toastFileReadFail: '读取檔敗矣',
+    toastFilePick: '请选择檔',
+    toastStickerTooLarge: '表情包请小于 600KB',
+    toastStickerUpdated: '表情包已更',
+    toastVoiceNotSupported: '浏览器不支持录音',
+    toastVoiceFormatFail: '浏览器不支持录音格式',
+    toastVoiceCanceled: '已罷录音',
+    toastVoiceTooShort: '录音太短（至少 1 秒）',
+    toastMicDenied: '无法访问麦克风',
+    toastVoiceSent: '聲已發',
+    toastVoiceAutoplayBlocked: '浏览器阻止了自动奏，请再点一次',
+    toastVoicePlayFail: '聲奏敗矣',
+    toastVoiceMaxReached: '已达最长时长，自动發',
+    toastGroupNameRequired: '请入群名称',
+    toastInviteSelect: '请选择要邀请的人',
+    toastInvited: '邀请已發',
+    toastGroupRenamed: '群名称已更',
+    toastAnnounceUpdated: '群公告已更',
+    toastGroupOnly: '仅在群聊中使用',
+    toastNotAdmin: '您不是理员',
+    toastUserOffline: '人不在线',
+    toastLevelRange: '等级须 1-1000',
+    dailySigninLabel: '每日签到',
+    signinBtnTitle: '每日签到 +10 经验（已签到后點擊查看日历）',
+    signinCalendarTitle: '📅 签到日历',
+    signinCalendarBtnTitle: '签到日历',
+    toastAnnounceRequired: '请入公告文',
+    toastImagePick: '请选择圖',
+    toastImageOnly: '请上传圖',
+    toastVoteQuestion: '请入投票虞',
+    toastVoteMinOptions: '至少須 2 个选项',
+    toastVoteCreating: '投票创建中...',
+    toastPinned: '已置顶',
+    toastUnpinned: '已罷置顶',
+    toastClearedLocal: '已清空本地记录',
+    toastMutedChat: '已静音该会话',
+    toastUnmutedChat: '已罷静音',
+    toastForwarded: '已转发',
+    toastBulkEnter: '已进入批量模式，點擊信选择',
+    toastBulkPick: '请先选择信',
+    toastBulkDeleted: '已去',
+    toastMsgNotFound: '原信不在当前视图',
+    toastDownloadFail: '下载敗矣',
+    toastNotifyUnsupported: '当前浏览器不支持桌面通知',
+    toastNotifyDenied: '通知權已被拒绝，请到浏览器設置中开启',
+    toastNotifyOn: '桌面通知已开启',
+    toastNotifyOff: '桌面通知已閉',
+    toastTTSUnsupported: '浏览器不支持朗读',
+    toastTTSReading: '方朗读...',
+    toastTTSFail: '朗读敗矣',
+    toastSelectChat: '请先选择会话',
+    toastChatEmpty: '会话为空',
+    toastExported: '已导出',
+    qrTitle: '⚡ 快捷回复',
+    qrAdd: '＋ 新增',
+    qrPrompt: '入快捷回复文（最多 200 字）：',
+    qrEmpty: '暂无快捷回复，點擊「＋ 新增」添加',
+    qrDuplicated: '已存在相同文',
+    qrLimit: '最多 30 条',
+    sysOffline: '⚠️ 对方不在线，信已存但暂未送达',
+    sysNotExist: '⚠️ 对方不存在',
+    confirmLeaveGroup: '定退出群聊吗？',
+    confirmDeleteSticker: '去此表情包？',
+    confirmClearStarred: '确认清空悉收藏吗？此操作不可撤销。',
+    confirmLogout: '定退出吗？',
+    confirmKick: '确认踢出 ',
+    confirmRemoveMember: '确认移除 ',
+    loginErrIO: '❌ Socket.IO 未加载，请检查网络/CDN',
+    loginErrInit: '❌ 无法初始化连接：',
+    loginErrConnect: '⚠️ 无法连接服务端: ',
+    loginFailed: '登录敗矣',
+    loginTimeout: '⏱️ 登录超时，请确认服务端已启动并可访问',
+    groupJoinedSuffix: ' 加入了群聊',
+    groupLeftSuffix: ' 离开了群聊',
+    globalAnnouncePrefix: '📢 全局公告：',
+    toastRefreshOk: '已重新整理',
+    uiGuardTitle: '界面保护已触发',
+    uiGuardDescDelete: '检测到关键界面元素被去。',
+    uiGuardDescMove: '检测到关键界面元素被移动到其它位置。',
+    uiGuardDescPaste: '检测到粘贴了重复的关键界面元素。',
+    uiGuardDescAttribute: '检测到关键元素属性 {attr} 被修改。',
+    uiGuardReload: '连接已中断，页面将在 {n} 秒后自动刷新…',
+    uiGuardAdminExempt: '理员触发界面保护（已豁免统计）',
+    uiGuardBanReason: '多次触发界面保护',
+    uiGuardBanBy: '系统（界面保护）',
+    announceReadStatus: '已读：{n}/{t} ({p}%)',
+    announceNoData: '暂无公告',
+    groupActivityTitle: '📜 群动态',
+    groupActivityEmpty: '暂无动态',
+    groupActivityCreate: '创建了群聊',
+    groupActivityJoin: '加入了群聊',
+    groupActivityLeave: '退出了群聊',
+    groupActivityKick: '被移出群聊',
+    groupActivityRename: '修改了群名',
+    groupActivityAnnounce: '发布了群公告',
+    groupActivityTitle2: '修改了群头衔',
+    groupActivityMuteAll: '切换了全员禁言',
+    autoReplyTitle: '🤖 离线自动回复',
+    autoReplyDesc: '当你离线时，自动回复预设信给發者。',
+    autoReplyEnabled: '启用',
+    autoReplyKeywords: '关键词（逗号分隔）',
+    autoReplyMessage: '自动回复文',
+    autoReplyMatchAll: '需同时匹配凡关键词',
+    autoReplyAddRule: '+ 添加规则',
+    autoReplySaved: '自动回复规则已存',
+    scheduledTitle: '⏰ 定时信',
+    scheduledEmpty: '暂无定时信',
+    scheduledAdd: '+ 新建定时信',
+    scheduledTargetPrompt: '目标人/群 ID：',
+    scheduledTimePrompt: '發時（YYYY-MM-DD HH:MM:SS）：',
+    scheduledContentPrompt: '信文：',
+    scheduledTimeInvalid: '時格式謬',
+    scheduledSaved: '定时信已存',
+    keywordTitle: '🔔 关键词规则',
+    keywordAlerts: '强提醒关键词（每行一个）：',
+    keywordAlertsHint: '触发响铃+桌面通知+标题闪烁，无视静音/免打扰',
+    keywordHighlights: '高亮关键词（每行一个）：',
+    keywordHighlightsHint: '命中关键词的信会高亮示',
+    keywordSaved: '关键词规则已存',
+    shortcutsCustomTitle: '⌨️ 自定义快捷键',
+    shortcutsCustomHint: '點擊右侧键位，然后按下新组合键。修改即生效。',
+    shortcutsReset: '恢复默认',
+    shortcutsResetToast: '快捷键已恢复默认',
+    shortcutsPressKey: '按下新键位...',
+    timeThemeTitle: '🌙 時段主题',
+    timeThemeEnable: '启用時段主题',
+    timeThemeDay: '白天时段：',
+    timeThemeHint: '白天时段使用浅色主题，其余时段自动切换深色主题',
+    timeThemeSaved: '時段主题已存',
+    announceReadsTitle: '群公告已读状态',
+    netDetailTitle: '📡 网络详情',
+    netDetailConnection: '连接信息',
+    netDetailStatus: '状态',
+    netDetailServer: '服务器',
+    netDetailProtocol: '协议',
+    netDetailEncrypted: '加密状态',
+    netDetailSocketId: 'Socket ID',
+    netDetailTransport: '传输方式',
+    netDetailUptime: '已连接',
+    netDetailLatency: '延迟统计',
+    netDetailCurrent: '当前延迟',
+    netDetailMinMaxAvg: '最小 / 最大 / 平均',
+    netDetailSamples: '采样次数',
+    netDetailReconnects: '重连次数',
+    netDetailDevice: '设备 / 环境',
+    netDetailPageLoaded: '页面已加载',
+    netDetailVisibility: '页面可见性',
+    netDetailBrowserNet: '浏览器网络',
+    netDetailJsHeap: 'JS 堆内存',
+    netDetailUserAgent: '浏览器',
+    netDetailTestNow: '即测速',
+    netDetailResetStats: '重置统计',
+    netDetailCopyDiag: '复制诊断信息',
+    netDetailCopied: '诊断信息已复制',
+    netDetailStatsCleared: '统计已清零',
+    netDetailTesting: '方测速…',
+    netDetailConnected: '已连接',
+    netDetailDisconnected: '未连接',
+    netDetailVisible: '可见',
+    netDetailHidden: '隐藏',
+    netDetailOnline: '🟢 在线',
+    netDetailOffline: '🔴 离线',
+    storageItemsCount: '{n} 项',
+    devCurrentTag: '当前设备',
+    devOfflineTag: '离线',
+    devOnlineTag: '在线',
+    devRemoveBtn: '🚪 移出该设备',
+    devRemoveOthers: '🚪 移出凡其它设备',
+    devRemoveConfirm: '移出设备「{name}」？\n该设备将即被强制退出登录。',
+    devRemoveOthersConfirm: '定移出其它 {n} 台设备吗？\n它们将即被强制退出登录。',
+    devRemoved: '已移出：{name}',
+    devRemovedAll: '✅ 已移出 {n} 台其它设备',
+    devNoOthers: '無其它登录设备',
+    devEmpty: '暂无设备记录',
+    devLogin: '登录：',
+    devActive: '活跃：',
+    devDesktop: '桌面端',
+    devMobile: '移动端',
+    devTablet: '平板',
+    feedbackReplyTitle: '💬 回复人（人可见）',
+    feedbackReplyPlaceholder: '入回复文…',
+    feedbackReplySend: '發',
+    feedbackReplySent: '✅ 回复已發',
+    mpConfirmRemoveDevice: '确认移出该设备？',
+    tagPickerTitle: '为「{name}」設置标签',
+    tagPickerHint: '勾选该联系人所属的标签，也可在下方新建标签。',
+    tagPickerNew: '新建标签（16 字内）',
+    tagPickerCreate: '新建',
+    tagPickerSave: '存',
+    tagPickerCancel: '罷',
+    tagPickerCreated: '✅ 标签已创建',
+    tagPickerSaved: '✅ 标签已存',
+    tagPickerExists: '标签已存在',
+    tagPickerMax: '标签数量上限（30）',
+    tagPickerEmpty: '请入标签名',
+    tagPickerNoTags: '暂无标签，请在下方新建。',
+    tagPickerDelete: '定去标签「{name}」？\n标签将从凡联系人中移除。',
+    remarkTitle: '备注名',
+    remarkPrompt: '为「{name}」設置备注名。留空点存即去。',
+    remarkPlaceholder: '例如：同事小王（留空 = 去）',
+    remarkSaved: '✅ 备注名已存',
+    remarkRemoved: '✅ 备注名已去',
+    archiveLabel: '📦 归档会话',
+    unarchiveLabel: '📦 罷归档',
+    archivedToast: '已归档',
+    unarchivedToast: '已罷归档',
+    blockLabel: '🚫 拉黑',
+    unblockLabel: '🚫 罷拉黑',
+    msgReact2: '表情回应',
+    menuPinChat: '📌 置顶会话',
+    menuUnpinChat: '📌 罷置顶',
+    menuMuteChat: '🔕 静音会话',
+    menuUnmuteChat: '🔕 罷静音',
+    menuRemark: '✏️ 設置备注名',
+    menuTag: '🏷️ 設置标签',
+    menuSound: '🔔 提示音',
+    menuArchive: '📦 归档会话',
+    menuUnarchive: '📦 罷归档',
+    menuClearHistory: '🗑️ 清空记录',
+    menuBlock: '🚫 拉黑',
+    menuUnblock: '🚫 罷拉黑',
+    pinnedToast: '已置顶',
+    unpinnedToast: '已罷置顶',
+    menuManageGroup: '理群',
+    menuDisbandGroup: '解散群聊',
+    menuLeaveGroup: '退出群聊',
+    btnOk: '定',
+    btnConfirm2: '确认',
+    btnApply2: '应用',
+    btnSave2: '存',
+    btnClose2: '閉',
+    btnDelete2: '去',
+    cancel: '罷',
+    confirm: '确认',
+    yes: '是',
+    no: '否',
+    loading: '載中…',
+    processing: '处理中…',
+    toastDisconnected: '⚠️ 与服务器断开连接',
+    userSuffixOffline: ' (离线)',
+    roleOwnerLabel: '群主',
+    recalledSuffix: ' 撤回了一条信',
+    readLabel: '已读：',
+    listJoin: '、',
+    tagFile: '[檔]',
+    tagSticker: '[表情]',
+    tagVoice: '[聲]',
+    tagImage: '[圖]',
+    tagVideo: '[影]',
+    tagRecalled: '[已撤回]',
+    replyHintPrefix: '引用: ',
+    atAll: '@全体成员',
+    stickerUploadTitle: '上传表情包',
+    stickerTip: '點擊發 / 右键去',
+    toastVoiceReadFail: '读取录音敗矣',
+    voicePlayTitle: '奏/止',
+    voiceSpeedTitle: '切换倍速',
+    toastVoiceMaxSet: '聲最长时长：',
+    groupManageTitle: '理群聊',
+    groupMenuManage: '理群',
+    groupMenuLeave: '退出群聊',
+    groupMenuDisband: '解散群聊',
+    confirmDisbandGroup: '定解散该群聊吗？\n\n此操作不可恢复，凡成员将被移出。',
+    toastDisbanded: '群聊已解散',
+    titlePlaceholder: '头衔',
+    noInvitable: '无其他可邀请的在线人',
+    noOnlineUsers: '暂无其他在线人',
+    groupMembersTitle: '群成员',
+    btnUnsetSVIP: '罷SVIP',
+    btnSetSVIP: '设为SVIP',
+    btnKick: '踢',
+    btnUnmute: '解禁',
+    btnMute: '禁言',
+    btnRevokeAdmin: '撤管',
+    btnGrantAdmin: '授管',
+    tagAdminShort: '[理]',
+    tagMutedShort: '[禁言]',
+    toastUploading: '上传中...',
+    noFiles: '暂无檔',
+    noPhotos: '暂无照片',
+    noVotes: '暂无投票',
+    voteCreatorPrefix: ' (创建者: ',
+    votesUnit: '票',
+    voteDone: '✔ 您已投票',
+    bulkSelected: '已选 ',
+    confirmBulkDeletePre: '确认去选中的 ',
+    confirmBulkDeletePost: ' 条信吗？（仅本地）',
+    starredEmpty: '还無收藏任何信\n在信上點擊 ☆ 即可收藏',
+    scopePrivate: '私聊',
+    scopeGroupPrefix: '群聊 · ',
+    starOff: '罷收藏',
+    starOn: '收藏该信',
+    toastLoginFirst: '请先登录',
+    toastRefreshing: '方全局刷新...',
+    toastContactsRefreshed: '已刷新联系人',
+    toastLangChanged: '界面语言已切换',
+    toastTimeMode: '時示已切换',
+    toastGlobalAnnounceSent: '✅ 全局公告已發',
+    globalRefreshBtn: '🔄 全局刷新',
+    globalRefreshTitle: '全局刷新',
+    ttMenuBtn: '切换侧边栏',
+    ttAdminPanel: '理员面板',
+    ttTimeMode: '切换時示',
+    ttTheme: '切换主题',
+    ttOrientation: '切换横竖屏',
+    ttFullscreen: '切换全屏',
+    toastFullscreenOn: '已进入全屏',
+    toastFullscreenOff: '已退出全屏',
+    ttMembers: '群成员',
+    ttQQFile: '群檔',
+    ttQQAlbum: '群相册',
+    ttQQVote: '群投票',
+    ttScrollToggle: '自动滚动开关',
+    ttRefresh: '刷新悉',
+    ttSearchToggle: '搜索当前会话信 (Ctrl+F)',
+    ttStarred: '收藏夹',
+    ttSettings: '設置',
+    ttClearChat: '清空聊天记录',
+    ttCloseChat: '閉当前会话 (Esc)',
+    chatTitleEditTitle: '重命名群聊',
+    onlineCountTitle: '查看悉人',
+    onlineUsersTitle: '👥 悉人',
+    ttMention: '@提及',
+    ttQuickReply: '快捷回复',
+    ttEmoji: '表情',
+    ttFile: '發檔',
+    ttVoiceCancel: '罷录音',
+    ttSearchPrev: '上一个',
+    ttSearchNext: '下一个',
+    ttSearchClose: '閉',
+    searchInputPh: '搜索当前会话的信…',
+    searchCountEmpty: '0/0',
+    headerNotLogged: '未登录',
+    adminBtnShort: '⚙️ 理',
+    logoutBtnShort: '🚪 退出',
+    replyHintCancelTitle: '罷引用',
+    adminPanelTitle: '⚙️ 理员面板',
+    globalAnnounceTitle: '📢 全局公告',
+    globalAnnounceInputPh: '入全局公告文',
+    adminMaxFileTitle: '📦 最大檔大小（MB）',
+    adminMaxFileHint: '范围：1 ~ 500 MB，对凡人生效',
+    adminMoneyTitle: '💰 批量設置余额（元）',
+    adminMoneyHint: '对凡在线人生效；单个人可在下方单独設置',
+    qqFileTitle: '📁 群檔',
+    qqAlbumTitle: '🖼️ 群相册',
+    qqVoteTitle: '🗳️ 群投票',
+    qqUploadBtn: '上传',
+    qqVoteQuestionPh: '投票虞',
+    qqVoteOptionPh: '选项',
+    qqVoteOptionDefaultPh: '选项',
+    qqVoteAddOptionBtn: '添加选项',
+    qqVoteCreateBtn: '创建投票',
+    qqFileUploadTitle: '选择檔',
+    qqUploadTitle: '上传檔',
+    qqAlbumUploadTitle: '选择圖',
+    qqUploadingHint: '上传中…',
+    qqFileEmptyTitle: '暂无檔',
+    qqAlbumEmptyTitle: '暂无照片',
+    qqVoteEmptyTitle: '暂无投票',
+    qqFileHint: '支持任意类型檔，单檔不超过 20MB',
+    qqAlbumHint: '仅支持圖檔，超过 1280px 自动压缩',
+    qqFileTotalLabel: '共 ',
+    qqFileTotalSuffix: ' 个檔',
+    qqAlbumTotalLabel: '共 ',
+    qqAlbumTotalSuffix: ' 张照片',
+    fileChoose: '选择檔',
+    fileChooseImage: '选择圖',
+    fileNoFile: '未选择檔',
+    fileChosen: '已选择：',
+    createGroupTitle: '创建群聊',
+    groupNamePh: '群名称',
+    groupManageTitle2: '群理',
+    renameLabel: '修改群名称',
+    renameInputPh: '新群名称',
+    announceLabel: '📢 群公告（持久存）',
+    announceInputPh: '入群公告',
+    allMuteLabel: '全员禁言',
+    groupMembersLabel: '群成员',
+    inviteLabel: '邀请新成员',
+    inviteBtn: '邀请选中的成员',
+    starredTitle: '⭐ 我的收藏',
+    btnClearStarred: '清空收藏',
+    shortcutsTitle: '⌨️ 快捷键',
+    scSearch: '在当前会话中搜索',
+    scSendEnter: '發信（默认）',
+    scSendCtrl: '發信（設置后）',
+    scNewline: '入换行',
+    scEsc: '閉搜索 / 弹窗',
+    scPageUp: '向上翻一屏信',
+    scPageDown: '向下翻一屏信',
+    scSidebar: '切换侧边栏',
+    scTheme: '切换主题',
+    scGlass: '切换磨砂玻璃',
+    scLatest: '回到最新信',
+    scQuickReply: '快捷回复',
+    scMute: '静音当前会话',
+    scBulk: '批量模式',
+    scFullscreen: '切换全屏',
+    scNextUnread: '跳到下一个未读（@优先）',
+    scMyProfile: '查看我的名片',
+    scSwitchChat: '快速切换会话',
+    forwardTitle: '↪️ 转发信',
+    forwardEmpty: '暂无可转发会话',
+    onlineShort: 'Online',
+    offlineShort: 'Offline',
+    setTitle: '🔧 設置',
+    notifyHint: '（窗口失焦时）',
+    draftLabel: '草稿',
+    toastDraftSaved: '草稿已存',
+    toastNoMoreChats: '無更多会话',
+    currentChatLabel: '当前会话',
+    toastOfflineFlushed: '已补发 {n} 条离线信',
+    toastGroupAnnounce: '{who} 发布了新群公告',
+    toastMentionAll: '{who} 提到了凡人：{text}',
+    toastCallFull: '通话人数已达上限',
+    toastScreenSharing: '{who} 开始共享屏幕',
+    callNoAnswer: '对方无应答',
+    quotaMeter: '存储配额',
+    syncEnabled: '多端同步',
+    readReceipt: '已读回执',
+    starTags: '收藏标签',
+    groupAnnounce: '群公告',
+    groupTodos: '群待办',
+    mdPreview: 'Markdown 预览',
+    msgEditFailed: '信编辑敗矣',
+    toastMusicDeleted: '樂已去',
+    toastReadonlyOn: '服务器已进入只读模式',
+aboutSysAccountsBody:
+      '<li><b>微信团队</b>、<b>微信支付</b>、<b>SYSTEM</b> 均為内置官方帳號，且行為完全一致：</li>' +
+      '<li>· 開啟會話時<b>停用輸入框與全部工具列</b>（表情 / 檔案 / 通話 / 紅包等一律不可用）；</li>' +
+      '<li>· 不接受私聊訊息、紅包、轉帳；在轉帳目標清單中也不出現；</li>' +
+      '<li>· 統一规格：官方標 + 藍色認證 + 金色 👑LV1000 + 藍色雙环頭像。</li>' +
+      '<li>紅包播報、群通話系統訊息、通話记錄、對方離線提示、Web 終端訊息等均由 <b>SYSTEM</b> 帳號發出；點頭像可查看官方名片。</li>',
+
+    aboutNetStatusBody:
+      '<li>設置面板 →「外观與顯示」→「顯示網路狀態」開启後，頂欄顯示網路徽章（🟢/🟡/🟠/🔴 加延遲值）。</li>' +
+      '<li><b>點擊徽章開啟「網路详情」面板</b>，查看連線信息、延遲統計、裝置環境三組數據。</li>' +
+      '<li>面板開啟時每秒自動重新整理動态字段，取樣週期从預設 30 秒加速到 10 秒；關閉後自動還原。</li>' +
+      '<li>面板内提供「立即測速」「重設統計」「複製診斷信息」三個操作按鈕。</li>',
+
+    aboutDebugModeBody:
+      '<li>設置面板 →「數據與帮助」→ 開啟「详細偵錯模式」開關，右下角出現 🐞 浮動按鈕。</li>' +
+      '<li>點擊 🐞 開啟偵錯面板，實時展示：Socket 事件（52 種）、window.onerror、未捕获的 Promise 異常、瀏覽器上下線、頁面可見性等日誌。</li>' +
+      '<li>日誌上限 500 條，按等級著色（绿 / 蓝 / 黄 / 红 / 紫），自動捲動到底部。</li>' +
+      '<li>面板頂部三個按鈕：「狀態」弹出狀態快照、「複製」把全部日誌複製到剪貼簿、「清空」清空緩衝。</li>' +
+      '<li>偵錯模式通過 localStorage 持久化，重新整理後自動還原。主控臺可调用 <code>window.__debugLog(level, tag, msg)</code> 手動寫日誌。</li>',
+    callSettingsTitle: '通話之設',
+    callForceTurn: '強走中繼（TURN）',
+    callForceTurnHint: '開啟後所有通話都經伺服器中繼，跨網段可用但更耗流量',
+    callQualityShow: '示通話之質',
+    callQualityShowHint: '通话中显示延迟与丢包',
+    callAutoAnswer: '自接',
+    callAutoAnswerHint: '收到來電時自動接聽（僅限可信環境）',
+    callDefaultVideo: '預設視訊',
+    callDefaultVideoHint: '发起通话时默认开启摄像头',
+    callReconnect: '斷線重連之數',
+    callRingTimeout: '響鈴逾時（秒）',
+    callMaxPeers: '群通話人數之限',
+    turnUrl: 'TURN 服务器地址',
+    turnUser: 'TURN 用户名',
+    turnCred: 'TURN 密码',
+    turnConfigured: '已配置中继，支持跨网段',
+    turnNotConfigured: '未配置中继，仅局域网可用',
+    callChat: '通話中傳信',
+    callChatPh: '入信…',
+    callSend: '發',
+    callRecordTitle: '通話之誌',
+    callRecordEmpty: '尚無通話之誌',
+    callStatsTotal: '總',
+    callStatsEnded: '已通',
+    callStatsMissed: '未接',
+    callStatsRejected: '已拒',
+    screenShareStart: '共螢幕',
+    screenShareStop: '止共',
+    screenSharing: '方共螢幕',
+aboutCliConsoleBody:
+      '<li><b>頂欄</b>：伺服器執行狀態（▶ 執行中 / ⏸ 已暫停）。</li>' +
+      '<li><b>狀態区</b>：在線 / 使用者總數、群組數、訊息總數、會話數、執行時長。</li>' +
+      '<li><b>使用者 / 群組面板</b>：按 <kbd>Tab</kbd> 切換；<kbd>↑↓</kbd> 選擇、<kbd>Enter</kbd> 打開操作菜單。</li>' +
+      '<li><b>使用者操作</b>：查看聊天记錄 / 發私聊訊息 / 踢出 / 封禁（可設時長）/ 解封 / 設管理員 / 禁言 / 認證 / 升級 / 改余額 / 刪除帳號。</li>' +
+      '<li><b>群組操作</b>：查看群聊天记錄 / 發群訊息 / 發群公告 / 解散群組。</li>' +
+      '<li><b>訊息浏览</b>：<kbd>↑</kbd> 看更早、<kbd>↓</kbd> 看更新、<kbd>Esc</kbd> 返回。</li>' +
+      '<li><b>事件流</b>：底部實時顯示最近事件（登錄、红包、通話、封禁等）。</li>' +
+      '<li>快捷鍵：<kbd>R</kbd> 重新整理、<kbd>P</kbd> 暫停 / 恢復伺服器、<kbd>Q</kbd> 退出 TUI。</li>',
+
+    aboutWebTermBody:
+      '<li><b>存取碼</b>：伺服器啟動時隨機產生并列印在命令列橫幅裡；<b>5 分鐘</b>内有效。</li>' +
+      '<li>頁面上的「取得驗證碼」按鈕可重新產生一個存取碼（同樣 5 分鐘有效，30 秒冷卻）。</li>' +
+      '<li>每次請求都會列印到服務端命令列，附帶請求者 IP 與時間，便於稽核。</li>' +
+      '<li>支援 <kbd>↑</kbd> / <kbd>↓</kbd> 浏览历史命令；<code>exit</code> 被拦截以避免誤關伺服器。</li>',
+
+    aboutServerPauseBody:
+      '<li>命令列執行 <code>pause</code> → 中斷所有連線、釋放連接埠、拒絕新访問；Node 進程繼續執行。</li>' +
+      '<li>命令列執行 <code>resume</code> → 在同一連接埠重新監聽，用戶端自動重連，無需手動重新整理。</li>' +
+      '<li>TUI 主控臺内按 <kbd>P</kbd> 可一鍵暫停 / 恢復。</li>',
+
+    aboutTimedBanBody:
+      '<li>命令列：<code>ban &lt;使用者名&gt; [時長] [原因]</code>，時長支援 <code>30m</code> / <code>1h</code> / <code>1d</code> / <code>7d</code> / <code>1w</code> / <code>30d</code> / <code>1y</code>，<code>i</code> 表示永久封禁。</li>' +
+      '<li>TUI 主控臺：封禁時進入输入框，實時顯示解析结果，留空回車 = 永久。</li>' +
+      '<li>限時封禁到期後，使用者下次登錄時服務端自動解封并广播 <code>user-unbanned</code>；所有在線用戶端、以及停在登錄頁的設備都會立即重新整理。</li>' +
+      '<li>封禁提示包含原因、操作人、到期時間；在線被踢出的弹窗同樣顯示這些信息。</li>',
+
+    aboutAccountBanBody:
+      '<li>管理員可在管理面板、命令列或 TUI 主控臺封禁違規帳號。</li>' +
+      '<li><b>支援限時封禁</b>：<code>30m</code> / <code>1h</code> / <code>1d</code> / <code>7d</code> / <code>1w</code> / <code>30d</code> / <code>1y</code>；输入 <code>i</code> 或留空表示永久封禁。</li>' +
+      '<li>限時封禁到期後，使用者下次登錄時自動解封，并广播给所有在線用戶端。</li>' +
+      '<li>被封禁帳號無法登錄；若帳號当前在線，會立即被强制中斷并跳轉至登錄頁。</li>' +
+      '<li>被封禁帳號的名片頂部顯示红色橫幅（含原因 / 操作人 / 到期時間），侧边栏昵稱變红并带头像角標 🚫。</li>' +
+      '<li>解封時其他在線用戶端的侧边栏顏色、头像角標、名片橫幅、管理面板徽章立即恢復正常。</li>' +
+      '<li>系統内置帳號（微信团队 / 微信支付 / SYSTEM）不可被封禁。</li>',
+    aboutWebTermSecBody:
+      '<li>Web 終端存取碼每次啟動隨機產生（6 位數字），<b>5 分鐘有效</b>。</li>' +
+      '<li>點擊頁面上的「取得驗證碼」可重新產生，30 秒冷卻防止刷屏。</li>' +
+      '<li>每次授權成功 / 失敗、以及執行的每條命令，都會列印到服務端命令列（含請求者 IP 與時間），便於稽核。</li>' +
+      '<li>Web 終端的 <code>exit</code> 命令被攔截，避免誤關伺服器；<code>restart</code> / <code>pause</code> / <code>resume</code> 等破壞性命令仍可執行（屬於管理員預期操作）。</li>' +
+      '<li>每個瀏覽器會話獨立授權，重新整理頁面後需要重新輸入存取碼。</li>',
+    groupFiles: '群文件',
+    auditLogTitle: '审计日志',
+    auditRefresh: '刷新'
+  ,
+    editHistoryTitle: '编辑记录',
+    jumpToOrigin: '跳到原消息',
+    noEditHistory: '该消息没有编辑记录',
+    scheduleSend: '定时发送',
+    scheduleSendTime: '发送时间',
+    scheduleSendContent: '消息内容',
+    scheduleSendEmpty: '暂无定时消息',
+    scheduleSendOk: '已添加到定时发送',
+    scheduleSendFuture: '请选择未来的时间',
+    scheduleCancel: '取消',
+    msgHighlight: '已定位到原消息'
   }
 };
 
@@ -35918,7 +40011,7 @@ function formatChatListTime(ts) {
   var dayDiff = Math.round((todayMid - thatMid) / 86400000);
   var _en = state.lang === 'en';
 
-  /* ★ v0.32.2：会话列表时间格式可自定义 */
+  /* 会话列表时间格式可自定义 */
   var _fmt = state.contactTimeFormat || 'smart';
   if (_fmt === 'hidden') return '';
   if (_fmt === 'relative') {
@@ -37703,9 +41796,17 @@ function saveDraftNow() {
   var k = currentChatKey();
   if (!k || !dom.msgInput) return;
   var v = dom.msgInput.value;
-  if (v && v.trim()) state.drafts[k] = v;
-  else delete state.drafts[k];
+  var _changed = false;
+  if (v && v.trim()) { if (state.drafts[k] !== v) _changed = true; state.drafts[k] = v; }
+  else { if (k in state.drafts) _changed = true; delete state.drafts[k]; }
   try { localStorage.setItem('chat_drafts', JSON.stringify(state.drafts)); } catch (e) {}
+  /* ★ 草稿多端同步：把「本会话的最新草稿」推给其它端 */
+  if (_changed && state.socket && state.socket.connected) {
+    try {
+      var _dv = {}; _dv[k] = (state.drafts[k] || '');
+      state.socket.emit('dsh-sync', { kind: 'draft', value: _dv });
+    } catch (e) {}
+  }
 }
 function saveDraftDebounced() {
   if (state._draftTimer) clearTimeout(state._draftTimer);
@@ -37863,7 +41964,7 @@ dom.orientationToggle.addEventListener('click', function () {
   var chatMoreMenu   = $id('chatMoreMenu');
   if (!headerMoreMenu && !chatMoreMenu) return;
 
-  var HEADER_ORDER = ['headerNickname', 'onlineCount', 'adminBtn', 'walletBtn', 'signinBtn', 'spaceBtn', 'musicBtn', 'aboutBtn',
+  var HEADER_ORDER = ['headerNickname', 'onlineCount', 'adminBtn', 'toolkitBtn', 'walletBtn', 'signinBtn', 'spaceBtn', 'musicBtn', 'aboutBtn',
     'timeModeToggle', 'themeToggle', 'orientationToggle', 'fullscreenToggle', 'logoutBtn'];
   var HEADER_MOVE  = ['onlineCount', 'adminBtn', 'walletBtn', 'signinBtn',
     'timeModeToggle', 'themeToggle', 'orientationToggle', 'fullscreenToggle', 'logoutBtn'];
@@ -38203,29 +42304,78 @@ dom.downloadImgBtn.addEventListener('click', function () {
 function downloadData(dataUrl, name) {
   try {
     if (!dataUrl) return;
-    if (dataUrl.indexOf('data:') !== 0) {
-      var a0 = document.createElement('a');
-      a0.href = dataUrl; a0.download = name || 'download';
-      a0.target = '_blank';
-      document.body.appendChild(a0); a0.click(); document.body.removeChild(a0);
+
+    /* ① data: URL */
+    if (dataUrl.indexOf('data:') === 0) {
+      var parts = dataUrl.split(',');
+      if (parts.length < 2) return;
+      var mimeMatch = parts[0].match(/:(.*?);/);
+      var mimeType = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+      var bstr = atob(parts[1]);
+      var n = bstr.length;
+      var u8 = new Uint8Array(n);
+      while (n--) u8[n] = bstr.charCodeAt(n);
+      downloadBlob(new Blob([u8], { type: mimeType }), name || 'download');
       return;
     }
-    var parts = dataUrl.split(',');
-    if (parts.length < 2) return;
-    var mimeMatch = parts[0].match(/:(.*?);/);
-    var mimeType = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
-    var bstr = atob(parts[1]);
-    var n = bstr.length;
-    var u8 = new Uint8Array(n);
-    while (n--) u8[n] = bstr.charCodeAt(n);
-    var blob = new Blob([u8], { type: mimeType });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url; a.download = name || 'download';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} }, 3000);
+
+    /* ② /api/file/xxx 或 http(s):// 链接 */
+    var _isApiFile = (dataUrl.indexOf('/api/file/') === 0);
+
+    /* ②-a 已移除 HTTP URL 分支：
+       · HTTPS 页面点击 HTTP 链接会被浏览器 Mixed Content 拦截（用户看到"没反应"）
+       · a.target='_blank' + a.download 在 Chrome 冲突，会打开新标签页内联显示
+       所有浏览器内下载统一走下面的 fetch → blob → a.download 分支 */
+
+    /* ②-b 无 HTTP 端口 → fetch 成 blob 再下载（下载器接管不了 blob:） */
+    if (_isApiFile || /^https?:\/\//.test(dataUrl)) {
+      var _url = dataUrl;
+      if (_url.indexOf('dl=1') === -1) {
+        _url += (_url.indexOf('?') === -1 ? '?dl=1' : '&dl=1');
+      }
+      showToast('正在准备下载…');
+      fetch(_url, { credentials: 'same-origin' }).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        var _cl = parseInt(r.headers.get('content-length') || '0', 10);
+        if (_cl > 200 * 1024 * 1024) {
+          throw new Error('文件较大（' + formatFileSize(_cl) +
+            '），请让管理员开启 HTTP 下载端口，或改用浏览器右键另存为');
+        }
+        return r.blob();
+      }).then(function (blob) {
+        if (!blob || !blob.size) {
+          throw new Error('文件为空（可能已被清理）');
+        }
+        downloadBlob(blob, name || 'download');
+      }).catch(function (e) {
+        console.error('[download]', e);
+        var _em = String(e && e.message || '未知错误');
+        var _hint = '';
+        if (_em === 'HTTP 404') {
+          _hint = '（文件已不存在，可能被服务器清理或过期）';
+        } else if (_em === 'HTTP 403') {
+          _hint = '（无权限访问该文件）';
+        } else if (_em === 'HTTP 429') {
+          _hint = '（请求过于频繁，请稍后再试）';
+        } else if (_em.indexOf('超过') !== -1) {
+          _hint = '（请用浏览器右键另存为）';
+        } else if (_em === 'Failed to fetch' || _em.indexOf('NetworkError') !== -1) {
+          _hint = '（网络断开，请检查连接）';
+        }
+        showToast('下载失败：' + _em + _hint);
+      });
+      return;
+    }
+
+    /* ③ 其它外链 */
+    var a1 = document.createElement('a');
+    a1.href = dataUrl;
+    a1.download = name || 'download';
+    a1.target = '_blank';
+    a1.rel = 'noopener';
+    document.body.appendChild(a1);
+    a1.click();
+    document.body.removeChild(a1);
   } catch (e) {
     console.error('下载失败', e);
     showToast(t('toastDownloadFail'));
@@ -38377,7 +42527,7 @@ function insertMention(text) {
   inp.selectionStart = inp.selectionEnd = pos;
 }
 
-/* ★ v0.32.1：位置共享（支持自定义位置、历史地点、可选坐标） */
+/* 位置共享（支持自定义位置、历史地点、可选坐标） */
 var LOC_HISTORY_KEY = 'loc_history_v1';
 var LOC_HISTORY_MAX = 10;
 
@@ -38752,23 +42902,415 @@ dom.fileBtn.addEventListener('click', function () {
       document.body.removeChild(fi);
       return;
     }
-    var rd = new FileReader();
-    rd.onload = function (ev) {
-      var dataUrl = ev.target.result;
-      if (f.type && f.type.indexOf('image/') === 0) {
-        compressImage(dataUrl, 1280, 0.75).then(function (c) {
-          sendFileMessage(f.name, Math.round(c.length * 0.75), 'image/jpeg', c);
-        });
-      } else {
-        sendFileMessage(f.name, f.size, f.type || 'application/octet-stream', dataUrl);
-      }
-    };
-    rd.onerror = function () { showToast(t('toastFileReadFail')); };
-    rd.readAsDataURL(f);
+    sendFileObject(f);
     document.body.removeChild(fi);
   });
   fi.click();
 });
+
+/* ===== 分片上传：辅助函数 ===== */
+var _uploadTicketCache = { ticket: '', expires: 0 };
+
+function _getUploadTicketAsync(cb) {
+  if (_uploadTicketCache.ticket && _uploadTicketCache.expires > Date.now() + 5000) {
+    cb(_uploadTicketCache.ticket);
+    return;
+  }
+  if (!state.socket || !state.socket.connected) {
+    cb('');
+    return;
+  }
+  var _done = false;
+  var _timer = setTimeout(function () {
+    if (_done) return;
+    _done = true;
+    cb('');
+  }, 3000);
+  try {
+    state.socket.emit('request-upload-ticket', {}, function (r) {
+      if (_done) return;
+      _done = true;
+      clearTimeout(_timer);
+      if (r && r.ok && r.ticket) {
+        var parts = String(r.ticket).split('|');
+        var exp = parseInt(parts[1], 10) || (Date.now() + 5 * 60 * 1000);
+        _uploadTicketCache = { ticket: r.ticket, expires: exp };
+        cb(r.ticket);
+      } else {
+        cb('');
+      }
+    });
+  } catch (e) {
+    if (!_done) {
+      _done = true;
+      clearTimeout(_timer);
+      cb('');
+    }
+  }
+}
+
+function _safeJsonFetch(url, options) {
+  return fetch(url, options).then(function (r) {
+    return r.text().then(function (txt) {
+      var parsed = null;
+      try { parsed = JSON.parse(txt); } catch (e) {}
+      if (parsed && typeof parsed === 'object') {
+        if (!r.ok && parsed.ok !== false) {
+          parsed.ok = false;
+          if (!parsed.error) parsed.error = 'HTTP ' + r.status;
+        }
+        return parsed;
+      }
+      var _hint = 'HTTP ' + r.status;
+      if (!r.ok) {
+        var _plain = String(txt).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        if (_plain) _hint += ' · ' + _plain.slice(0, 120);
+      }
+      return { ok: false, error: _hint };
+    });
+  }).catch(function (e) {
+    return { ok: false, error: '网络错误：' + (e && e.message || 'unknown') };
+  });
+}
+
+function _calcFileSha256(file) {
+  return new Promise(function (resolve) {
+    try {
+      if (file.size > 20 * 1024 * 1024) {
+        return resolve('');
+      }
+      if (!window.crypto || !window.crypto.subtle || !file.arrayBuffer) {
+        return resolve('');
+      }
+      file.arrayBuffer().then(function (ab) {
+        return crypto.subtle.digest('SHA-256', ab);
+      }).then(function (h) {
+        var arr = Array.from(new Uint8Array(h));
+        resolve(arr.map(function (b) {
+          return b.toString(16).padStart(2, '0');
+        }).join(''));
+      }).catch(function () { resolve(''); });
+    } catch (e) { resolve(''); }
+  });
+}
+
+/* ===== 上传任务状态 ===== */
+state.uploadTask = null;
+
+/* ===== 进度条 UI ===== */
+function _ensureUploadProgressUI() {
+  var el = document.getElementById('uploadProgressBar');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'uploadProgressBar';
+  el.style.cssText =
+    'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);' +
+    'width:min(420px,calc(100vw - 32px));' +
+    'background:var(--bg-modal);border:1px solid var(--border-modal);' +
+    'border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.22);' +
+    'padding:12px 16px;display:none;z-index:9999;' +
+    'font-size:13px;color:var(--text-primary);' +
+    'font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",' +
+    '"Microsoft YaHei",sans-serif;';
+  el.innerHTML =
+    '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">' +
+      '<span style="font-size:16px;">📤</span>' +
+      '<span id="uploadProgressName" style="flex:1;min-width:0;' +
+        'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+        'font-weight:600;"></span>' +
+      '<span id="uploadProgressPct" style="font-variant-numeric:tabular-nums;' +
+        'color:var(--accent);font-weight:700;flex-shrink:0;">0%</span>' +
+      '<button id="uploadProgressCancel" type="button" style="' +
+        'padding:3px 12px;border:1px solid var(--border-input);' +
+        'background:transparent;border-radius:12px;color:var(--text-secondary);' +
+        'cursor:pointer;font-family:inherit;font-size:12px;' +
+        'flex-shrink:0;transition:all .15s;">取消</button>' +
+    '</div>' +
+    '<div style="height:6px;background:rgba(0,0,0,.08);' +
+      'border-radius:3px;overflow:hidden;margin-bottom:6px;">' +
+      '<div id="uploadProgressFill" style="height:100%;width:0%;' +
+        'background:linear-gradient(90deg,var(--accent),var(--accent-hover));' +
+        'border-radius:3px;transition:width .18s cubic-bezier(.16,1,.3,1);"></div>' +
+    '</div>' +
+    '<div style="display:flex;justify-content:space-between;' +
+      'font-size:11.5px;color:var(--text-muted);' +
+      'font-variant-numeric:tabular-nums;">' +
+      '<span id="uploadProgressSize">0 B / 0 B</span>' +
+      '<span id="uploadProgressSpeed">—</span>' +
+    '</div>';
+  document.body.appendChild(el);
+  document.getElementById('uploadProgressCancel').addEventListener('click', function (e) {
+    e.stopPropagation();
+    cancelUploadTask();
+  });
+  return el;
+}
+
+function _showUploadProgressUI(fileName) {
+  var el = _ensureUploadProgressUI();
+  el.style.display = 'block';
+  document.getElementById('uploadProgressName').textContent = fileName;
+  document.getElementById('uploadProgressPct').textContent = '0%';
+  document.getElementById('uploadProgressFill').style.width = '0%';
+  document.getElementById('uploadProgressSize').textContent = '0 B / 0 B';
+  document.getElementById('uploadProgressSpeed').textContent = '—';
+}
+
+function _updateUploadProgressUI(uploadedBytes, totalBytes, startAt) {
+  var el = document.getElementById('uploadProgressBar');
+  if (!el || el.style.display === 'none') return;
+  var pct = totalBytes > 0 ? Math.min(100, uploadedBytes / totalBytes * 100) : 0;
+  document.getElementById('uploadProgressFill').style.width = pct.toFixed(1) + '%';
+  document.getElementById('uploadProgressPct').textContent = Math.round(pct) + '%';
+  document.getElementById('uploadProgressSize').textContent =
+    formatFileSize(uploadedBytes) + ' / ' + formatFileSize(totalBytes);
+  var elapsed = (Date.now() - startAt) / 1000;
+  if (elapsed > 1 && uploadedBytes > 0) {
+    var speed = uploadedBytes / elapsed;
+    var remain = speed > 0 ? (totalBytes - uploadedBytes) / speed : 0;
+    var remainTxt = remain > 60
+      ? Math.round(remain / 60) + ' 分'
+      : Math.round(remain) + ' 秒';
+    document.getElementById('uploadProgressSpeed').textContent =
+      formatFileSize(speed) + '/s · 剩 ' + remainTxt;
+  }
+}
+
+function _hideUploadProgressUI() {
+  var el = document.getElementById('uploadProgressBar');
+  if (el) el.style.display = 'none';
+}
+
+/* ===== 取消 ===== */
+function cancelUploadTask() {
+  var task = state.uploadTask;
+  if (!task) return;
+  task.cancelRequested = true;
+  if (task.xhr) {
+    try { task.xhr.abort(); } catch (e) {}
+  }
+  /* 通知服务端清理 */
+  if (task.uploadId && task.ticket) {
+    fetch('/api/upload/cancel', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Upload-Ticket': task.ticket
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify({ uploadId: task.uploadId })
+    }).catch(function () {});
+  }
+}
+
+/* 单分片：用 XHR 以便支持 abort */
+function _uploadOneChunk(uploadId, index, arrayBuffer, ticket, signalObj) {
+  return new Promise(function (resolve, reject) {
+    var xhr = new XMLHttpRequest();
+    signalObj.xhr = xhr;
+    xhr.open('POST', '/api/upload/chunk?uploadId=' +
+      encodeURIComponent(uploadId) + '&index=' + index, true);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-Upload-Ticket', ticket);
+    xhr.withCredentials = true;
+    xhr.onload = function () {
+      try { resolve(JSON.parse(xhr.responseText)); }
+      catch (e) { resolve({ ok: false, error: '响应解析失败' }); }
+    };
+    xhr.onerror = function () { reject(new Error('网络错误')); };
+    xhr.onabort = function () { reject({ aborted: true }); };
+    xhr.send(arrayBuffer);
+  });
+}
+
+/* 主流程：init → 逐片上传 → complete */
+function _chunkedUpload(file, ticket, onProgress, signalObj) {
+  var CHUNK = 4 * 1024 * 1024;
+
+  return _calcFileSha256(file).then(function (sha256) {
+    return _safeJsonFetch('/api/upload/init', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Upload-Ticket': ticket
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        fileName: file.name || 'file.bin',
+        fileType: file.type || 'application/octet-stream',
+        size: file.size,
+        totalChunks: Math.ceil(file.size / CHUNK),
+        sha256: sha256
+      })
+    });
+  }).then(function (initRes) {
+    if (signalObj.cancelRequested) {
+      if (initRes && initRes.uploadId) {
+        fetch('/api/upload/cancel', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Upload-Ticket': ticket },
+          credentials: 'same-origin',
+          body: JSON.stringify({ uploadId: initRes.uploadId })
+        }).catch(function () {});
+      }
+      throw { aborted: true };
+    }
+    if (!initRes || !initRes.ok) {
+      throw new Error((initRes && initRes.error) || '初始化失败');
+    }
+    if (!initRes.needUpload) {
+      if (onProgress) onProgress(file.size, file.size);
+      return {
+        ok: true,
+        fileId: initRes.fileId,
+        fileName: file.name,
+        fileSize: file.size,
+        fileType: file.type || 'application/octet-stream',
+        _instant: true
+      };
+    }
+
+    var uploadId = initRes.uploadId;
+    signalObj.uploadId = uploadId;
+    if (state.uploadTask) state.uploadTask.uploadId = uploadId;
+
+    var chunkSize = initRes.chunkSize || CHUNK;
+    var totalChunks = Math.ceil(file.size / chunkSize);
+
+    function uploadNext(index) {
+      if (signalObj.cancelRequested) {
+        return Promise.reject({ aborted: true });
+      }
+      if (index >= totalChunks) {
+        return _safeJsonFetch('/api/upload/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Upload-Ticket': ticket },
+          credentials: 'same-origin',
+          body: JSON.stringify({ uploadId: uploadId })
+        });
+      }
+      var start = index * chunkSize;
+      var end = Math.min(start + chunkSize, file.size);
+      var chunk = file.slice(start, end);
+      return chunk.arrayBuffer().then(function (ab) {
+        return _uploadOneChunk(uploadId, index, ab, ticket, signalObj);
+      }).then(function (r) {
+        if (!r || !r.ok) {
+          throw new Error((r && r.error) || '分片 #' + index + ' 上传失败');
+        }
+        if (onProgress) onProgress(end, file.size);
+        return uploadNext(index + 1);
+      });
+    }
+    return uploadNext(0);
+  });
+}
+
+/* ===== 统一文件发送入口：按类型/大小自动选择路径 ===== */
+function sendFileObject(file) {
+  if (!file) return;
+  if (state.readonlyMode) { showToast('🔒 只读模式已启用，无法发送文件'); return; }
+  if (state.isSending) { showToast(t('toastSending')); return; }
+  if (!state.socket || !state.socket.connected) {
+    showConnectionStatus('error', t('connServerLost')); return;
+  }
+  var targetId = state.currentTarget, type = state.currentType;
+  if (!targetId) { showToast(t('toastPickContact')); return; }
+  if (type === 'group') {
+    var g = state.groups[targetId];
+    if (g && g.muted && g.muted[state.myId]) {
+      showToast(t('toastMutedByGroup')); return;
+    }
+  }
+  if (file.size > state.maxFileSize) {
+    showToast(t('qqFileTooLargePrefix') +
+      (state.maxFileSize / 1048576).toFixed(0) + t('qqFileTooLargeSuffix'));
+    return;
+  }
+
+  var fileName = file.name || ('file_' + Date.now() + '.bin');
+  var fileType = file.type || 'application/octet-stream';
+  var isImage = /^image\//.test(fileType);
+
+  /* 图片：压缩后走 base64（压缩后一般 < 1MB） */
+  if (isImage) {
+    var rd = new FileReader();
+    rd.onload = function (ev) {
+      compressImage(ev.target.result, 1280, 0.75).then(function (c) {
+        sendFileMessage(fileName, Math.round(c.length * 0.75), 'image/jpeg', c);
+      }).catch(function () {
+        showToast('图片处理失败');
+      });
+    };
+    rd.onerror = function () { showToast(t('toastFileReadFail')); };
+    rd.readAsDataURL(file);
+    return;
+  }
+
+  if (file.size > 2 * 1024 * 1024) {
+    if (state.uploadTask) {
+      showToast('已有文件正在上传，请等待完成或先取消');
+      return;
+    }
+    _getUploadTicketAsync(function (ticket) {
+      if (!ticket) {
+        showToast('获取上传权限失败，请重试');
+        return;
+      }
+      var signalObj = { cancelRequested: false, xhr: null, uploadId: null };
+      var startAt = Date.now();
+      state.uploadTask = {
+        ticket: ticket,
+        uploadId: null,
+        fileName: fileName,
+        cancelRequested: false,
+        xhr: null
+      };
+
+      _showUploadProgressUI(fileName);
+      _updateUploadProgressUI(0, file.size, startAt);
+
+      _chunkedUpload(file, ticket, function (uploaded, total) {
+        if (state.uploadTask) {
+          state.uploadTask.xhr = signalObj.xhr;
+          state.uploadTask.uploadId = signalObj.uploadId;
+        }
+        _updateUploadProgressUI(uploaded, total, startAt);
+      }, signalObj).then(function (res) {
+        /* 取消竞态：complete 恰好成功也要忽略 */
+        if (signalObj.cancelRequested) throw { aborted: true };
+
+        _hideUploadProgressUI();
+        state.uploadTask = null;
+        if (!res || !res.ok) {
+          showToast('上传失败：' + ((res && res.error) || '未知错误'));
+          return;
+        }
+        _doSendMessageMeta(res.fileId, fileName, res.fileSize, fileType, null);
+        showToast(res._instant ? '⚡ 秒传成功' : '✅ 文件已上传');
+      }).catch(function (e) {
+        _hideUploadProgressUI();
+        state.uploadTask = null;
+        if (e && e.aborted) {
+          showToast('已取消上传');
+          return;
+        }
+        console.error('[chunked-upload]', e);
+        showToast('上传异常：' + (e && e.message || '未知'));
+      });
+    });
+    return;
+  }
+
+  /* 小文件（≤ 2MB，非图片）：原 base64 逻辑 */
+  var rd2 = new FileReader();
+  rd2.onload = function (ev) {
+    sendFileMessage(fileName, file.size, fileType, ev.target.result);
+  };
+  rd2.onerror = function () { showToast(t('toastFileReadFail')); };
+  rd2.readAsDataURL(file);
+}
+
 function sendFileMessage(fileName, fileSize, fileType, dataUrl) {
   if (state.readonlyMode) { showToast('🔒 只读模式已启用，无法发送文件'); return; }
   if (state.isSending) return;
@@ -38782,37 +43324,122 @@ function sendFileMessage(fileName, fileSize, fileType, dataUrl) {
     var g = state.groups[targetId];
     if (g && g.muted && g.muted[state.myId]) { showToast(t('toastMutedByGroup')); return; }
   }
+  
   state.isSending = true;
+
+  // ★ 大文件拦截（超过 1MB 的 Base64 数据不走 Socket.io）
+  if (dataUrl.length > 1.3 * 1024 * 1024) {
+    showToast('正在计算文件特征...');
+    
+    var _reqUpload = function(ticket, sha256) {
+        var size = Math.round(dataUrl.length * 0.75);
+        fetch('/api/upload/check', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Upload-Ticket': ticket },
+            body: JSON.stringify({ sha256: sha256, size: size })
+        }).then(function(r) { return r.json(); }).then(function(checkRes) {
+            if (checkRes && checkRes.ok && checkRes.fileId) {
+                _doSendMessageMeta(checkRes.fileId, fileName, size, fileType, null);
+                state.isSending = false;
+                showToast('⚡ 秒传成功');
+            } else {
+                showToast('正在上传大文件...');
+                fetch('/api/upload-file', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'X-Upload-Ticket': ticket },
+                  body: JSON.stringify({ fileData: dataUrl, fileName: fileName, fileType: fileType, sha256: sha256 })
+                }).then(function(r) { return r.json(); }).then(function(res) {
+                  if (res && res.ok) {
+                    _doSendMessageMeta(res.fileId, fileName, res.fileSize, fileType, dataUrl);
+                  } else {
+                    showToast('上传失败：' + (res.error || '未知错误'));
+                    state.isSending = false;
+                  }
+                }).catch(function() {
+                  showToast('上传异常，请重试');
+                  state.isSending = false;
+                });
+            }
+        }).catch(function() {
+            state.isSending = false;
+            showToast('检查秒传失败');
+        });
+    };
+
+    var _calcSha256 = function(cb) {
+        if (!window.crypto || !window.crypto.subtle) return cb(null); // 非 HTTPS 降级
+        try {
+            var base64 = dataUrl.split(',')[1];
+            var binary = atob(base64);
+            var len = binary.length;
+            var bytes = new Uint8Array(len);
+            for (var i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+            crypto.subtle.digest('SHA-256', bytes).then(function(hashBuffer) {
+                var hashArray = Array.from(new Uint8Array(hashBuffer));
+                cb(hashArray.map(function(b) { return b.toString(16).padStart(2, '0'); }).join(''));
+            }).catch(function() { cb(null); });
+        } catch(e) { cb(null); }
+    };
+
+    state.socket.emit('request-upload-ticket', {}, function(ticketRes) {
+        if (!ticketRes || !ticketRes.ok) {
+            showToast('获取上传权限失败');
+            state.isSending = false;
+            return;
+        }
+        _calcSha256(function(sha256) {
+            _reqUpload(ticketRes.ticket, sha256);
+        });
+    });
+    return;
+  }
+  // 走小文件逻辑（<1MB）
+  _doSendMessageMeta(null, fileName, fileSize, fileType, dataUrl);
+}
+
+function _doSendMessageMeta(fileId, fileName, fileSize, fileType, dataUrl) {
+  var targetId = state.currentTarget, type = state.currentType;
   var msgId = generateMsgId();
   var reply = state.replyContext ? {
     msgId: state.replyContext.msgId,
     content: state.replyContext.content,
     sender: state.replyContext.sender
   } : null;
+
   var msg = {
     from: state.myId, to: targetId, content: '',
     time: getFullTime(), msgId: msgId,
-    type: 'file', fileName: fileName, fileSize: fileSize, fileType: fileType,
-    fileData: dataUrl, reply: reply,
-    recalled: false, recalledBy: null, status: 'sending', readUsers: [],
+    type: 'file',
+    fileName: fileName, fileSize: fileSize, fileType: fileType,
+    fileId: fileId || null,
+    fileData: dataUrl || null,
+    _needsFetch: !!(fileId && !dataUrl),
+    reply: reply,
+    recalled: false, recalledBy: null,
+    status: 'sending', readUsers: [],
     fromLevel: state.myLevel, fromVip: state.myVip, fromAdmin: state.isAdmin,
     fromVerified: state.myVerified || '',
     fromAvatar: (state.myProfile && state.myProfile.avatar) || ''
   };
   addMessage(targetId, msg, type);
+
+  var payload = {
+    content: '', msgId: msgId, type: 'file',
+    fileName: fileName, fileSize: fileSize, fileType: fileType,
+    fileId: fileId || null,
+    /* 已有 fileId（文件已落盘到 filestore）时不再回传 base64，避免服务端重复存储 */
+    fileData: fileId ? null : (dataUrl || null),
+    reply: reply
+  };
+
   if (type === 'private') {
-    state.socket.emit('private-message', {
-      to: targetId, content: '', msgId: msgId, type: 'file',
-      fileName: fileName, fileSize: fileSize, fileType: fileType,
-      fileData: dataUrl, reply: reply
-    });
+    payload.to = targetId;
+    state.socket.emit('private-message', payload);
   } else if (type === 'group') {
-    state.socket.emit('group-message', {
-      groupId: targetId, content: '', msgId: msgId, type: 'file',
-      fileName: fileName, fileSize: fileSize, fileType: fileType,
-      fileData: dataUrl, reply: reply
-    });
+    payload.groupId = targetId;
+    state.socket.emit('group-message', payload);
   }
+
   clearDraftForCurrent();
   clearReplyContext();
   markMessageSent(targetId, type, msgId);
@@ -39908,7 +44535,7 @@ function openRenameHistory(userId) {
 var _editAvatarData = '';
 var _editGender = '';
 var _editMood = '';
-var _editPersonality = '';   /* ★ v0.32.0：MBTI 性格 4 位代码 */
+var _editPersonality = '';   /* MBTI 性格 4 位代码 */
 
 var MOOD_PRESETS = [
   { e: '😊', i18nKey: 'moodHappy'    },
@@ -40846,7 +45473,7 @@ function clearReplyContext() {
 dom.replyHint.addEventListener('click', clearReplyContext);
 
 dom.msgInput.addEventListener('input', function () {
-  /* ★ v0.32.2：用户可关闭自动保存草稿 */
+  /* 用户可关闭自动保存草稿 */
   if (state.autoSaveDraft !== false) saveDraftDebounced();
 });
 
@@ -41001,6 +45628,20 @@ function showMsgMenu(x, y, msgId, from) {
   var editItem   = menu.querySelector('.menu-item[data-action="edit"]');
   var recallItem = menu.querySelector('.menu-item[data-action="recall"]');
 
+  /* ★ 编辑记录入口：有历史才显示 */
+  var jumpItem = menu.querySelector('.menu-item[data-action="jump-origin"]');
+  if (jumpItem) {
+    var _hasReply = !!(msg.reply && msg.reply.msgId);
+    jumpItem.style.display = _hasReply ? 'block' : 'none';
+    jumpItem.textContent = '↗️ ' + t('jumpToOrigin');
+  }
+  var histItem = menu.querySelector('.menu-item[data-action="edit-history"]');
+  if (histItem) {
+    var _hasHist = Array.isArray(msg.editHistory) && msg.editHistory.length > 0;
+    histItem.style.display = _hasHist ? 'block' : 'none';
+    histItem.textContent = '📝 ' + t('editHistoryTitle') +
+      (_hasHist ? ' (' + msg.editHistory.length + ')' : '');
+  }
   if (editItem) {
     editItem.style.display = canEditBase ? 'block' : 'none';
     editItem.textContent = t('msgEditBtn');
@@ -41104,7 +45745,15 @@ document.addEventListener('click', function (e) {
     var msgId = dom.msgMenu.dataset.msgid;
     dom.msgMenu.style.display = 'none';
 
-    if (action === 'edit') startEditMessage(msgId);
+    if (action === 'jump-origin') {
+      var _jm = findMessageById(msgId);
+      if (_jm && _jm.reply && _jm.reply.msgId) jumpToMsg(_jm.reply.msgId);
+    }
+    else if (action === 'edit-history') {
+      var _hm = findMessageById(msgId);
+      showEditHistory(_hm);
+    }
+    else if (action === 'edit') startEditMessage(msgId);
     else if (action === 'recall') handleRecall(msgId);
     else if (action === 'delete') handleDelete(msgId);
     else if (action === 'reply') handleReply(msgId);
@@ -41142,6 +45791,138 @@ document.addEventListener('click', function (e) {
     }
   });
 })();
+/* ★ 定时发送：UI 交互 */
+function openScheduleSend() {
+  var modal = document.getElementById('scheduleSendModal');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  modal.classList.add('open');
+  var tEl = document.getElementById('scheduleSendTime');
+  if (tEl && !tEl.value) {
+    var d = new Date(Date.now() + 5 * 60 * 1000);
+    var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+    tEl.value = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+  var cEl = document.getElementById('scheduleSendContent');
+  if (cEl && !cEl.value && dom.msgInput) cEl.value = dom.msgInput.value || '';
+  renderScheduleSendList();
+}
+function renderScheduleSendList() {
+  var box = document.getElementById('scheduleSendList');
+  if (!box) return;
+  var list = state.scheduled || [];
+  if (!list.length) { box.innerHTML = '<div style="color:var(--text-muted);">暂无定时消息</div>'; return; }
+  var h = '';
+  for (var i = 0; i < list.length; i++) {
+    var t2 = list[i];
+    var when = new Date(t2.sendAt).toLocaleString('zh-CN', { hour12: false });
+    h += '<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid rgba(0,0,0,.05);">' +
+      '<span style="color:var(--text-muted);">' + when + '</span>' +
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+      escapeHtml(String(t2.content || '').slice(0, 30)) + '</span>' +
+      '<button type="button" data-cancel-sched="' + escapeHtml(t2.id) + '" ' +
+      'style="font-size:11px;padding:2px 8px;border:1px solid var(--border-input);border-radius:6px;background:none;cursor:pointer;">取消</button>' +
+      '</div>';
+  }
+  box.innerHTML = h;
+  var btns = box.querySelectorAll('[data-cancel-sched]');
+  for (var j = 0; j < btns.length; j++) {
+    btns[j].addEventListener('click', function () {
+      var id = this.getAttribute('data-cancel-sched');
+      if (state.socket && state.socket.connected) {
+        state.socket.emit('scheduled-remove', { id: id });
+      }
+      state.scheduled = (state.scheduled || []).filter(function (x) { return x.id !== id; });
+      renderScheduleSendList();
+    });
+  }
+}
+(function initScheduleSend() {
+  var btn = document.getElementById('scheduleSendBtn');
+  if (btn && !btn._bound) {
+    btn._bound = true;
+    btn.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      if (!state.currentTarget) { showToast('请先选择会话'); return; }
+      openScheduleSend();
+    });
+  }
+  var ok = document.getElementById('scheduleSendOk');
+  if (ok && !ok._bound) {
+    ok._bound = true;
+    ok.addEventListener('click', function () {
+      var tEl = document.getElementById('scheduleSendTime');
+      var cEl = document.getElementById('scheduleSendContent');
+      var when = tEl ? new Date(tEl.value).getTime() : 0;
+      var text = cEl ? String(cEl.value || '').trim() : '';
+      if (!text) { showToast('请输入内容'); return; }
+      if (!when || when <= Date.now()) { showToast(t('scheduleSendFuture')); return; }
+      if (state.socket && state.socket.connected) {
+        state.socket.emit('scheduled-add', { task: {
+          id: 'sch_' + Date.now().toString(36),
+          target: state.currentTarget,
+          type: state.currentType,
+          content: text,
+          msgType: 'text',
+          sendAt: when
+        } });
+      }
+      showToast(t('scheduleSendOk'));
+      var modal = document.getElementById('scheduleSendModal');
+      if (modal) { modal.style.display = 'none'; modal.classList.remove('open'); }
+      if (dom.msgInput) dom.msgInput.value = '';
+    });
+  }
+  var cancel = document.getElementById('scheduleSendCancel');
+  if (cancel && !cancel._bound) {
+    cancel._bound = true;
+    cancel.addEventListener('click', function () {
+      var modal = document.getElementById('scheduleSendModal');
+      if (modal) { modal.style.display = 'none'; modal.classList.remove('open'); }
+    });
+  }
+})();
+
+/* ★ 编辑历史查看弹窗 */
+function showEditHistory(msg) {
+  if (!msg || !Array.isArray(msg.editHistory) || !msg.editHistory.length) {
+    showToast(t('noEditHistory'));
+    return;
+  }
+  var h = '<div style="max-height:340px;overflow-y:auto;">';
+  h += '<div style="padding:8px;background:rgba(7,193,96,.08);border-radius:8px;margin-bottom:8px;">';
+  h += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:4px;">当前版本</div>';
+  h += '<div style="font-size:13.5px;white-space:pre-wrap;">' + escapeHtml(msg.content || '') + '</div>';
+  h += '</div>';
+  for (var i = msg.editHistory.length - 1; i >= 0; i--) {
+    var e = msg.editHistory[i];
+    var tt = new Date(e.at).toLocaleString('zh-CN', { hour12: false });
+    h += '<div style="padding:8px;border-left:3px solid var(--border-input);margin-bottom:6px;">';
+    h += '<div style="font-size:11.5px;color:var(--text-muted);margin-bottom:3px;">' +
+      tt + (e.by ? ' · ' + escapeHtml(e.by) : '') + '</div>';
+    h += '<div style="font-size:13px;white-space:pre-wrap;opacity:.8;">' +
+      escapeHtml(e.content || '') + '</div></div>';
+  }
+  h += '</div>';
+  showModal('📝 ' + t('editHistoryTitle') + '（' + msg.editHistory.length + '）', h);
+}
+
+/* ★ 引用跳转：滚动到被引用的原消息并高亮 */
+function jumpToMsg(msgId) {
+  if (!msgId) return;
+  try {
+    var el = dom.messageList.querySelector('.msg[data-msgid="' + msgId + '"]');
+    if (!el) {
+      showToast(t('msgHighlight'));
+      return;
+    }
+    if (el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('msg-highlight');
+    setTimeout(function () { el.classList.remove('msg-highlight'); }, 2000);
+  } catch (e) {}
+}
+
 function findMessageById(msgId) {
   var k;
   for (k in state.messages) {
@@ -41195,12 +45976,6 @@ function handleDelete(msgId) {
     var arr = state.messages[k];
     for (var i = 0; i < arr.length; i++) {
       if (arr[i].msgId === msgId) {
-        /* ★ v0.32.0：同步清理 burn 索引与定时器，避免内存泄漏 */
-        if (typeof _burnIndexDel === 'function') _burnIndexDel(msgId);
-        if (typeof burnTimers !== 'undefined' && burnTimers[msgId]) {
-          try { clearTimeout(burnTimers[msgId]); } catch (e) {}
-          delete burnTimers[msgId];
-        }
         arr.splice(i, 1);
         if (state.currentTarget === k && state.currentType === 'private') renderMessages();
         renderContacts();
@@ -41420,7 +46195,7 @@ function handleCopy(msgId) {
   var msg = findMessageById(msgId);
   if (!msg) return;
   var text = msgPreviewText(msg, 99999);
-  /* ★ v0.32.2：复制时可选是否带发送者 */
+  /* 复制时可选是否带发送者 */
   if (state.copyWithSender !== false &&
       msg.from !== 'SYSTEM' && msg.from !== 'system' &&
       !isSystemUserId(msg.from)) {
@@ -41588,7 +46363,7 @@ dom.groupMenuLeave.addEventListener('click', function () {
   });
 })();
 
-/* ★ v0.32.0：renderContacts 加 80ms 去抖，把连续多次调用合并为一次渲染 */
+/* renderContacts 加 80ms 去抖，把连续多次调用合并为一次渲染 */
 var _renderContactsTimer = null;
 function renderContacts() {
   if (_renderContactsTimer) clearTimeout(_renderContactsTimer);
@@ -41601,7 +46376,7 @@ function _renderContactsNow() {
   var privHtml = '';
   var ids = [];
   var k;
-  /* ★ v0.32.0 修复：判据统一为 !getIsPC()，避免 960×540 等尺寸下渲染样式与 CSS 不一致 */
+  /* 修复：判据统一为 !getIsPC()，避免 960×540 等尺寸下渲染样式与 CSS 不一致 */
   var _isMobileView = !getIsPC();
   for (k in state.users) {
     if (!state.users.hasOwnProperty(k)) continue;
@@ -41970,11 +46745,11 @@ function _renderContactsNow() {
       var ava = el.querySelector('.avatar');
       if (ava && el.dataset.type === 'private') {
         ava.style.cursor = 'pointer';
-        ava.title = state.lang === 'en' ? 'View profile' : '查看名片';
         ava.addEventListener('click', function (ev) {
           ev.stopPropagation();
           var uid = el.dataset.id;
-          if (uid && state.users[uid]) openProfile(uid);
+          if (!uid || !state.users[uid]) return;
+          openProfile(uid);
         });
       }
 
@@ -42059,25 +46834,43 @@ function selectContact(id, type) {
   if (state.currentTarget && dom.msgInput && !dom.msgInput.disabled) saveDraftNow();
 
   try {
-    /* ★ v0.32.1：只裁剪"其它"会话，避免当前目标会话刚加载的更早消息被误裁
-       阈值放大到 2× CLIENT_MAX_HISTORY，兼顾内存与"加载更早"体验 */
-    var _trimThreshold = CLIENT_MAX_HISTORY * 2;
+    /* ★ 优化：极其激进地释放非当前会话的 Base64 大文件，防止浏览器崩溃 */
+    var _trimThreshold = CLIENT_MAX_HISTORY;
     var _mk;
+    
+    function _aggressiveTrim(arr) {
+        if (!Array.isArray(arr)) return;
+        // 超出条数的裁切
+        if (arr.length > _trimThreshold) {
+            _trimClientHistory(arr);
+        }
+        // 强杀大文件 Base64 缓存（图片、视频、语音）
+        for (var _i = 0; _i < arr.length; _i++) {
+            var _m = arr[_i];
+            if (_m && _m.fileData && typeof _m.fileData === 'string' && _m.fileData.length > 1024) {
+                // 只有存在 fileId（能从服务器重新拉）或者可以重新上传的，才删除本地缓存
+                if (_m.fileId) {
+                    _m.fileData = null;
+                    _m._needsFetch = true;
+                }
+            }
+        }
+    }
+
     for (_mk in state.messages) {
       if (!state.messages.hasOwnProperty(_mk)) continue;
-      if (_mk === id && type === 'private') continue;  /* 跳过本次要打开的私聊 */
-      var _arr2 = state.messages[_mk];
-      if (Array.isArray(_arr2) && _arr2.length > _trimThreshold) {
-        _trimClientHistory(_arr2);
-      }
+      if (_mk === id && type === 'private') continue;
+      _aggressiveTrim(state.messages[_mk]);
     }
     for (_mk in state.groups) {
       if (!state.groups.hasOwnProperty(_mk)) continue;
-      if (_mk === id && type === 'group') continue;    /* 跳过本次要打开的群聊 */
+      if (_mk === id && type === 'group') continue;
       var _g2 = state.groups[_mk];
-      if (_g2 && Array.isArray(_g2.messages) && _g2.messages.length > _trimThreshold) {
-        _trimClientHistory(_g2.messages);
-      }
+      if (_g2) _aggressiveTrim(_g2.messages);
+    }
+    // 顺手清理一下浏览器的全局大文件对象
+    if (window.__blobRegistry && window.__blobRegistry.size > 50) {
+        window.__blobRegistry.clear();
     }
   } catch (eTrim) { console.warn('[selectContact] trim 失败:', eTrim && eTrim.message); }
   if (typeof stopTypingNow === 'function') stopTypingNow();
@@ -42089,6 +46882,8 @@ function selectContact(id, type) {
   state.currentType = type;
   state.unread[id] = 0;
   delete state.mentions[id];
+  state._cursorMissingCount = 0;
+  state._emptyBatchCount = 0;
 
   var _chatKey = (type === 'private' ? 'private_' : 'group_') + id;
   state.lastReadTime[_chatKey] = Date.now();
@@ -42317,6 +47112,8 @@ function applyReadonlyUI() {
         voiceCallBtn: 1, videoCallBtn: 1, groupCallBtn: 1, mentionBtn: 1,
         quickReplyBtn: 1, emojiBtn: 1, redpacketBtn: 1, fileBtn: 1,
         voiceBtn: 1, burnBtn: 1, sendBtn: 1
+        /* ★ 注意：settingsBtn 绝不加入此列表 —— 否则只读模式下用户
+           无法打开设置面板，也就无法在只读被解除后切回普通模式 */
       };
       var allTools = document.querySelectorAll('.input-area button');
       for (var i = 0; i < allTools.length; i++) {
@@ -42528,21 +47325,48 @@ function renderPlaceholder() {
   dom.scrollBottomBtn.classList.remove('visible');
 }
 
-/* ★ v0.32.0：renderMessages 去抖，连续调用合并为一次 */
+function _renderFilePlaceholder(msg, kind, icon, displayName) {
+  var sizeTxt = formatFileSize(msg.fileSize || 0);
+  var hint = (kind === 'voice') ? '点击播放' : '点击加载';
+  return '<div class="file-placeholder" ' +
+    'data-load-fid="' + escapeHtml(msg.fileId || '') + '" ' +
+    'data-load-mid="' + escapeHtml(msg.msgId || '') + '" ' +
+    'data-load-kind="' + kind + '" ' +
+    'style="display:flex;align-items:center;gap:10px;padding:10px 14px;' +
+    'background:rgba(var(--accent-rgb),.06);' +
+    'border:1px dashed rgba(var(--accent-rgb),.4);' +
+    'border-radius:12px;min-width:200px;max-width:280px;cursor:pointer;' +
+    'transition:background .15s,border-color .15s;user-select:none;">' +
+    '<div style="font-size:26px;line-height:1;flex-shrink:0;">' + icon + '</div>' +
+    '<div style="flex:1;min-width:0;">' +
+      '<div style="font-size:13px;font-weight:600;color:var(--text-primary);' +
+        'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+        escapeHtml(displayName) + '</div>' +
+      '<div style="font-size:11.5px;color:var(--text-muted);margin-top:2px;">' +
+        sizeTxt + ' · ' + hint + '</div>' +
+    '</div>' +
+    '<div style="font-size:16px;color:var(--accent);flex-shrink:0;">' +
+      (kind === 'voice' ? '▶' : '📥') + '</div>' +
+  '</div>';
+}
+
+/* renderMessages 去抖：连续调用合并为一次 */
 var _renderMessagesTimer = null;
-function renderMessages(immediate) {
+function renderMessages(immediate, opts) {
   if (immediate === true) {
     if (_renderMessagesTimer) { clearTimeout(_renderMessagesTimer); _renderMessagesTimer = null; }
-    _renderMessagesNow();
+    _renderMessagesNow(opts);
     return;
   }
   if (_renderMessagesTimer) clearTimeout(_renderMessagesTimer);
   _renderMessagesTimer = setTimeout(function () {
     _renderMessagesTimer = null;
-    _renderMessagesNow();
+    _renderMessagesNow(opts);
   }, 120);
 }
-function _renderMessagesNow() {
+function _renderMessagesNow(opts) {
+  opts = opts || {};
+  var _isPrepend = !!(opts.prependMsgs && opts.prependMsgs.length);
   var id = state.currentTarget, type = state.currentType;
   if (!id) { renderPlaceholder(); return; }
   var msgs = [];
@@ -42554,6 +47378,8 @@ function _renderMessagesNow() {
     dom.scrollBottomBtn.classList.remove('visible');
     return;
   }
+  var _msgsView = _isPrepend ? opts.prependMsgs : msgs;
+  var _prevMsg = _isPrepend ? (opts.prevMsg || null) : null;
   var html = '';
 
   var _hlKey = (type === 'private' ? 'private_' : 'group_') + id;
@@ -42574,7 +47400,10 @@ function _renderMessagesNow() {
   var lastDividerIdx = -1;
   var DIVIDER_EVERY = 10;
   var _rpToFetch = [];
-    var _rpToFetch = [];
+  if (_isPrepend && _prevMsg) {
+    lastDay = dayKey(parseMsgTime(_prevMsg));
+    lastDividerIdx = 0;
+  }
 
   var recalledBuf = [];
   function flushRecalled() {
@@ -42588,7 +47417,8 @@ function _renderMessagesNow() {
 
     if (recalledBuf.length > 1) {
       var text = _rNameHtml + (state.lang === 'en' ? ' recalled ' + recalledBuf.length + ' messages' : ' 撤回了 ' + recalledBuf.length + ' 条消息');
-      html += '<div class="sys-recalled-tip" data-msgid="' + first.msgId + '"><span>' + text + '</span></div>';
+      /* ★ 安全：msgId 由服务端生成，但仍来自网络；统一转义避免属性注入 */
+      html += '<div class="sys-recalled-tip" data-msgid="' + escapeHtml(first.msgId) + '"><span>' + text + '</span></div>';
     } else {
       var msg = first;
       var _oFromId = msg.originalFrom || '';
@@ -42607,8 +47437,8 @@ function _renderMessagesNow() {
   }
   if (!state.redPacketPending) state.redPacketPending = {};
   /* 修复：加载更早消息后必须渲染已加载数据，不能再只渲染最后 200 条 */
-  for (var i = 0; i < msgs.length; i++) {
-    var msg = msgs[i];
+  for (var i = 0; i < _msgsView.length; i++) {
+    var msg = _msgsView[i];
     var _ts = parseMsgTime(msg);
     var _dk = dayKey(_ts);
     var dateChanged = (_dk !== lastDay);
@@ -42865,6 +47695,7 @@ function _renderMessagesNow() {
                 grabbers: []
               }
             };
+            _clientCacheTrim(state.redPacketCache, _CLIENT_CACHE_LIMIT.redPacket);
           } else {
             state.redPacketPending[pid] = true;
             _rpToFetch.push(pid);
@@ -42921,46 +47752,85 @@ function _renderMessagesNow() {
           '</div>' +
         '</div>' +
       '</div>';
-    } else if (msg.type === 'file' || msg.type === 'voice') {
-      var ft = msg.fileType || '';
-      if (msg.type === 'voice' || ft.indexOf('audio/') === 0) {
-        var vdur = msg.duration || Math.max(1, Math.round((msg.fileSize || 20000) / 4000));
-        var bars = voiceWaveformBars(msg.msgId, vdur);
-        var barsHtml = '';
-        for (var bi = 0; bi < bars.length; bi++) {
-          barsHtml += '<span style="height:' + bars[bi] + 'px"></span>';
-        }
-        content += '<div class="voice-msg" data-url="' + escapeHtml(msg.fileData) +
-          '" data-duration="' + vdur + '">' +
-          '<button class="voice-play" title="' + escapeHtml(t('voicePlayTitle')) + '">▶</button>' +
-          '<div class="voice-bars">' + barsHtml + '</div>' +
-          '<span class="voice-duration">' + vdur + '"</span>' +
-          '<button class="voice-speed" title="' + escapeHtml(t('voiceSpeedTitle')) + '">' + (state.voicePlaybackSpeed === 1 ? '1x' : state.voicePlaybackSpeed + 'x') + '</button>' +
-          '<div class="voice-progress"></div>' +
-          '</div>';
-      } else if (ft.indexOf('image/') === 0) {
-        content += '<img src="' + escapeHtml(msg.fileData) + '" class="image-preview" data-src="' + escapeHtml(msg.fileData) +
-          '" loading="lazy" alt="' + escapeHtml(t('imagePreviewAlt')) + '">';
-      } else if (ft.indexOf('video/') === 0) {
-        var _videoMute = (state.videoMute !== false) ? ' muted' : '';
-        content += '<video src="' + escapeHtml(msg.fileData) + '" controls' +
-          _videoMute + ' class="video-preview" preload="none" playsinline></video>' +
-          '<div class="file-info"><span class="file-icon">🎬</span><div class="file-detail"><div class="file-name">' +
-          escapeHtml(msg.fileName) + '</div><div class="file-size">' + formatFileSize(msg.fileSize) + '</div></div>' +
-          '<button class="download-btn" data-url="' + escapeHtml(msg.fileData) + '" data-name="' + escapeHtml(msg.fileName) + '">' + escapeHtml(t('btnDownload')) + '</button></div>';
-      } else {
-        var icon = '📄';
-        if (ft.indexOf('pdf') === 0) icon = '📕';
-        else if (ft.indexOf('zip') >= 0 || ft.indexOf('rar') >= 0) icon = '🗜️';
-        else if (ft.indexOf('word') >= 0 || ft.indexOf('document') >= 0) icon = '📘';
-        else if (ft.indexOf('sheet') >= 0 || ft.indexOf('excel') >= 0) icon = '📗';
-        else if (ft.indexOf('presentation') >= 0) icon = '📙';
-        content += '<div class="file-info"><span class="file-icon">' + icon + '</span>' +
-          '<div class="file-detail"><div class="file-name">' + escapeHtml(msg.fileName) + '</div>' +
-          '<div class="file-size">' + formatFileSize(msg.fileSize) + '</div></div>' +
-          '<button class="download-btn" data-url="' + escapeHtml(msg.fileData) + '" data-name="' + escapeHtml(msg.fileName) + '">' + escapeHtml(t('btnDownload')) + '</button></div>';
+} else if (msg.type === 'file' || msg.type === 'voice') {
+  var ft = msg.fileType || '';
+  /* 普通模式下图片/视频/语音直接生成 URL，依靠浏览器缓存节省带宽 */
+  var _isMedia = (ft.indexOf('image/') === 0 || ft.indexOf('video/') === 0 || 
+                  ft.indexOf('audio/') === 0 || msg.type === 'voice');
+  
+  var _needLoad = !msg.fileData && msg.fileId && msg._loaded !== true && !_isMedia;
+  var _src = msg.fileData || (msg.fileId ? ('/api/file/' + msg.fileId) : '');
+
+  if (msg.type === 'voice' || ft.indexOf('audio/') === 0) {
+    if (_needLoad) {
+      content += _renderFilePlaceholder(msg, 'voice', '🎤',
+        msg.fileName || '语音消息');
+    } else {
+      var vdur = msg.duration || Math.max(1, Math.round((msg.fileSize || 20000) / 4000));
+      var bars = voiceWaveformBars(msg.msgId, vdur);
+      var barsHtml = '';
+      for (var bi = 0; bi < bars.length; bi++) {
+        barsHtml += '<span style="height:' + bars[bi] + 'px"></span>';
       }
-    } else if (msg.isCallRecord) {
+      content += '<div class="voice-msg" data-url="' + escapeHtml(_src) +
+        '" data-duration="' + vdur + '">' +
+        '<button class="voice-play" title="' + escapeHtml(t('voicePlayTitle')) + '">▶</button>' +
+        '<div class="voice-bars">' + barsHtml + '</div>' +
+        '<span class="voice-duration">' + vdur + '"</span>' +
+        '<button class="voice-speed" title="' + escapeHtml(t('voiceSpeedTitle')) + '">' +
+          (state.voicePlaybackSpeed === 1 ? '1x' : state.voicePlaybackSpeed + 'x') + '</button>' +
+        '<div class="voice-progress"></div>' +
+        '</div>';
+    }
+  } else if (ft.indexOf('image/') === 0) {
+    if (_needLoad) {
+      content += _renderFilePlaceholder(msg, 'image', '🖼️',
+        msg.fileName || '图片');
+    } else if (!_src) {
+      content += '<div style="padding:10px;color:#fa5151;font-size:12px;' +
+        'border:1px dashed #fa5151;border-radius:8px;">图片数据已损坏或丢失</div>';
+    } else {
+      content += '<img src="' + escapeHtml(_src) +
+        '" class="image-preview" data-src="' + escapeHtml(_src) +
+        '" loading="lazy" alt="' + escapeHtml(t('imagePreviewAlt')) + '">';
+    }
+  } else if (ft.indexOf('video/') === 0) {
+    if (_needLoad) {
+      content += _renderFilePlaceholder(msg, 'video', '🎬',
+        msg.fileName || '视频');
+    } else if (!_src) {
+      content += '<div style="padding:10px;color:#fa5151;font-size:12px;' +
+        'border:1px dashed #fa5151;border-radius:8px;">视频数据已损坏或丢失</div>';
+    } else {
+      var _videoMute = (state.videoMute !== false) ? ' muted' : '';
+          content += '<video src="' + escapeHtml(_src) + '" controls' +
+            _videoMute + ' class="video-preview" preload="none" playsinline></video>' +
+            '<div class="file-info"><span class="file-icon">🎬</span><div class="file-detail"><div class="file-name">' +
+            escapeHtml(msg.fileName) + '</div><div class="file-size">' + formatFileSize(msg.fileSize) + '</div></div>' +
+                  '<button class="download-btn" data-url="' + escapeHtml(_src) + '" data-name="' + escapeHtml(msg.fileName) + '" data-dl="1">' + escapeHtml(t('btnDownload')) + '</button></div>';
+    }
+  } else {
+    /* 普通文件：本来就是下载按钮，无需占位；数据为空仍走下载按钮 */
+    if (!_src) {
+      content += '<div style="padding:10px;color:#fa5151;font-size:12px;' +
+        'border:1px dashed #fa5151;border-radius:8px;">' +
+        (msg.fileDataMissing
+          ? '🧹 文件已被管理员清理'
+          : '文件数据已丢失') + '</div>';
+    } else {
+      var icon = '📄';
+      if (ft.indexOf('pdf') === 0) icon = '📕';
+      else if (ft.indexOf('zip') >= 0 || ft.indexOf('rar') >= 0) icon = '🗜️';
+      else if (ft.indexOf('word') >= 0 || ft.indexOf('document') >= 0) icon = '📘';
+else if (ft.indexOf('sheet') >= 0 || ft.indexOf('excel') >= 0) icon = '📗';
+else if (ft.indexOf('presentation') >= 0) icon = '📙';
+    content += '<div class="file-info"><span class="file-icon">' + icon + '</span>' +
+      '<div class="file-detail"><div class="file-name">' + escapeHtml(msg.fileName) + '</div>' +
+      '<div class="file-size">' + formatFileSize(msg.fileSize) + '</div></div>' +
+            '<button class="download-btn" data-url="' + escapeHtml(_src) + '" data-name="' + escapeHtml(msg.fileName) + '" data-dl="1">' + escapeHtml(t('btnDownload')) + '</button></div>';
+    }
+  }
+} else if (msg.isCallRecord) {
       var _callIcon = (msg.callKind === 'video') ? '📹' : '📞';
       var _callDur = Math.max(0, Math.round(Number(msg.callDuration) || 0));
       var _isInit = (msg.callInitiator === state.myId);
@@ -43167,8 +48037,8 @@ function _renderMessagesNow() {
         escapeHtml(names.join(t('listJoin'))) + '</div>';
     }
     var merged = false;
-    if (state.mergeMessages && i > 0) {
-      var prevMsg = msgs[i - 1];
+    if (state.mergeMessages) {
+      var prevMsg = (i > 0) ? _msgsView[i - 1] : (_isPrepend ? _prevMsg : null);
       if (prevMsg && prevMsg.from === msg.from && !prevMsg.recalled &&
           !msg.recalled && !msg.reply &&
           (parseMsgTime(msg) - parseMsgTime(prevMsg) < 300000)) {
@@ -43291,7 +48161,16 @@ function _renderMessagesNow() {
 
   flushRecalled();
 
-  list.innerHTML = html;
+  /* ★ 分帧渲染：异步 append 完成后，再执行原有的绑定 + 滚动逻辑
+     把「一次性 innerHTML = 上千条」拆成「每帧 50 条」，主线程不阻塞 */
+  var _prependPrevHeight = 0;
+  var _prependPrevTop = 0;
+  if (_isPrepend) {
+    _prependPrevHeight = list.scrollHeight;
+    _prependPrevTop = list.scrollTop;
+  }
+
+  _renderHtmlInFrames(list, html, function _afterRenderMessages() {
 
   if (_rpToFetch.length) {
     if (state.socket && state.socket.connected) {
@@ -43311,10 +48190,20 @@ function _renderMessagesNow() {
     }
   }
 
+  if (_isPrepend) {
+    /* prepend 增量：恢复视觉位置，跳过底部滚动与已读上报 */
+    var _newH = list.scrollHeight;
+    list.scrollTop = _prependPrevTop + (_newH - _prependPrevHeight);
+    state._keepScrollPos = false;
+    state._refreshStayBottom = false;
+    updateScrollBtns();
+    /* 新 historyLoader 已随 _nodes 首位插入最前，无需在此替换 */
+  }
+
   var imgs = list.querySelectorAll('.image-preview');
   for (var ii = 0; ii < imgs.length; ii++) {
     (function (im) {
-      im.addEventListener('click', function () {
+      _bindOnce(im, 'click', function () {
         var src = im.dataset.src || im.src || '';
         if (!src || src.indexOf('data:') !== 0) {
           showToast('图片正在加载，请稍候…');
@@ -43332,16 +48221,21 @@ function _renderMessagesNow() {
   var dls = list.querySelectorAll('.download-btn');
   for (var dd = 0; dd < dls.length; dd++) {
     (function (b) {
-      b.addEventListener('click', function (e) {
+      _bindOnce(b, 'click', function (e) {
         e.stopPropagation();
-        downloadData(b.dataset.url, b.dataset.name);
+        var _u = b.dataset.url || '';
+        if (b.dataset.dl === '1' && _u.indexOf('/api/file/') === 0 &&
+            _u.indexOf('dl=1') === -1) {
+          _u += (_u.indexOf('?') === -1 ? '?dl=1' : '&dl=1');
+        }
+        downloadData(_u, b.dataset.name);
       });
     })(dls[dd]);
   }
   var reps = list.querySelectorAll('.reply-block');
   for (var rj = 0; rj < reps.length; rj++) {
     (function (b) {
-      b.addEventListener('click', function (e) {
+      _bindOnce(b, 'click', function (e) {
         e.stopPropagation();
         var jid = b.dataset.jumpid;
         if (jid) jumpToMessage(jid);
@@ -43351,7 +48245,7 @@ function _renderMessagesNow() {
   var rpBubbles = list.querySelectorAll('.redpacket-bubble');
   for (var rbi = 0; rbi < rpBubbles.length; rbi++) {
     (function (el) {
-      el.addEventListener('click', function (e) {
+      _bindOnce(el, 'click', function (e) {
         e.stopPropagation();
         var pid = el.getAttribute('data-packetid');
         if (pid) openRedpacketDetail(pid);
@@ -43362,7 +48256,7 @@ function _renderMessagesNow() {
   var _locCards = list.querySelectorAll('.location-card');
   for (var _lci = 0; _lci < _locCards.length; _lci++) {
     (function (el) {
-      el.addEventListener('click', function (e) {
+      _bindOnce(el, 'click', function (e) {
         e.stopPropagation();
         var gm = el.getAttribute('data-gmaps');
         if (!gm) return;
@@ -43377,7 +48271,7 @@ function _renderMessagesNow() {
   var wcBtns = list.querySelectorAll('.welcome-changelog-btn');
   for (var wci = 0; wci < wcBtns.length; wci++) {
     (function (btn) {
-      btn.addEventListener('click', function (e) {
+      _bindOnce(btn, 'click', function (e) {
         e.stopPropagation();
         e.preventDefault();
         if (typeof window.__openChangelog === 'function') window.__openChangelog();
@@ -43387,7 +48281,7 @@ function _renderMessagesNow() {
   var whBtns = list.querySelectorAll('.welcome-help-btn');
   for (var whi = 0; whi < whBtns.length; whi++) {
     (function (btn) {
-      btn.addEventListener('click', function (e) {
+      _bindOnce(btn, 'click', function (e) {
         e.stopPropagation();
         e.preventDefault();
         if (typeof window.__openAbout === 'function') window.__openAbout();
@@ -43406,28 +48300,22 @@ function _renderMessagesNow() {
         if (pid.indexOf('local_') === 0) return;
         openRedpacketDetail(pid);
       }
-      el.addEventListener('click', function (e) {
-        _openTag(e);
-      });
-      el.addEventListener('touchend', function (e) {
+      _bindOnce(el, 'click', function (e) { _openTag(e); });
+      _bindOnce(el, 'touchend', function (e) {
         if (_tagFired) return;
         _tagFired = true;
         setTimeout(function () { _tagFired = false; }, 400);
         _openTag(e);
-      }, { passive: false });
-      el.addEventListener('touchstart', function (e) {
-        e.stopPropagation();
-      }, { passive: true });
-      el.addEventListener('touchmove', function (e) {
-        e.stopPropagation();
-      }, { passive: true });
+      });
+      _bindOnce(el, 'touchstart', function (e) { e.stopPropagation(); });
+      _bindOnce(el, 'touchmove', function (e) { e.stopPropagation(); });
     })(rpSysTags[rsti]);
   }
 
   var vmsgs = list.querySelectorAll('.voice-msg');
   for (var vi = 0; vi < vmsgs.length; vi++) {
     (function (v) {
-      v.addEventListener('click', function (e) {
+      _bindOnce(v, 'click', function (e) {
         if (e.target && e.target.classList && e.target.classList.contains('voice-speed')) return;
         if (e.target && e.target.classList && e.target.classList.contains('voice-play')) {
           playVoiceMessage(v, v.getAttribute('data-url'),
@@ -43439,7 +48327,7 @@ function _renderMessagesNow() {
       });
       var spd = v.querySelector('.voice-speed');
       if (spd) {
-        spd.addEventListener('click', function (e) {
+        _bindOnce(spd, 'click', function (e) {
           e.stopPropagation();
           var order = [1, 1.5, 2];
           var idx = order.indexOf(state.voicePlaybackSpeed);
@@ -43458,7 +48346,7 @@ function _renderMessagesNow() {
   var retries = list.querySelectorAll('.retry-btn');
   for (var ri = 0; ri < retries.length; ri++) {
     (function (btn) {
-      btn.addEventListener('click', function (e) {
+      _bindOnce(btn, 'click', function (e) {
         e.stopPropagation();
         retryMessage(btn.getAttribute('data-retry'));
       });
@@ -43468,7 +48356,7 @@ function _renderMessagesNow() {
   var rChips = list.querySelectorAll('.reaction-chip');
   for (var rc = 0; rc < rChips.length; rc++) {
     (function (chip) {
-      chip.addEventListener('click', function (e) {
+      _bindOnce(chip, 'click', function (e) {
         e.stopPropagation();
         var el = chip.closest ? chip.closest('.msg') : null;
         if (!el) return;
@@ -43481,7 +48369,7 @@ function _renderMessagesNow() {
     var names = list.querySelectorAll('.recalled-by.clickable[data-uid], .recalled-original.clickable[data-uid]');
     for (var i = 0; i < names.length; i++) {
       (function (el) {
-        el.addEventListener('click', function (e) {
+        _bindOnce(el, 'click', function (e) {
           e.stopPropagation();
           e.preventDefault();
           var uid = el.getAttribute('data-uid');
@@ -43495,54 +48383,9 @@ function _renderMessagesNow() {
     }
   })();
 
-  /* ★ v0.32.2：渲染完成后自动拉取被剥离到磁盘的大文件（图片/视频/语音）
-     - 每次最多拉 5 个，避免一次性打满服务器
-     - 拉取成功后重渲染本会话；已拉取的消息带 _fetching 标记不再重复请求 */
-  (function _autoFileFetch() {
-    if (!state.socket || !state.socket.connected) return;
-    if (!msgs || !msgs.length) return;
-    var _key = (type === 'private' ? 'private_' : 'group_') + id;
-    var _need = [];
-    for (var _fi = 0; _fi < msgs.length; _fi++) {
-      var _fm = msgs[_fi];
-      if (!_fm || !_fm._needsFetch || !_fm.fileId) continue;
-      if (_fm._fetching || _fm.fileData) continue;
-      if (_fm.type !== 'file' && _fm.type !== 'voice' && _fm.type !== 'sticker') continue;
-      _need.push(_fm);
-      if (_need.length >= 5) break;
-    }
-    if (!_need.length) return;
-    var _idx = 0;
-    var _timer = setInterval(function () {
-      if (_idx >= _need.length) { clearInterval(_timer); return; }
-      var _m = _need[_idx++];
-      if (!_m || _m._fetching || _m.fileData) return;
-      _m._fetching = true;
-      try {
-        state.socket.emit('file-fetch', {
-          fileId: _m.fileId,
-          msgId: _m.msgId,
-          sessionKey: _key
-        }, function (res) {
-          _m._fetching = false;
-          if (res && res.ok && res.dataUrl) {
-            _m.fileData = res.dataUrl;
-            delete _m._needsFetch;
-            var _curKey = (state.currentType === 'private' ? 'private_' : 'group_') + state.currentTarget;
-            if (_curKey === _key) {
-              renderMessages(true);
-            }
-          } else {
-            console.warn('[file-fetch] 拉取失败:', _m.fileId, res && res.error);
-          }
-        });
-      } catch (e) {
-        _m._fetching = false;
-      }
-    }, 200);
-  })();
+  /* 已取消自动拉取，改为用户点击“加载图片/文件”占位符时手动拉取 */
 
-    /* ★ v0.32.0 内存优化：消息事件从「每条一绑」改为「容器一次绑」，事件监听器从 3N 降到 3 */
+    /* 消息事件用容器委托一次性绑定，避免每渲染重建监听器 */
     (function _bindMessageDelegateOnce() {
       if (list._msgDelegateBound) return;
       list._msgDelegateBound = true;
@@ -43566,7 +48409,8 @@ function _renderMessagesNow() {
                   node.classList.contains('rp-sys-tag') ||
                   node.classList.contains('redpacket-bubble') ||
                   node.classList.contains('reply-block') ||
-                  node.classList.contains('reaction-chip')) return true;
+                  node.classList.contains('reaction-chip') ||
+                  node.classList.contains('msg-avatar')) return true;
             }
           }
           node = node.parentNode;
@@ -43624,6 +48468,25 @@ function _renderMessagesNow() {
         var el = _findMsgEl(e.target);
         if (!el) return;
         if (_isInteractiveTarget(e.target, el)) return;
+
+        /* ★ 长按文本气泡内容：交给系统原生选择（选择性复制），不弹自定义菜单
+           长按头像 / 时间 / 图片 / 文件 / 语音 / 红包 等非文本气泡：仍弹菜单 */
+        var _bubble = e.target.closest ? e.target.closest('.bubble') : null;
+        var _isTextBubble = false;
+        if (_bubble) {
+          _isTextBubble = !_bubble.querySelector(
+            'img, video, audio, .file-info, .redpacket-bubble, ' +
+            '.location-card, .voice-msg, .sticker-preview'
+          );
+        }
+        if (_isTextBubble) {
+          /* 让系统接管长按选择，不启动自定义菜单计时器 */
+          _lpTargetEl = null;
+          _lpFired = false;
+          if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+          return;
+        }
+
         _lpTargetEl = el;
         _lpFired = false;
         var t0 = e.touches && e.touches[0];
@@ -43647,59 +48510,99 @@ function _renderMessagesNow() {
           e.stopPropagation();
           e.preventDefault();
           _lpFired = false;
+          return;
         }
+
+        // 点击"手动加载"占位卡片
+        var ph = e.target.closest ? e.target.closest('.file-placeholder') : null;
+        if (ph) {
+          e.stopPropagation();
+          e.preventDefault();
+          var fid = ph.getAttribute('data-load-fid');
+          var mid = ph.getAttribute('data-load-mid');
+          if (!fid || !mid) return;
+          var _m = findMessageById(mid);
+          if (_m) {
+            _m._loaded = true;
+            renderMessages(true);
+            /* 语音：加载后立即尝试播放，减少一次点击 */
+            if (ph.getAttribute('data-load-kind') === 'voice') {
+              setTimeout(function () {
+                try {
+                  var el = dom.messageList.querySelector(
+                    '.msg[data-msgid="' + mid + '"] .voice-msg');
+                  if (el) {
+                    playVoiceMessage(el, el.getAttribute('data-url'),
+                      parseInt(el.getAttribute('data-duration'), 10) || 1);
+                  }
+                } catch (e2) {}
+              }, 80);
+            }
+          }
+          return;
+        }
+
+        var av = e.target.closest ? e.target.closest('.msg-avatar') : null;
+        if (!av) return;
+        e.stopPropagation();
+        var msgEl = av.closest('.msg');
+        if (!msgEl) return;
+        var fromId = msgEl.dataset.from;
+        if (fromId === state.myId || isSystemUserId(fromId)) {
+          if (fromId && state.users[fromId]) openProfile(fromId);
+          return;
+        }
+        if (av._clickTimer) clearTimeout(av._clickTimer);
+        av._clickTimer = setTimeout(function () {
+          av._clickTimer = null;
+          if (fromId && state.users[fromId]) openProfile(fromId);
+        }, 250);
+      }, true);
+
+      list.addEventListener('dblclick', function (e) {
+        var av = e.target.closest ? e.target.closest('.msg-avatar') : null;
+        if (!av) return;
+        e.stopPropagation();
+        e.preventDefault();
+        if (av._clickTimer) { clearTimeout(av._clickTimer); av._clickTimer = null; }
+        var msgEl = av.closest('.msg');
+        if (!msgEl) return;
+        var fromId = msgEl.dataset.from;
+        if (fromId === state.myId) { openProfileEdit(); }
+        else if (fromId && fromId !== 'system' && fromId !== 'SYSTEM' &&
+                 !isSystemUserId(fromId)) {
+          if (typeof sendPatPat === 'function') {
+            var _gid = (state.currentType === 'group' && state.currentTarget)
+              ? state.currentTarget : '';
+            sendPatPat(fromId, _gid);
+          }
+        }
+      }, true);
+
+      list.addEventListener('contextmenu', function (e) {
+        var av = e.target.closest ? e.target.closest('.msg-avatar') : null;
+        if (!av) return;
+        e.preventDefault();
+        e.stopPropagation();
+        var msgEl = av.closest('.msg');
+        if (!msgEl) return;
+        var fromId = msgEl.dataset.from;
+        var url = '';
+        if (fromId === state.myId) {
+          url = (state.myProfile && state.myProfile.avatar) || '';
+        } else if (state.users[fromId] && state.users[fromId].profile) {
+          url = state.users[fromId].profile.avatar || '';
+        }
+        if (url) openImagePreview(url);
       }, true);
     })();
 
-    /* 头像单独绑（数量少，且要支持「单击 / 双击 / 右键」三种操作，独立处理更清晰） */
-    var _avatars = list.querySelectorAll('.msg-avatar');
-    for (var _ai = 0; _ai < _avatars.length; _ai++) {
-      (function (av) {
-        var _msgEl = av.closest ? av.closest('.msg') : null;
-        if (!_msgEl) return;
-        av.style.cursor = 'pointer';
-        var _avClickTimer = null;
-        av.addEventListener('click', function (e) {
-          e.stopPropagation();
-          var fromId = _msgEl.dataset.from;
-          if (fromId === state.myId || isSystemUserId(fromId)) {
-            if (fromId && state.users[fromId]) openProfile(fromId);
-            return;
-          }
-          if (_avClickTimer) clearTimeout(_avClickTimer);
-          _avClickTimer = setTimeout(function () {
-            _avClickTimer = null;
-            if (fromId && state.users[fromId]) openProfile(fromId);
-          }, 250);
-        });
-        av.addEventListener('dblclick', function (e) {
-          e.stopPropagation();
-          e.preventDefault();
-          if (_avClickTimer) { clearTimeout(_avClickTimer); _avClickTimer = null; }
-          var fromId = _msgEl.dataset.from;
-          if (fromId === state.myId) { openProfileEdit(); }
-          else if (fromId && fromId !== 'system' && fromId !== 'SYSTEM' &&
-                   !isSystemUserId(fromId)) {
-            if (typeof sendPatPat === 'function') {
-              var _gid = (state.currentType === 'group' && state.currentTarget)
-                ? state.currentTarget : '';
-              sendPatPat(fromId, _gid);
-            }
-          }
-        });
-        av.addEventListener('contextmenu', function (e) {
-          e.preventDefault();
-          e.stopPropagation();
-          var fromId = _msgEl.dataset.from;
-          var url = '';
-          if (fromId === state.myId) url = (state.myProfile && state.myProfile.avatar) || '';
-          else if (state.users[fromId] && state.users[fromId].profile) {
-            url = state.users[fromId].profile.avatar || '';
-          }
-          if (url) openImagePreview(url);
-        });
-      })(_avatars[_ai]);
-    }
+    try {
+      var _avs = list.querySelectorAll('.msg-avatar');
+      for (var _avi = 0; _avi < _avs.length; _avi++) {
+        _avs[_avi].style.cursor = 'pointer';
+      }
+    } catch (e) {}
   var _shouldScrollBottom = state.autoScroll && !state._userScrolledUp;
   if (_shouldScrollBottom && state._refreshStayBottom) {
     list.scrollTop = list.scrollHeight;
@@ -43751,6 +48654,90 @@ function _renderMessagesNow() {
       }
     }
   } catch (e) {}
+
+  }, _isPrepend ? 'prepend' : 'replace');
+}
+
+function _bindOnce(el, type, fn) {
+  if (!el) return;
+  if (!el._bound) el._bound = Object.create(null);
+  if (el._bound[type]) return;
+  el._bound[type] = 1;
+  el.addEventListener(type, fn);
+}
+
+function _renderHtmlInFrames(container, htmlStr, done, mode) {
+  if (!container) { if (done) done(); return; }
+
+  var _temp = document.createElement('div');
+  _temp.innerHTML = htmlStr;
+  var _nodes = Array.prototype.slice.call(_temp.childNodes);
+
+  if (container._renderToken) container._renderToken.cancelled = true;
+  var _token = { cancelled: false };
+  container._renderToken = _token;
+
+  if (mode === 'prepend') {
+    /* 旧 historyLoader 移除，新版由 _nodes 首位携带 */
+    var _oldHl = container.querySelector('#historyLoader');
+    if (_oldHl && _oldHl.parentNode === container) {
+      try { _oldHl.remove(); } catch (e) {}
+    }
+
+    /* fast-prepend：iOS 上让子元素成为独立布局上下文，
+       每次 insertBefore 不会向上传导重排（桌面无此 CSS，不影响） */
+    container.classList.add('fast-prepend');
+
+    var _pi = 0;
+    var _pBATCH = 30;
+
+    function _finishPrepend() {
+      container.classList.remove('fast-prepend');
+      container._renderToken = null;
+      if (done) done();
+    }
+
+    function _stepPrepend() {
+      if (_token.cancelled) {
+        container.classList.remove('fast-prepend');
+        return;
+      }
+      if (_pi >= _nodes.length) {
+        _finishPrepend();
+        return;
+      }
+      var _frag = document.createDocumentFragment();
+      var _end = Math.min(_pi + _pBATCH, _nodes.length);
+      for (; _pi < _end; _pi++) _frag.appendChild(_nodes[_pi]);
+      container.insertBefore(_frag, container.firstChild);
+      setTimeout(_stepPrepend, 0);
+    }
+    _stepPrepend();
+    return;
+  }
+
+  container.innerHTML = '';
+  var _i = 0;
+  var _BATCH = 30;
+
+  function _step() {
+    if (_token.cancelled) return;
+    var _frag = document.createDocumentFragment();
+    var _end = Math.min(_i + _BATCH, _nodes.length);
+    for (; _i < _end; _i++) {
+      _frag.appendChild(_nodes[_i]);
+    }
+    container.appendChild(_frag);
+    if (_i < _nodes.length) {
+      /* 剩余 > 1 帧用 rAF 保平滑；剩 ≤ 1 帧用 setTimeout 避免 rAF 节流抖动 */
+      if (_nodes.length - _i > _BATCH) requestAnimationFrame(_step);
+      else setTimeout(_step, 0);
+    } else {
+      container._renderToken = null;
+      if (done) done();
+    }
+  }
+  requestAnimationFrame(_step);
 }
 
 function checkUserScrollUp() {
@@ -43787,9 +48774,32 @@ function loadMoreHistory() {
   var type = state.currentType;
   if (!targetId) return;
   var key = (type === 'private' ? 'private_' : 'group_') + targetId;
+
+  // ★ 新增：液态/磨砂玻璃性能提示拦截
+  if (state._glassWarnPending) return;
+  var _isGlass = document.documentElement.classList.contains('liquid-glass') || 
+                 document.documentElement.classList.contains('liquid-glass-enhanced') || 
+                 document.documentElement.classList.contains('frosted-glass');
+                 
+  if (_isGlass && !state._glassWarned) {
+    state._glassWarned = true;
+    state._glassWarnPending = true;
+    showConfirm('您当前开启了【液态/磨砂玻璃】特效。\n\n加载大量历史消息（特别是图片/视频）可能导致页面严重卡顿。\n\n建议前往设置关闭玻璃特效，是否继续加载？', {
+      icon: '⚠️', title: '性能提示', confirmText: '继续加载', cancelText: '取消'
+    }).then(function(ok) {
+      state._glassWarnPending = false;
+      if (ok) {
+        loadMoreHistory(); // 同意后递归调用自身跳过提示
+      } else {
+        state._glassWarned = false; // 取消则重置，下次再提示
+      }
+    });
+    return;
+  }
+
   if (state.historyHasMore[key] === false) return;
 
-  /* ★ v0.32.1：超时复位（避免某次异常无响应导致按钮永久失效） */
+  /* 超时复位（避免某次异常无响应导致按钮永久失效） */
   if (state.historyLoading[key]) {
     var _ts0 = (state._historyLoadTs && state._historyLoadTs[key]) || 0;
     if (Date.now() - _ts0 < 8000) return;
@@ -43836,6 +48846,37 @@ function loadMoreHistory() {
     }
   }
 }
+/* 只替换 #historyLoader，不重建消息 DOM。
+   用于「无新消息」「游标丢失」「没有更早」这类纯状态变更。 */
+function _updateHistoryLoaderOnly(hk) {
+  var list = dom.messageList;
+  if (!list) return;
+  var hlEl = list.querySelector('#historyLoader');
+  if (!hlEl) return;
+  var hlHasMore = state.historyHasMore[hk];
+  var hlLoading = !!state.historyLoading[hk];
+
+  /* 避免 outerHTML：iOS WebKit 上 outerHTML setter 会重新解析 HTML
+     并重排父节点。改用 className + textContent/innerHTML，只触碰节点本身。
+     className 未变时不做 DOM 写入，减少 iOS 上的强制 reflow 次数。 */
+  if (hlHasMore === false) {
+    if (hlEl.className !== 'history-loader no-more') {
+      hlEl.className = 'history-loader no-more';
+      hlEl.textContent = '— 没有更早的消息了 —';
+    }
+  } else if (hlLoading) {
+    if (hlEl.className !== 'history-loader loading') {
+      hlEl.className = 'history-loader loading';
+      hlEl.innerHTML = '<span class="hl-spin"></span>加载中…';
+    }
+  } else {
+    if (hlEl.className !== 'history-loader') {
+      hlEl.className = 'history-loader';
+      hlEl.textContent = '↑ 加载更早的消息';
+    }
+  }
+}
+
 function updateScrollBtns() {
   var list = dom.messageList;
   var st = list.scrollTop;
@@ -43876,7 +48917,7 @@ function refreshMessageTimes() {
     if (span.textContent !== label) span.textContent = label;
   }
 }
-setInterval(refreshMessageTimes, 5000);
+setInterval(refreshMessageTimes, 10000);
 
 function _burnMarkOne(m) {
   if (!m || m.burned) return false;
@@ -44196,7 +49237,7 @@ function ensureAuthSocket(cb) {
     return;
   }
   _authSocket = io({
-    /* ★ v0.32.3：polling 优先，兼容自签证书 */
+    /* polling 优先，兼容自签证书 */
     transports: ['polling', 'websocket'],
     reconnection: true,
     reconnectionAttempts: 5,
@@ -44673,7 +49714,7 @@ function doLogin() {
   var socket;
   try {
     socket = io({
-      /* ★ v0.32.3：polling 优先，自签证书局域网 IP 访问下 wss 被拒时仍可连接 */
+      /* polling 优先，自签证书局域网 IP 访问下 wss 被拒时仍可连接 */
       transports: ['polling', 'websocket'],
       reconnection: true,
       reconnectionAttempts: 8,
@@ -44715,7 +49756,7 @@ function doLogin() {
         browser:    _dev.browser,
         platform:   _dev.platform,
         screen:     _dev.screen,
-        deviceType: _dev.deviceType
+        deviceType: _dev.deviceType,
       });
     } catch (e) { console.error('emit login 失败:', e); }
   }
@@ -44741,41 +49782,87 @@ function doLogin() {
     var origEmit = sk.emit.bind(sk);
     var buffer = [];
     var BUFFER_MAX = 200;
-    sk.emit = function (event, data) {
-      var NO_BUFFER = { 'login': 1, 'get-groups': 1, 'get-my-history': 1,
-                        'wallet-get': 1, 'get-blocks': 1 };
-      if (!sk.connected && !NO_BUFFER[event]) {
-        if (buffer.length < BUFFER_MAX) buffer.push([event, data]);
+
+    function _updateQueueBanner() {
+      var _b = document.getElementById('__sendQueueBanner');
+      if (buffer.length === 0) {
+        if (_b && _b.parentNode) _b.parentNode.removeChild(_b);
+        return;
+      }
+      if (!_b) {
+        _b = document.createElement('div');
+        _b.id = '__sendQueueBanner';
+        _b.style.cssText =
+          'position:fixed;left:50%;top:8px;transform:translateX(-50%);' +
+          'z-index:100003;background:rgba(255,152,0,.95);color:#fff;' +
+          'padding:6px 16px;border-radius:14px;font-size:12.5px;' +
+          'box-shadow:0 6px 18px rgba(255,152,0,.4);' +
+          'font-family:inherit;font-weight:600;';
+        (document.body || document.documentElement).appendChild(_b);
+      }
+      _b.textContent = '⏳ ' + buffer.length + ' 条消息待发送（网络恢复后自动补发）';
+    }
+
+    /* 不参与重连缓冲的事件（这些事件在重连时由其他逻辑重新发送） */
+    var NO_BUFFER = {
+      'login': 1, 'get-groups': 1, 'get-my-history': 1,
+      'wallet-get': 1, 'get-blocks': 1
+    };
+
+    sk.emit = function () {
+      /* ★ 用 arguments 透传所有参数（包括 callback），绝不能只声明 (event, data) */
+      var args = Array.prototype.slice.call(arguments);
+      var event = args[0];
+
+      /* 已连接：原样发出 */
+      if (sk.connected) {
+        return origEmit.apply(sk, args);
+      }
+
+      /* 未连接时判断是否带 callback */
+      var hasCb = (args.length > 1 &&
+                   typeof args[args.length - 1] === 'function');
+
+      /* ★ 带 callback 的请求：立即回调失败，绝不缓冲（否则回调永远挂起） */
+      if (hasCb) {
+        var failCb = args[args.length - 1];
+        try { failCb({ ok: false, error: 'disconnected' }); } catch (e) {}
         return sk;
       }
-      return origEmit(event, data);
+
+      /* 无 callback 但属于"重连时重新发"的：不缓冲 */
+      if (NO_BUFFER[event]) {
+        return sk;
+      }
+
+      /* 其余无 callback 消息：缓冲等待重连 */
+      if (buffer.length < BUFFER_MAX) buffer.push(args);
+      _updateQueueBanner();
+      return sk;
     };
+
     sk.on('connect', function () {
       if (!buffer.length) return;
       var pending = buffer.slice();
       buffer.length = 0;
+      _updateQueueBanner();
       setTimeout(function () {
         for (var i = 0; i < pending.length; i++) {
-          try { origEmit(pending[i][0], pending[i][1]); } catch (e) {}
+          try { origEmit.apply(sk, pending[i]); } catch (e) {}
         }
+        showToast('✅ 已补发 ' + pending.length + ' 条消息');
       }, 400);
     });
   })(socket);
 
   socket.on('disconnect', function (reason) {
-    var _uid = socket.data && socket.data.userId;
-    if (_uid && ACTIVE_CALLS[_uid]) {
-      var _rec = ACTIVE_CALLS[_uid];
-      var _peerId = _rec.peerId;
-      _callClear(_uid);
-      try {
-        emitToUser(_peerId, 'call-ended', {
-          from: _uid,
-          reason: 'disconnect'
-        });
-      } catch (e) {}
-      console.log('📞 通话因断线结束：' + _uid + ' ↔ ' + _peerId);
-    }
+    /* ★ 修复：此处原有服务端式通话清理（socket.data / ACTIVE_CALLS / emitToUser），
+       在浏览器里全部未定义 → 断线时抛错并中断后续逻辑。改为纯客户端清理。 */
+    try {
+      if (state.call && state.call.active) {
+        callFinish(t('connServerLost'), true, 'disconnect');
+      }
+    } catch (e) {}
     if (reason === 'io client disconnect') return; /* 主动登出时不提示 */
     if (state.isLoggedIn) showConnectionStatus('error', t('connServerLost'));
   });
@@ -44862,8 +49949,14 @@ function doLogin() {
       iceServers: Array.isArray(data.iceServers) ? data.iceServers : [],
       usePeerJS: !!data.usePeerJS,
       hasInternet: data.hasInternet !== false,
-      mode: data.callMode || (data.usePeerJS ? 'peerjs' : 'webrtc')
+      mode: data.callMode || (data.usePeerJS ? 'peerjs' : 'webrtc'),
+      callRingTimeoutMs: Number(data.callRingTimeoutMs) || 30000,
+      callMaxPeers: Number(data.callMaxPeers) || 8
     };
+    console.log('[CALL-DIAG] 通话配置 iceServers=' + state.callConfig.iceServers.length +
+      ' mode=' + state.callConfig.mode);
+    state.httpDlBase = (typeof data.httpDlBase === 'string' && data.httpDlBase)
+      ? data.httpDlBase : '';
     CALL_ICE_SERVERS = state.callConfig.iceServers;
     state.officialWebsite = (data.officialWebsite && typeof data.officialWebsite === 'string')
       ? data.officialWebsite
@@ -44876,7 +49969,7 @@ function doLogin() {
           '; path=/; max-age=' + (7 * 24 * 3600) + '; SameSite=Lax';
       } catch (e) {}
     } else {
-      /* ★ v0.32.2：若 login-success 没带 token，尝试从 localStorage 恢复 */
+      /* 若 login-success 没带 token，尝试从 localStorage 恢复 */
       try {
         var _cachedTk = localStorage.getItem('feedback_token');
         if (_cachedTk) state.feedbackToken = _cachedTk;
@@ -45032,7 +50125,7 @@ function doLogin() {
       }, 600);
     }
 
-    // ★ v0.32.3：仅在外网离线时才初始化 PeerJS（有外网走 WebRTC + TURN，无需 PeerJS）
+    // 仅在外网离线时才初始化 PeerJS（有外网走 WebRTC + TURN，无需 PeerJS）
     if (window.Peer && !window.__myPeer && data.usePeerJS === true) {
       window.__myPeer = new Peer(state.myId, {
         host: location.hostname,
@@ -45643,7 +50736,7 @@ updateSecurityBadge();
 
 function getIsPC() {
   try {
-    /* ★ v0.32.3：用户强制指定的模式优先级最高 */
+    /* 用户强制指定的模式优先级最高 */
     if (typeof state === 'object' && state) {
       if (state.forceLayoutMode === 'pc') return true;
       if (state.forceLayoutMode === 'mobile') return false;
@@ -45653,13 +50746,13 @@ function getIsPC() {
     var h = window.innerHeight || 0;
     var ua = navigator.userAgent || '';
 
-    /* ★ v0.32.0 修复：极小视口（≤768px）无论 screen 尺寸 / 触摸 / UA 如何，
+    /* 修复：极小视口（≤768px）无论 screen 尺寸 / 触摸 / UA 如何，
        一律强制走 mobile。覆盖 320×374 收银机、小窗口调试、
        老旧嵌入设备、Chrome 59 鼠标环境等场景。
        必须在任何 screen 检查之前，否则会被下面的 screen<=1024x600 抢走。 */
     if (w > 0 && w < 769) return false;
 
-    /* ★ v0.32.0 修复：screen 逻辑尺寸 ≤1024×600 → 走 mobile（不是 PC！）
+    /* 修复：screen 逻辑尺寸 ≤1024×600 → 走 mobile（不是 PC！）
        原代码此处误写 return true，导致 960×540 电视 / 1024×600 小笔记本
        / 320×374 嵌入式屏幕全部走了 PC 三栏布局，联系人栏被挤爆或消失。
        与上方注释「不该用 PC 三栏布局」的意图保持一致。 */
@@ -45691,7 +50784,7 @@ function getIsPC() {
 
     if (touch) return w >= 950;
   } catch (e) {
-    /* ★ v0.32.0：异常兜底放宽。屏幕 ≤1024px 一律 mobile，
+    /* 异常兜底放宽。屏幕 ≤1024px 一律 mobile，
        保证哪怕所有探测 API 都挂掉，联系人栏也一定看得见。 */
     return (window.innerWidth || 0) > 1024;
   }
@@ -45713,7 +50806,7 @@ window.__getIsPC = getIsPC;
 
     var isPC = getIsPC();
 
-    /* ★ v0.33.2：电视也分大小屏——960×540 的嵌入式电视浏览器
+    /* 电视也分大小屏——960×540 的嵌入式电视浏览器
        由 getIsPC 判为移动布局；这里只负责加 is-tv 视觉类，
        is-pc / is-mobile 交给下面的 isPC 分支统一决定，
        避免 "设备管理显示 960×540 却走 PC 三栏" 的错配。 */
@@ -45749,6 +50842,9 @@ window.__getIsPC = getIsPC;
         if (dom && dom.sidebar) dom.sidebar.classList.remove('open');
         if (dom && dom.sidebarOverlay) dom.sidebarOverlay.classList.remove('active');
       } catch (e) {}
+      if (typeof _mobileClearA11y === 'function') {
+        try { _mobileClearA11y(); } catch (e) {}
+      }
     } else {
       root.classList.add('is-mobile');
       root.classList.remove('is-pc');
@@ -45759,7 +50855,7 @@ window.__getIsPC = getIsPC;
                          body.classList.contains('mobile-page-discover') ||
                          body.classList.contains('mobile-page-me') ||
                          body.classList.contains('mobile-chat-detail');
-          /* ★ v0.32.0 修复：从 PC 缩到窄屏或电视时，主动进入 mobile 页面，
+          /* 修复：从 PC 缩到窄屏或电视时，主动进入 mobile 页面，
              否则 sidebar 会因为 transform: translateX(-100%) 而不可见 */
           if (!_hasPage) {
             var _hasChat = (typeof state === 'object' && state &&
@@ -45823,7 +50919,7 @@ window.__getIsPC = getIsPC;
     setTimeout(updateLayoutMode, 200);
   });
 
-  /* ★ v0.32.4：暴露给外部（强制布局模式切换需要动态重渲染） */
+  /* 暴露给外部（强制布局模式切换需要动态重渲染） */
   window.__updateLayoutMode = updateLayoutMode;
 })();
 
@@ -46052,8 +51148,55 @@ window.addEventListener('focus', function () {
   }
 })();
 
+/* ===== 连续聊天徽章（客户端；★ 修复：原误放在服务端作用域）===== */
+function _isInteractionActive(rec) {
+  return !!(rec && rec.lastDate === todayStr() && rec.days > 1);
+}
+function updateInteractionBadge() {
+  var badge = document.getElementById('chatInteractionBadge');
+  if (!badge) return;
+  badge.style.display = 'none';
+  badge.innerHTML = '';
+  if (state.showInteraction === false) return;
+  if (!state.currentTarget || !state.currentType) return;
+  if (!state.interactions) state.interactions = { private: {}, group: {} };
+  if (state.currentType === 'private') {
+    var rec = state.interactions.private[state.currentTarget];
+    if (_isInteractionActive(rec)) {
+      badge.className = 'interaction-badge fire';
+      badge.innerHTML = '🔥 ' + rec.days + (state.lang === 'en' ? 'd' : '天');
+      badge.title = (state.lang === 'en') ? ('Chat streak: ' + rec.days + ' days') : ('连续聊天 ' + rec.days + ' 天');
+      badge.style.display = 'inline-flex';
+    }
+  }
+}
+function initInteractionListener(socket) {
+  socket.on('interaction-update', function (d) {
+    if (!d) return;
+    if (!state.interactions) state.interactions = { private: {}, group: {} };
+    if (d.kind === 'private' && d.peerId) {
+      state.interactions.private[d.peerId] = { days: d.days, lastDate: d.lastDate };
+      if (state.currentType === 'private' && state.currentTarget === d.peerId) updateInteractionBadge();
+      if (typeof renderContacts === 'function') renderContacts();
+    } else if (d.kind === 'group' && d.groupId) {
+      state.interactions.group[d.groupId] = { days: d.days, lastDate: d.lastDate, dailyTop: d.dailyTop };
+      if (state.currentType === 'group' && state.currentTarget === d.groupId) {
+        updateInteractionBadge();
+        if (typeof renderGroupSidePanel === 'function') renderGroupSidePanel();
+      }
+    }
+  });
+}
+
 function setupSocketEvents(socket) {
   try { initInteractionListener(socket); } catch (e) { }
+
+  /* ★ 修复：原先同一个 global-search-result 监听器被注册了两次，
+     每条结果会重复渲染，这里只保留一个。 */
+  socket.on('global-search-result', function (d) {
+    try { if (typeof window.__handleGlobalSearchResult === 'function') window.__handleGlobalSearchResult(d); }
+    catch (e) { console.error('[global-search] 渲染失败:', e); }
+  });
 
   socket.on('risk-alert', function (d) {
     if (!d) return;
@@ -46472,15 +51615,20 @@ function setupSocketEvents(socket) {
         var _oldReadUsers = localArr[i].readUsers || [];
 
         for (var fk in incoming) {
-          if (incoming.hasOwnProperty(fk)) {
-            if (fk === 'status' && _localRead && incoming[fk] === 'sent') {
-              continue;
-            }
-            localArr[i][fk] = incoming[fk];
-          }
+          if (!incoming.hasOwnProperty(fk)) continue;
+          if (fk === 'status' && _localRead && incoming[fk] === 'sent') continue;
+          if ((fk === 'fileId' || fk === 'fileData' ||
+               fk === 'fileName' || fk === 'fileType') &&
+              !incoming[fk] && localArr[i][fk]) continue;
+          localArr[i][fk] = incoming[fk];
         }
 
         if (_localSending || _localRead) localArr[i].status = _localStatus;
+
+        if ((localArr[i].fileId || localArr[i].fileData) &&
+            !localArr[i].fileData) {
+          localArr[i]._needsFetch = true;
+        }
 
         if (incoming.readUsers && Array.isArray(incoming.readUsers)) {
           var _newUsers = incoming.readUsers.slice();
@@ -46864,10 +52012,13 @@ function setupSocketEvents(socket) {
       (arr.length >= CLIENT_HISTORY_PAGE);
     state.historyLoading[_hk] = false;
 
+    var _anyNew = false;
+
     if (type === 'private') {
       if (!state.messages[targetId]) state.messages[targetId] = [];
       for (var j = 0; j < arr.length; j++) {
         var _isNewH = mergeIncomingMessage(state.messages[targetId], arr[j]);
+        if (_isNewH) _anyNew = true;
         if (_isNewH && arr[j].from !== state.myId && arr[j].from !== 'system' && arr[j].from !== 'SYSTEM') {
           var _tsH = parseMsgTime(arr[j]);
           var _rkH = 'private_' + targetId;
@@ -46884,6 +52035,7 @@ function setupSocketEvents(socket) {
       if (!state.groups[targetId].messages) state.groups[targetId].messages = [];
       for (var l = 0; l < arr.length; l++) {
         var _isNewHG = mergeIncomingMessage(state.groups[targetId].messages, arr[l]);
+        if (_isNewHG) _anyNew = true;
         if (_isNewHG && arr[l].from !== state.myId && arr[l].from !== 'system' && arr[l].from !== 'SYSTEM') {
           var _tsHG = parseMsgTime(arr[l]);
           var _rkHG = 'group_' + targetId;
@@ -46896,7 +52048,12 @@ function setupSocketEvents(socket) {
       }
       state.groups[targetId].messages.sort(function (a, b) { return parseMsgTime(a) - parseMsgTime(b); });
     }
-    if (state.currentTarget === targetId && state.currentType === type) renderMessages();
+
+    /* 无真正新增 → 不重建 DOM，只刷新 loader */
+    if (state.currentTarget === targetId && state.currentType === type) {
+      if (_anyNew) renderMessages();
+      else _updateHistoryLoaderOnly(_hk);
+    }
   });
 
 socket.on('history-more', function (payload) {
@@ -46906,21 +52063,40 @@ socket.on('history-more', function (payload) {
     var hk = (type === 'private' ? 'private_' : 'group_') + targetId;
     state.historyLoading[hk] = false;
 
-    /* ★ v0.32.1：游标丢失 → 触发一次 get-history 重建本地缓存 */
+    /* ★ 修复：重连导致游标丢失，自动尝试抢救 */
     if (payload.cursorMissing) {
-      console.warn('[history-more] 游标丢失，重新拉取最近一页以重建游标', payload);
-      state.historyHasMore[hk] = true;
-      if (state.socket && state.socket.connected) {
-        state.socket.emit('get-history', { targetId: targetId, type: type });
+      state._cursorMissingCount = (state._cursorMissingCount || 0) + 1;
+      console.warn('[History] 游标丢失，自动重试同步...');
+      
+      if (state._cursorMissingCount >= 3) {
+        // 连续 3 次找不到，承认真的没有旧消息了
+        state.historyHasMore[hk] = false;
+        state._cursorMissingCount = 0;
+        if (state.currentTarget === targetId && state.currentType === type) {
+          _updateHistoryLoaderOnly(hk);
+        }
+        showToast(state.lang === 'en' ? 'No more messages' : '已到达最早的消息');
+      } else {
+        // 前两次丢失，重新拉取最新记录来重置游标，保证按钮不死锁
+        state.historyHasMore[hk] = true; 
+        if (state.socket && state.socket.connected) {
+          state.socket.emit('get-history', { targetId: targetId, type: type });
+        }
+        if (state.currentTarget === targetId && state.currentType === type) {
+          _updateHistoryLoaderOnly(hk); // 恢复按钮为可点击状态
+        }
+        showToast('网络波动，正在重新同步...');
       }
       return;
     }
+    state._cursorMissingCount = 0;
 
     var msgs = payload.messages || [];
     if (!msgs.length) {
       state.historyHasMore[hk] = false;
+      state._emptyBatchCount = 0;
       if (state.currentTarget === targetId && state.currentType === type) {
-        renderMessages();
+        _updateHistoryLoaderOnly(hk);
       }
       return;
     }
@@ -46948,27 +52124,31 @@ socket.on('history-more', function (payload) {
     toAdd.sort(function (a, b) { return parseMsgTime(a) - parseMsgTime(b); });
 
     if (!toAdd.length) {
-      /* ★ v0.32.1：本批全是本地已有的消息
-         - 若服务端已明确无更多（hasMore === false）→ 正式置 false
-         - 否则保留 true，用户再次点击时可继续尝试（可能是边界情况下 beforeMsgId 落后） */
+      /* 本批全是本地已有：不重建 DOM，只更新 loader；连续 3 次空批停止重试 */
       if (payload.hasMore === false) {
         state.historyHasMore[hk] = false;
+        state._emptyBatchCount = 0;
       } else {
-        state.historyHasMore[hk] = true;
-        console.warn('[history-more] 本批全部重复，服务端 hasMore=true，保留可重试', {
-          targetId: targetId, count: msgs.length
-        });
-        try {
+        state._emptyBatchCount = (state._emptyBatchCount || 0) + 1;
+        if (state._emptyBatchCount >= 3) {
+          state._emptyBatchCount = 0;
+          state.historyHasMore[hk] = false;
+          showToast(state.lang === 'en'
+            ? 'No more messages'
+            : '已到达最早的消息');
+        } else {
+          state.historyHasMore[hk] = true;
           showToast(state.lang === 'en'
             ? 'No new messages loaded, tap again'
             : '本批未加载到新消息，可再次点击重试');
-        } catch (e) {}
+        }
       }
       if (state.currentTarget === targetId && state.currentType === type) {
-        renderMessages(true);
+        _updateHistoryLoaderOnly(hk);
       }
       return;
     }
+    state._emptyBatchCount = 0;
 
     var _isVisible = (state.currentTarget === targetId && state.currentType === type);
     var _prevHeight = 0, _prevTop = 0;
@@ -46984,16 +52164,16 @@ socket.on('history-more', function (payload) {
     }
 
     if (_isVisible) {
-      /* ★ v0.32.1：立即渲染，避免 120ms 去抖造成的高度差计算失效 */
-      renderMessages(true);
+      /* 增量 prepend：只渲染新增的 N 条，已有 M 条 DOM 不重建 */
+      var _prevFirstMsg = arr[toAdd.length] || null;
+      renderMessages(true, { prependMsgs: toAdd, prevMsg: _prevFirstMsg });
 
-      /* ★ 三层 RAF + 50ms 兜底：覆盖 iOS Safari / 慢设备布局延迟 */
+      /* ★ 同步保持视觉位置（不跳动） */
       var _applyScrollKeep = function () {
         if (!state.currentTarget) return;
         var _newHeight = dom.messageList.scrollHeight;
         var _target = _prevTop + (_newHeight - _prevHeight);
         dom.messageList.scrollTop = _target;
-        /* ★ 再次校验：部分浏览器布局异步，最终滚动位置可能偏小 */
         setTimeout(function () {
           var _h2 = dom.messageList.scrollHeight;
           if (Math.abs(_h2 - _newHeight) > 5 && state.currentTarget) {
@@ -47091,14 +52271,18 @@ socket.on('history-more', function (payload) {
       msgId: data.msgId || generateMsgId(),
       type: data.type || 'text',
       fileName: data.fileName, fileSize: data.fileSize, fileType: data.fileType,
+      fileId: data.fileId || null,
+      fileMime: data.fileMime || null,
       fileData: data.fileData, duration: data.duration || null,
+      _needsFetch: !!(data.fileId && !data.fileData),
+      /* ★ 修复：原先在浏览器里调用服务端的 getHistoryKey / messageHistory，
+         两者都未定义 → 抛异常导致整条消息构造失败、消息直接丢失。
+         改为查询客户端自己的 state.messages。 */
       reply: (function () {
         if (!data.reply || !data.reply.msgId) return null;
-        /* ★ v0.32.0：校验被引用消息是否真实存在，防止伪造 reply */
-        var _srcKey = getHistoryKey('private', fromUser.id, toUser.id);
-        var _srcArr = messageHistory[_srcKey] || [];
+        var _srcArr = (state.messages && state.messages[fromId]) || [];
         for (var _i = 0; _i < _srcArr.length; _i++) {
-          if (_srcArr[_i].msgId === data.reply.msgId) return data.reply;
+          if (_srcArr[_i] && _srcArr[_i].msgId === data.reply.msgId) return data.reply;
         }
         return null;
       })(),
@@ -47112,21 +52296,20 @@ socket.on('history-more', function (payload) {
       patTargetId: data.patTargetId || null,
       patTargetName: data.patTargetName || null,
       patTemplate: data.patTemplate || null,
-
-      packetId:        data.packetId || null,
-      packetAmount:    (typeof data.packetAmount === 'number') ? data.packetAmount : null,
-      packetCount:     (typeof data.packetCount === 'number') ? data.packetCount : null,
-      packetType:      data.packetType || null,
-      packetGreeting:  data.packetGreeting || null,
-      packetFromName:  data.packetFromName || null,
-      isWxPayNotice:   !!data.isWxPayNotice,
-      noticeType:      data.noticeType || null,
-      noticeIcon:      data.noticeIcon || null,
-      isCallRecord:    !!data.isCallRecord,
-      callKind:        data.callKind || null,
-      callResult:      data.callResult || null,
-      callDuration:    (typeof data.callDuration === 'number') ? data.callDuration : 0,
-      callInitiator:   data.callInitiator || null,
+      packetId: data.packetId || null,
+      packetAmount: (typeof data.packetAmount === 'number') ? data.packetAmount : null,
+      packetCount: (typeof data.packetCount === 'number') ? data.packetCount : null,
+      packetType: data.packetType || null,
+      packetGreeting: data.packetGreeting || null,
+      packetFromName: data.packetFromName || null,
+      isWxPayNotice: !!data.isWxPayNotice,
+      noticeType: data.noticeType || null,
+      noticeIcon: data.noticeIcon || null,
+      isCallRecord: !!data.isCallRecord,
+      callKind: data.callKind || null,
+      callResult: data.callResult || null,
+      callDuration: (typeof data.callDuration === 'number') ? data.callDuration : 0,
+      callInitiator: data.callInitiator || null,
       burnAfterRead: (data.burnAfterRead && data.burnAfterRead.enabled)
         ? {
             enabled: true,
@@ -47162,14 +52345,6 @@ socket.on('history-more', function (payload) {
     if (state.users[state.myId]) {
       state.users[state.myId].exp = state.myExp;
       state.users[state.myId].level = state.myLevel;
-    }
-      if (data.groupInvites && data.groupInvites.length) {
-      state.groupInvites = data.groupInvites;
-      setTimeout(function() {
-        state.groupInvites.forEach(handleGroupInvitePopup);
-      }, 2000);
-    } else {
-      state.groupInvites = [];
     }
     updateHeaderNickname();
     if (dom.profileModal && dom.profileModal.classList.contains('open') &&
@@ -47224,24 +52399,31 @@ socket.on('history-more', function (payload) {
   });
 
   socket.on('private-read', function (data) {
-    var uid = socket.data && socket.data.userId;
-    var to = String(data.to || '');
-    if (!uid || !to) return;
-    var key = getHistoryKey('private', uid, to);
-    var arr = messageHistory[key];
-    if (!arr) return;
-    var ids = data.msgIds || [];
-
+    /* ★ 修复：原实现用的是服务端标识符（socket.data / messageHistory / getHistoryKey /
+       emitToUser），在浏览器中全部未定义 → 对端已读状态永远不更新。
+       改为操作客户端自己的 state.messages 并重渲染。 */
+    if (!data) return;
+    var _from = String(data.from || '');
+    var _ids = (data.msgIds || []);
+    if (!_from || !_ids.length) return;
+    var _arr = (state.messages && state.messages[_from]) || null;
     var _changed = false;
-    for (var i = 0; i < arr.length; i++) {
-      if (ids.indexOf(arr[i].msgId) !== -1 && arr[i].status !== 'read') {
-        arr[i].status = 'read';
-        _changed = true;
+    if (Array.isArray(_arr)) {
+      for (var _i = 0; _i < _arr.length; _i++) {
+        if (_arr[_i] && _ids.indexOf(_arr[_i].msgId) !== -1) {
+          if (!Array.isArray(_arr[_i].readUsers)) _arr[_i].readUsers = [];
+          if (_arr[_i].readUsers.indexOf(state.myId) === -1) {
+            _arr[_i].readUsers.push(state.myId);
+            _arr[_i].status = 'read';
+            _changed = true;
+          }
+        }
       }
     }
-    if (_changed) scheduleSaveHistory();
-
-    emitToUser(to, 'private-read', { from: uid, msgIds: ids });
+    if (_changed) {
+      try { renderMessages(); } catch (e) {}
+      try { renderContacts(); } catch (e) {}
+    }
   });
 
   socket.on('message-reacted', function (data) {
@@ -47478,15 +52660,17 @@ socket.on('history-more', function (payload) {
       type: data.type || 'text',
       fileName: data.fileName, fileSize: data.fileSize, fileType: data.fileType,
       fileData: data.fileData, duration: data.duration || null,
+      /* ★ 修复：同上（服务端标识符在浏览器未定义）。
+         并修正逻辑：群消息的引用应查「本群消息列表」，原来错查了私聊。 */
       reply: (function () {
         if (!data.reply || !data.reply.msgId) return null;
-        /* ★ v0.32.0：校验被引用消息是否真实存在，防止伪造 reply */
-        var _srcKey = getHistoryKey('private', fromUser.id, toUser.id);
-        var _srcArr = messageHistory[_srcKey] || [];
+        var _g = state.groups && state.groups[gid];
+        var _srcArr = (_g && _g.messages) || [];
         for (var _i = 0; _i < _srcArr.length; _i++) {
-          if (_srcArr[_i].msgId === data.reply.msgId) return data.reply;
+          if (_srcArr[_i] && _srcArr[_i].msgId === data.reply.msgId) return data.reply;
         }
-        return null;
+        /* 群历史未加载时放宽：保留引用而不是丢弃 */
+        return data.reply;
       })(),
       recalled: false, recalledBy: null, status: 'sent',
       readUsers: data.readUsers || [],
@@ -47787,199 +52971,75 @@ socket.on('history-more', function (payload) {
     showToast(t('toastRefreshOk'));
   });
 
-  var ACTIVE_CALLS = {};    /* userId → { peerId, role, callId, since, pending } */
-  var CALL_REGISTRY_TIMEOUT = 45000;
+  /* ★ 修复：此处原有 194 行误贴进【客户端】的服务端通话代码
+     （ACTIVE_CALLS / _callReg / _callClear / emitToUser / socket.data / _isLanIp），
+     这些标识符在浏览器中均未定义 → 纯死代码，且掩盖了真正的客户端监听。已整体移除。 */
 
-  function _callReg(userId, peerId, role, callId) {
-    if (!userId) return;
-    ACTIVE_CALLS[userId] = {
-      peerId: peerId,
-      role: role,
-      callId: callId,
-      since: Date.now(),
-      pending: (role === 'callee')
-    };
-    setTimeout(function () {
-      var rec = ACTIVE_CALLS[userId];
-      if (rec && rec.callId === callId) {
-        var peerRec = ACTIVE_CALLS[rec.peerId];
-        delete ACTIVE_CALLS[userId];
-        if (peerRec && peerRec.callId === callId) {
-          delete ACTIVE_CALLS[rec.peerId];
-          try {
-            emitToUser(rec.peerId, 'call-ended', {
-              from: userId,
-              reason: 'timeout'
-            });
-          } catch (e) {}
+  /* ★ 补全：服务端确认消息编辑后，同步更新本地存储与视图 */
+  /* ★ 补全：多端已读同步（服务端一直 emit 'private-read-sync'，客户端此前无监听） */
+  socket.on('private-read-sync', function (d) {
+    if (!d) return;
+    try {
+      var _pid = d.peerId;
+      var _ids = d.msgIds || [];
+      var _arr = (state.messages && state.messages[_pid]) || null;
+      if (Array.isArray(_arr)) {
+        for (var _i = 0; _i < _arr.length; _i++) {
+          if (_arr[_i] && _ids.indexOf(_arr[_i].msgId) !== -1) {
+            if (!Array.isArray(_arr[_i].readUsers)) _arr[_i].readUsers = [];
+            if (_arr[_i].readUsers.indexOf(state.myId) === -1) _arr[_i].readUsers.push(state.myId);
+          }
         }
-        console.warn('[Call] 通话登记超时自动清理：' + userId + ' ↔ ' + rec.peerId);
       }
-    }, CALL_REGISTRY_TIMEOUT);
-  }
-
-  function _callClear(userId) {
-    if (!userId) return;
-    var rec = ACTIVE_CALLS[userId];
-    if (!rec) return;
-    var peerId = rec.peerId;
-    var callId = rec.callId;
-    delete ACTIVE_CALLS[userId];
-    var peerRec = ACTIVE_CALLS[peerId];
-    if (peerRec && peerRec.callId === callId) {
-      delete ACTIVE_CALLS[peerId];
-    }
-  }
-
-  function _callIsBusy(userId) {
-    var rec = ACTIVE_CALLS[userId];
-    if (!rec) return false;
-    return true;
-  }
-
-  socket.on('call-request', function (data) {
-    var callerId = socket.data && socket.data.userId;
-    if (!callerId || !data || !data.to) return;
-    var caller = getUserById(callerId);
-    var target = getUserById(data.to);
-    if (!caller) { return; }
-
-    /* ★ 仅允许局域网 IP 发起通话（cloudflared 隧道场景下防止外部设备使用） */
-    var _callerRealIp = _getRealIpFromSocket(socket);
-    if (!_isLanIp(_callerRealIp)) {
-      console.warn('📞 [通话] 拒绝非局域网 IP 发起：' +
-        caller.name + ' @ ' + _callerRealIp);
-      socket.emit('call-rejected', {
-        from: data.to,
-        reason: 'not_lan',
-        message: '通话功能仅限局域网内设备使用。\n' +
-          '检测到您来自外部网络（IP: ' + _callerRealIp + '），无法发起通话。\n\n' +
-          '如需使用通话，请将设备连接到与服务器相同的局域网。'
-      });
-      return;
-    }
-
-    if (_callIsBusy(callerId)) {
-      socket.emit('call-rejected', { from: data.to, reason: 'busy' });
-      return;
-    }
-
-    if (!target || !target.online) {
-      socket.emit('call-rejected', { from: data.to, reason: 'offline' });
-      return;
-    }
-
-    if (_callIsBusy(data.to)) {
-      socket.emit('call-rejected', { from: data.to, reason: 'busy' });
-      return;
-    }
-
-    if (callerId === data.to) {
-      socket.emit('call-rejected', { from: data.to, reason: 'failed' });
-      return;
-    }
-
-    var callId = 'call_' + Date.now().toString(36) +
-      Math.random().toString(36).slice(2, 8);
-    _callReg(callerId, data.to, 'caller', callId);
-    _callReg(data.to, callerId, 'callee', callId);
-
-    console.log('📞 通话登记：' + caller.name + ' → ' +
-      target.name + '  callId=' + callId);
-
-    emitToUser(data.to, 'call-incoming', {
-      from: callerId,
-      fromName: caller.name,
-      fromAvatar: (caller.profile && caller.profile.avatar) || '',
-      fromVerified: caller.verified || '',
-      callType: data.callType === 'video' ? 'video' : 'voice',
-      callId: callId,
-      ts: Date.now()
-    });
+      renderMessages();
+    } catch (e) {}
+  });
+  /* ★ 补全：音乐删除确认 */
+  socket.on('music-delete-ok', function () {
+    showToast(t('toastMusicDeleted'));
+    try { if (state.music) state.music = state.music.filter(function (m) { return true; }); } catch (e) {}
+  });
+  /* ★ 补全：备注数据推送 */
+  socket.on('remarks-data', function (d) {
+    if (!d) return;
+    state.remarks = d.remarks || {};
+    try { renderContacts(); } catch (e) {}
+  });
+  /* ★ 补全：只读模式变更即时生效（服务端广播 6 处，客户端此前无监听） */
+  socket.on('readonly-mode-changed', function (d) {
+    if (!d) return;
+    state.readonlyMode = !!d.enabled;
+    try {
+      var _rb = document.getElementById('readonlyBanner');
+      if (_rb) _rb.style.display = d.enabled ? 'block' : 'none';
+    } catch (e) {}
+    if (d.enabled) showToast(t('toastReadonlyOn'));
   });
 
-  socket.on('call-accept', function (data) {
-    var uid = socket.data && socket.data.userId;
-    if (!uid || !data || !data.to) return;
-    var me = getUserById(uid);
-    if (!me) return;
-
-    /* ★ 接听方同样必须是局域网 IP */
-    var _acceptorIp = _getRealIpFromSocket(socket);
-    if (!_isLanIp(_acceptorIp)) {
-      console.warn('📞 [通话] 拒绝非局域网 IP 接听：' +
-        me.name + ' @ ' + _acceptorIp);
-      _callClear(uid);
-      socket.emit('call-rejected', {
-        from: data.to,
-        reason: 'not_lan',
-        message: '通话功能仅限局域网内设备使用。\n' +
-          '检测到您来自外部网络（IP: ' + _acceptorIp + '），无法接听通话。'
-      });
-      emitToUser(data.to, 'call-rejected', {
-        from: uid,
-        reason: 'peer_not_lan',
-        message: me.name + ' 不在局域网内，无法接听通话'
-      });
-      return;
-    }
-
-    var rec = ACTIVE_CALLS[uid];
-    if (rec && rec.role === 'callee') rec.pending = false;
-
-    emitToUser(data.to, 'call-accepted', {
-      from: uid,
-      fromName: me.name
-    });
+  socket.on('message-edited', function (d) {
+    if (!d || !d.msgId) return;
+    try {
+      var _k = d.groupId ? d.groupId : d.peerId;
+      var _bucket = d.groupId
+        ? (state.groups && state.groups[_k] && state.groups[_k].messages)
+        : ((state.messages && state.messages[_k]) || null);
+      if (Array.isArray(_bucket)) {
+        for (var _i = 0; _i < _bucket.length; _i++) {
+          if (_bucket[_i] && _bucket[_i].msgId === d.msgId) {
+            _bucket[_i].content = d.content;
+            _bucket[_i].edited = true;
+            _bucket[_i].editTime = d.editTime;
+            if (d.editCount) _bucket[_i].editCount = d.editCount;
+            if (Array.isArray(d.editHistory)) _bucket[_i].editHistory = d.editHistory;
+            break;
+          }
+        }
+      }
+      renderMessages();
+    } catch (e) {}
   });
-
-  socket.on('call-reject', function (data) {
-    var uid = socket.data && socket.data.userId;
-    if (!uid || !data || !data.to) return;
-    _callClear(uid);
-    emitToUser(data.to, 'call-rejected', {
-      from: uid,
-      reason: data.reason || 'rejected'
-    });
-  });
-
-  socket.on('call-end', function (data) {
-    var uid = socket.data && socket.data.userId;
-    if (!uid || !data || !data.to) return;
-    _callClear(uid);
-    emitToUser(data.to, 'call-ended', {
-      from: uid,
-      duration: data.duration || 0
-    });
-  });
-
-  socket.on('call-signal', function (data) {
-    var uid = socket.data && socket.data.userId;
-    if (!uid || !data || !data.to || !data.signal) return;
-    /* ★ v0.32.0：只允许向当前已登记的通话对端推送信令 */
-    var _rec = ACTIVE_CALLS[uid];
-    if (!_rec || _rec.peerId !== data.to) {
-      console.warn('[Call] 丢弃非当前对端的信令：' +
-        uid + ' → ' + data.to);
-      return;
-    }
-    emitToUser(data.to, 'call-signal', {
-      from: uid,
-      signal: data.signal
-    });
-  });
-
-  socket.on('call-media-state', function (data) {
-    var uid = socket.data && socket.data.userId;
-    if (!uid || !data || !data.to) return;
-    var _rec = ACTIVE_CALLS[uid];
-    if (!_rec || _rec.peerId !== data.to) return;
-    emitToUser(data.to, 'call-media-state', {
-      from: uid,
-      muted: !!data.muted,
-      videoEnabled: !!data.videoEnabled,
-      speaking: !!data.speaking
-    });
+  socket.on('edit-message-error', function (d) {
+    showToast((d && d.error) || t('msgEditFailed'));
   });
 
   socket.on('call-incoming', function (data) {
@@ -47990,6 +53050,7 @@ socket.on('history-more', function (payload) {
   socket.on('call-accepted', function (data) {
     if (!data) return;
     var c = state.call;
+    console.log('[CALL-DIAG] 收到 call-accepted, 当前 status=' + c.status + ' active=' + c.active);
     if (!c.active || c.peerId !== data.from) return;
     if (c.status !== 'calling') return;
     if (c.timeoutId) { clearTimeout(c.timeoutId); c.timeoutId = null; }
@@ -47997,45 +53058,26 @@ socket.on('history-more', function (payload) {
     c.status = 'connecting';
     dom.callStatus.textContent = t('callConnecting');
 
-    // ★ 主叫方发起 PeerJS 呼叫
-    var tryCall = function () {
-      if (!c.localStream) { setTimeout(tryCall, 200); return; }
-      if (!window.__myPeer) {
-        console.error('PeerJS 未初始化');
-        callFinish(t('callFailed'), true, 'rejected');
-        return;
+    /* ★ DSH 通话修复 R4：不再走 PeerJS（其服务端/CDN 在局域网不可靠）。
+       对端接听后，由 ensurePeerConnection 的 onnegotiationneeded / makeCallOffer
+       自动发出 offer，经 call-signal → handleCallSignal 完成协商。 */
+    try {
+      var _pcMade = ensurePeerConnection();
+      /* ★ 兜底：即使 onnegotiationneeded 没触发（部分浏览器时序差异），
+         也主动发起一次 offer，保证协商一定能开始。 */
+      if (_pcMade && _pcMade.signalingState === 'stable' && !c._makingOffer) {
+        setTimeout(function () {
+          if (state.call.active && state.call.pc === _pcMade &&
+              state.call.pc.signalingState === 'stable') {
+            try { makeCallOffer(false); } catch (e) {
+              console.warn('[Call] 主动 offer 失败:', e && e.message);
+            }
+          }
+        }, 120);
       }
-      
-      var call = window.__myPeer.call(c.peerId, c.localStream, {
-        metadata: { type: c.type }
-      });
-      
-      if (!call) {
-        callFinish(t('callFailed'), true, 'rejected');
-        return;
-      }
-      
-      c._peerjsCall = call;
-      
-      call.on('stream', function (remoteStream) {
-        c.remoteStream = remoteStream;
-        try {
-          dom.callRemoteVideo.srcObject = remoteStream;
-          dom.callModal.classList.add('mode-video');
-        } catch (e) {}
-        if (!c.remoteAnalyser) setupVolumeDetection(remoteStream, false);
-        
-        c.status = 'active';
-        c.connectedAt = Date.now();
-        startCallTimer();
-        setupQualityMonitor();
-      });
-      
-      call.on('close', function () {
-        if (state.call.active) callFinish(t('callEnded'), true, 'ended');
-      });
-    };
-    tryCall();
+    } catch (e) {
+      console.warn('[Call] call-accepted 建 PC 失败:', e && e.message);
+    }
   });
 
   socket.on('call-rejected', function (data) {
@@ -48110,8 +53152,13 @@ socket.on('history-more', function (payload) {
     callFinish(t('callEnded'), true, _res);
   });
 
+  /* ★ DSH 通话修复 R1：原生 WebRTC 信令必须接回 handleCallSignal。
+     旧版本这里被清空（"已由 PeerJS 接管"），但 PeerJS 从未真正可用，
+     导致 offer/answer/ICE 全部被丢弃 —— 通话永远停在「连接中」。 */
   socket.on('call-signal', function (data) {
-    // ★ 已由 PeerJS 接管，忽略旧的原生 WebRTC 信令
+    if (!data) return;
+    try { handleCallSignal(data); }
+    catch (e) { console.warn('[Call] 处理信令失败:', e && e.message); }
   });
 
   socket.on('call-media-state', function (data) {
@@ -48152,13 +53199,18 @@ socket.on('history-more', function (payload) {
 
   socket.on('group-call-started', function (d) {
     if (!d) return;
-    if (state.gcall.active) return;
+    /* ★ 关键修复：发起者在 gcStartCall 里已把 state.gcall.active 置为 true，
+       原守卫 if (state.gcall.active) return; 会把【自己发起的】群呼直接丢弃，
+       导致永远不创建 peer、不发 offer → 界面永远「连接中」。 */
+    if (state.gcall.active && state.gcall.startedAt) return;   /* 已在通话中才忽略 */
     gcBecomeParticipant(d, true);
   });
 
   socket.on('group-call-joined', function (d) {
     if (!d) return;
-    if (state.gcall.active) return;
+    /* ★ 同上：重复的 joined 才忽略；首次加入必须处理 */
+    if (state.gcall.active && state.gcall.startedAt &&
+        state.gcall.groupId === d.groupId) return;
     gcHandleJoined(d);
   });
 
@@ -48167,14 +53219,20 @@ socket.on('history-more', function (payload) {
     if (d.groupId !== state.gcall.groupId) return;
     var m = d.member;
     if (!m || m.id === state.myId) return;
-    if (!state.gcall.peers[m.id]) {
-      state.gcall.peers[m.id] = {
-        pc: null, stream: null, name: m.name,
-        avatar: m.avatar || '', verified: m.verified || '',
-        audioEl: null, videoEl: null, muted: false, pending: true
-      };
-      gcRenderGrid();
+    console.log('[GC-DIAG] 新成员加入: ' + m.name + ' (' + m.id + ')');
+    /* ★ 通话修复：旧实现只占位不建 peer，导致永远没人发 offer。
+       现在由【已在通话中的本端】主动向新成员发起 offer —— 新成员是被叫方。 */
+    if (!state.gcall.localStream) {
+      console.warn('[GC-DIAG] 本地流未就绪，稍后重试建连 ' + m.name);
+      setTimeout(function () {
+        if (state.gcall.active && state.gcall.localStream && m.id !== state.myId) {
+          gcCreatePeer(m.id, m.name, m.avatar, m.verified, true);
+        }
+      }, 600);
+    } else {
+      gcCreatePeer(m.id, m.name, m.avatar, m.verified, true);
     }
+    gcRenderGrid();
   });
 
   socket.on('group-call-member-left', function (d) {
@@ -48223,6 +53281,74 @@ socket.on('history-more', function (payload) {
     showToast(msg);
     if (state.gcall.active && state.gcall.groupId === d.groupId) gcLeave(true);
   });
+
+  /* ★ 审计面板：首次展开时加载 + 刷新按钮 */
+  (function initAuditPanel() {
+    var btn = document.getElementById('dshAuditRefresh');
+    if (btn && !btn._bound) {
+      btn._bound = true;
+      btn.addEventListener('click', function () {
+        try { renderAuditPanel(); } catch (e) {}
+      });
+    }
+    var list = document.getElementById('dshAuditList');
+    if (list && list.getAttribute('data-loaded') !== '1') {
+      list.setAttribute('data-loaded', '1');
+      try { renderAuditPanel(); } catch (e) {}
+    }
+  })();
+
+  /* ★ 通话设置项：读取、持久化、推送 */
+  (function initCallSettings() {
+    var MAP = {
+      setCallForceTurn: 'callForceTurn',
+      setCallQualityShow: 'callQualityShow',
+      setCallAutoAnswer: 'callAutoAnswer',
+      setCallDefaultVideo: 'callDefaultVideo'
+    };
+    var NUMMAP = {
+      setCallRingTimeout: 'callRingTimeout',
+      setCallReconnect: 'callReconnect'
+    };
+    function applyOne(id, key, isBool) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      var saved = loadSetting(key, isBool ? (id === 'setCallQualityShow') : null);
+      if (isBool) el.checked = !!saved;
+      else if (saved != null) el.value = saved;
+      el.addEventListener('change', function () {
+        var v = isBool ? el.checked : (parseInt(el.value, 10) || 0);
+        saveSetting(key, v);
+        try { syncSettingToServer(key, v); } catch (e) {}
+      });
+    }
+    for (var id in MAP) applyOne(id, MAP[id], true);
+    for (var id2 in NUMMAP) applyOne(id2, NUMMAP[id2], false);
+  })();
+
+  /* ★ 设置推送：本地变更同步到服务端，多端生效 */
+  function syncSettingToServer(key, value) {
+    if (!state.socket || !state.socket.connected) return;
+    state.socket.emit('dsh-sync', { kind: 'setting', value: (function () {
+      var o = {}; o[key] = value; return o;
+    })() });
+  }
+
+  /* ★ 屏幕共享按钮绑定（存在则绑定，避免报错） */
+  (function () {
+    var ids = ['gcScreenBtn', 'gcShareScreenBtn', 'callScreenBtn'];
+    for (var i = 0; i < ids.length; i++) {
+      var el = document.getElementById(ids[i]);
+      if (el && !el._bound) {
+        el._bound = true;
+        el.addEventListener('click', function (ev) {
+          ev.preventDefault();
+          if (state.gcall && state.gcall.active) gcToggleScreenShare();
+          else showToast('请在群通话中使用屏幕共享');
+        });
+      }
+    }
+  })();
 
   socket.on('connect', function () {
     if (!state._hasConnectedOnce) {
@@ -48562,6 +53688,7 @@ socket.on('history-more', function (payload) {
     cached.info = d;
     cached.status = status;
     state.redPacketCache[d.packetId] = cached;
+    _clientCacheTrim(state.redPacketCache, _CLIENT_CACHE_LIMIT.redPacket);
 
     renderRpgDetail(d);
 
@@ -49028,6 +54155,411 @@ socket.on('history-more', function (payload) {
       applyTimeBasedTheme();
     }
   });
+
+  /* ================= DSH P2 客户端事件 ================= */
+  /* 登录/重连后请求离线队列与能力状态 */
+  socket.on('connect', function () {
+    try { socket.emit('dsh-ready'); socket.emit('dsh-sync-get'); } catch (e) {}
+  });
+  socket.on('dsh-status', function (d) {
+    if (!d) return;
+    state.dsh = state.dsh || {};
+    state.dsh.features = d.features || {};
+    state.dsh.snapshot = d.snapshot || null;
+    if (d.flushed) showToast(t('toastOfflineFlushed').replace('{n}', d.flushed));
+  });
+  socket.on('dsh-snapshot', function (d) {
+    if (!d) return;
+    state.dsh = state.dsh || {};
+    state.dsh.snapshot = d;
+    try { renderQuotaMeter(); } catch (e) {}
+  });
+  /* 已读回执 */
+  socket.on('dsh-read-receipt-ack', function (d) {
+    if (!d || !d.msgId) return;
+    try {
+      var _h = state.messages || {};
+      for (var _k in _h) {
+        var _arr = _h[_k]; if (!Array.isArray(_arr)) continue;
+        for (var _i = 0; _i < _arr.length; _i++) {
+          if (_arr[_i] && _arr[_i].msgId === d.msgId) {
+            if (!Array.isArray(_arr[_i].readUsers)) _arr[_i].readUsers = [];
+            if (_arr[_i].readUsers.indexOf(d.by) === -1) _arr[_i].readUsers.push(d.by);
+          }
+        }
+      }
+      renderMessages();
+    } catch (e) {}
+  });
+  /* 多端同步 */
+  socket.on('dsh-sync-apply', function (d) {
+    if (!d || !d.kind) return;
+    try {
+      if (d.kind === 'setting') { for (var _sk in (d.value || {})) { try { localStorage.setItem('set_' + _sk, JSON.stringify(d.value[_sk])); } catch (e) {} } }
+      else if (d.kind === 'draft') {
+        state.drafts = state.drafts || {};
+        for (var _dk in (d.value || {})) {
+          if (d.value[_dk]) state.drafts[_dk] = d.value[_dk];
+          else delete state.drafts[_dk];
+        }
+        try { localStorage.setItem('chat_drafts', JSON.stringify(state.drafts)); } catch (e) {}
+        /* 若改动的是当前会话，同步输入框内容 */
+        try {
+          var _ck = currentChatKey();
+          if (_ck && (_ck in (d.value || {})) && dom.msgInput &&
+              dom.msgInput.value !== (state.drafts[_ck] || '')) {
+            dom.msgInput.value = state.drafts[_ck] || '';
+          }
+        } catch (e) {}
+      }
+      else if (d.kind === 'read') { state.unread = state.unread || {}; for (var _rk in (d.value || {})) state.unread[_rk] = 0; renderContacts(); }
+      else if (d.kind === 'star') { state.starredMsgs = state.starredMsgs || {}; for (var _mk in (d.value || {})) state.starredMsgs[_mk] = d.value[_mk]; }
+      try { syncSettingsUI(); } catch (e) {}
+    } catch (e) {}
+  });
+  socket.on('dsh-sync-apply-all', function (d) {
+    if (!d) return;
+    state.dshSync = d;
+    try { if (d.setting) syncSettingsUI(); } catch (e) {}
+  });
+  /* 群公告 / 待办 / @all */
+  socket.on('dsh-group-meta', function (d) {
+    if (!d) return;
+    state.groupMeta = state.groupMeta || {};
+    state.groupMeta[state.currentTarget] = d;
+    try { renderGroupSidePanel(); } catch (e) {}
+  });
+  /* ★ 公告已读回执：打开群聊时把最新公告标记为已读 */
+  function dshMarkAnnounceRead() {
+    try {
+      if (state.currentType !== 'group' || !state.currentTarget) return;
+      var m = (state.groupMeta || {})[state.currentTarget];
+      if (!m || !m.announcements || !m.announcements.length) return;
+      var latest = m.announcements[0];
+      if (!latest || !latest.id) return;
+      if (Array.isArray(latest.readBy) && latest.readBy.indexOf(state.myId) !== -1) return;
+      if (state.socket && state.socket.connected) {
+        state.socket.emit('dsh-announce-read', { groupId: state.currentTarget, announceId: latest.id });
+      }
+    } catch (e) {}
+  }
+  socket.on('dsh-group-announce-read', function (d) {
+    if (!d || !d.groupId) return;
+    var m = (state.groupMeta || {})[d.groupId];
+    if (!m || !m.announcements) return;
+    for (var i = 0; i < m.announcements.length; i++) {
+      if (m.announcements[i].id === d.announceId) {
+        m.announcements[i].readBy = d.readBy || [];
+        m.announcements[i].readCount = d.readCount || 0;
+        break;
+      }
+    }
+    try { renderGroupMetaPanel(); } catch (e) {}
+  });
+
+  socket.on('dsh-group-announce-new', function (d) {
+    if (!d) return;
+    var _g = state.groupMeta = state.groupMeta || {};
+    _g[d.groupId] = _g[d.groupId] || { announcements: [], todos: [] };
+    _g[d.groupId].announcements = d.all || [_g[d.groupId].announcements || []].flat();
+    try { renderPinnedBanner(); } catch (e) {}
+    if (d.item && d.item.by !== state.myName) showToast(t('toastGroupAnnounce').replace('{who}', d.item.by || ''));
+    try { renderGroupSidePanel(); } catch (e) {}
+  });
+  /* ★ 群文件柜 */
+  /* 进入群聊时自动拉取文件柜 */
+  if (typeof state !== 'undefined' && state.socket && state.socket.connected) {
+    try {
+      if (state.currentType === 'group' && state.currentTarget) {
+        state.socket.emit('dsh-group-files-get', { groupId: state.currentTarget });
+      }
+    } catch (e) {}
+  }
+  socket.on('dsh-group-files', function (d) {
+    if (!d || !d.groupId) return;
+    var _g = state.groupMeta = state.groupMeta || {};
+    _g[d.groupId] = _g[d.groupId] || { announcements: [], todos: [], files: [] };
+    _g[d.groupId].files = d.files || [];
+    try { renderGroupFileCabinet(); } catch (e) {}
+  });
+  /* ★ 群待办（含指派信息） */
+  socket.on('dsh-group-todos', function (d) {
+    if (!d) return;
+    var _g = state.groupMeta = state.groupMeta || {};
+    _g[d.groupId] = _g[d.groupId] || { announcements: [], todos: [] };
+    _g[d.groupId].todos = d.todos || [];
+    try { renderGroupSidePanel(); } catch (e) {}
+  });
+  socket.on('dsh-mention-all', function (d) {
+    if (!d) return;
+    if (d.from === state.myName) return;
+    showToast(t('toastMentionAll').replace('{who}', d.from || '').replace('{text}', String(d.content || '').slice(0, 40)));
+  });
+  /* 收藏同步 */
+  socket.on('dsh-star-sync', function (d) {
+    if (!d || !d.msgId) return;
+    state.starTags = state.starTags || {};
+    state.starTags[d.msgId] = d.tags || [];
+    try { renderStarred(); } catch (e) {}
+  });
+  socket.on('dsh-star-ok', function (d) {
+    if (!d) return;
+    state.starTags = state.starTags || {};
+    state.starTags[d.msgId] = d.tags || [];
+    try { renderStarred(); } catch (e) {}
+  });
+  /* 通话：无应答超时 / 多方 / 屏幕共享 / 质量 */
+  /* ★ 通话中文字消息 */
+  socket.on('dsh-call-chat', function (d) {
+    if (!d || !d.text) return;
+    if (d.from === state.myId) return;
+    var box = document.getElementById('callChatLog') || document.getElementById('gcChatLog');
+    if (box) {
+      var row = document.createElement('div');
+      row.style.cssText = 'padding:3px 8px;font-size:12.5px;color:#fff;background:rgba(0,0,0,.35);border-radius:8px;margin-bottom:4px;';
+      row.textContent = (d.fromName || '') + '：' + d.text;
+      box.appendChild(row);
+      box.scrollTop = box.scrollHeight;
+    } else {
+      showToast((d.fromName || '') + '：' + d.text);
+    }
+    console.log('[CALL-DIAG] 收到通话消息 ' + (d.fromName || '') + ': ' + d.text);
+  });
+
+  socket.on('call-timeout', function (d) {
+    if (!state.call || !state.call.active) return;
+    callFinish(t('callNoAnswer'), true, 'timeout');
+  });
+  socket.on('dsh-call-peers', function (d) {
+    if (!d || !state.call || !state.call.active) return;
+    state.call.peers = d.peers || [];
+    try { renderCallPeers(); } catch (e) {}
+  });
+  socket.on('dsh-call-full', function () {
+    showToast(t('toastCallFull'));
+  });
+  socket.on('dsh-call-screen-changed', function (d) {
+    if (!d) return;
+    if (state.call && state.call.active) {
+      if (d.on) showToast(t('toastScreenSharing').replace('{who}', d.from || ''));
+      return;
+    }
+    /* 群呼场景：对端共享屏幕 → 把其视频轨接到大画面 */
+    if (state.gcall && state.gcall.active) {
+      var rec = state.gcall.peers[d.from];
+      if (rec && rec.stream) {
+        var vs = rec.stream.getVideoTracks();
+        if (d.on && vs.length) {
+          try {
+            var vEl = dom.gcScreenVideo || document.getElementById('gcScreenVideo');
+            if (vEl) { vEl.srcObject = rec.stream; vEl.style.display = 'block'; }
+          } catch (e) {}
+          showToast((d.fromName || d.from) + ' 开始共享屏幕');
+        } else {
+          try {
+            var vEl2 = dom.gcScreenVideo || document.getElementById('gcScreenVideo');
+            if (vEl2) { vEl2.srcObject = null; vEl2.style.display = 'none'; }
+          } catch (e) {}
+        }
+      }
+    }
+  });
+}
+
+/* ================= DSH P2 客户端辅助渲染 ================= */
+function renderQuotaMeter() {
+  var el = document.getElementById('dshQuotaMeter');
+  if (!el) return;
+  var s = (state.dsh && state.dsh.snapshot) || null;
+  if (!s) { el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  var pct = Math.max(0, Math.min(100, s.quotaPercent || 0));
+  el.innerHTML = '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:4px;">' +
+    escapeHtml(t('quotaMeter')) + ' ' + (s.quotaUsed / 1048576).toFixed(1) + ' / ' +
+    (s.quotaLimit / 1048576).toFixed(1) + ' MB</div>' +
+    '<div style="height:6px;background:rgba(0,0,0,.08);border-radius:3px;overflow:hidden;">' +
+    '<div style="height:100%;width:' + pct + '%;background:' +
+    (pct > 90 ? 'var(--danger,#e64340)' : 'var(--brand,#07c160)') + ';"></div></div>' +
+    (s.offlinePending ? '<div style="font-size:11px;color:var(--text-secondary);margin-top:3px;">离线待发 ' + s.offlinePending + ' 条</div>' : '');
+}
+function renderCallPeers() {
+  var el = document.getElementById('dshCallPeers');
+  if (!el) return;
+  var p = (state.call && state.call.peers) || [];
+  if (p.length <= 2) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:12px;color:#fff;opacity:.85;">通话中 ' + p.length + ' 人</div>';
+}
+/* ★ 审计日志面板：拉取并渲染 /api/audit */
+function renderAuditPanel() {
+  var el = document.getElementById('dshAuditList');
+  if (!el) return;
+  el.innerHTML = '<div style="font-size:12px;color:var(--text-muted);">加载中…</div>';
+  fetch('/api/audit?limit=100', { credentials: 'same-origin' })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      var list = (d && d.entries) || [];
+      if (!list.length) { el.innerHTML = '<div style="font-size:12px;color:var(--text-muted);">暂无审计记录</div>'; return; }
+      var h = '';
+      for (var i = 0; i < list.length; i++) {
+        var e = list[i];
+        var t = new Date(e.ts).toLocaleString('zh-CN', { hour12: false });
+        h += '<div style="padding:4px 6px;border-bottom:1px solid rgba(0,0,0,.05);font-size:12px;">' +
+          '<b>' + escapeHtml(e.actor || '') + '</b> ' +
+          escapeHtml(e.action || '') +
+          (e.target ? ' → ' + escapeHtml(String(e.target).slice(0, 40)) : '') +
+          '<span style="float:right;color:var(--text-muted);">' + t + '</span></div>';
+      }
+      el.innerHTML = h;
+    })
+    .catch(function () {
+      el.innerHTML = '<div style="font-size:12px;color:var(--danger,#e64340);">加载失败（需要管理员权限）</div>';
+    });
+}
+
+/* ★ 群文件柜渲染 */
+function renderGroupFileCabinet() {
+  var el = document.getElementById('dshGroupFiles');
+  if (!el) return;
+  var m = (state.groupMeta || {})[state.currentTarget];
+  var files = (m && m.files) || [];
+  if (!files.length) {
+    el.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:6px 0;">暂无群文件</div>';
+    return;
+  }
+  var h = '';
+  for (var i = 0; i < Math.min(50, files.length); i++) {
+    var f = files[i];
+    var size = f.fileSize > 1048576 ? (f.fileSize / 1048576).toFixed(1) + ' MB'
+      : f.fileSize > 1024 ? (f.fileSize / 1024).toFixed(0) + ' KB' : f.fileSize + ' B';
+    h += '<div style="display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:6px;' +
+      'font-size:12px;cursor:pointer;" data-fileid="' + escapeHtml(f.fileId) + '">' +
+      '<span>📄</span>' +
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+      escapeHtml(f.fileName) + '</span>' +
+      '<span style="color:var(--text-muted);">' + size + '</span></div>';
+  }
+  el.innerHTML = h;
+  /* 点击下载 */
+  var rows = el.querySelectorAll('[data-fileid]');
+  for (var j = 0; j < rows.length; j++) {
+    rows[j].addEventListener('click', function () {
+      var fid = this.getAttribute('data-fileid');
+      if (fid) window.open('/api/file/' + encodeURIComponent(fid) + '?dl=1', '_blank');
+    });
+  }
+}
+
+function renderGroupMetaPanel() {
+  /* ★ 打开群信息面板时把最新公告标记为已读 */
+  try { if (typeof dshMarkAnnounceRead === 'function') dshMarkAnnounceRead(); } catch (e) {}
+  var el = document.getElementById('dshGroupMeta');
+  if (!el) return;
+  var m = (state.groupMeta || {})[state.currentTarget];
+  if (!m) { el.innerHTML = ''; return; }
+  var h = '';
+  if (m.announcements && m.announcements.length) {
+    h += '<div class="gsp-section-title">' + escapeHtml(t('groupAnnounce')) + '</div>';
+    for (var i = 0; i < Math.min(3, m.announcements.length); i++) {
+      var a = m.announcements[i];
+      h += '<div style="padding:6px 8px;background:rgba(7,193,96,.06);border-radius:8px;margin-bottom:6px;font-size:12px;">' +
+        '<b>' + escapeHtml(a.by || '') + '</b>：' + escapeHtml(String(a.content || '').slice(0, 80)) + '</div>';
+    }
+  }
+  if (m.todos && m.todos.length) {
+    h += '<div class="gsp-section-title">' + escapeHtml(t('groupTodos')) + '</div>';
+    for (var j = 0; j < Math.min(8, m.todos.length); j++) {
+      var td = m.todos[j];
+      var _due = '';
+      if (td.dueAt) {
+        var _d = new Date(td.dueAt);
+        var _over = (!td.done && td.dueAt < Date.now());
+        _due = ' <span style="color:' + (_over ? 'var(--danger,#e64340)' : 'var(--text-muted)') +
+          ';font-size:11px;">' + (td.done ? '完成于 ' : '截止 ') +
+          (_d.getMonth() + 1) + '/' + _d.getDate() + '</span>';
+      }
+      var _asg = td.assigneeName
+        ? ' <span style="color:var(--accent);font-size:11px;">@' + escapeHtml(td.assigneeName) + '</span>'
+        : '';
+      h += '<div style="font-size:12px;padding:3px 0;" data-todoid="' + escapeHtml(td.id) + '">' +
+        (td.done ? '✅' : '⬜') + ' ' +
+        escapeHtml(String(td.content || '').slice(0, 60)) + _asg + _due + '</div>';
+    }
+    h += '<div style="padding:4px 0;">' +
+      '<input type="text" id="dshTodoInput" placeholder="新增待办…" ' +
+      'style="width:100%;padding:5px 8px;font-size:12px;border:1px solid var(--border-input);border-radius:6px;">' +
+      '<div style="display:flex;gap:4px;margin-top:4px;">' +
+      '<input type="text" id="dshTodoAssignee" placeholder="指派给…" ' +
+      'style="flex:1;padding:4px 6px;font-size:11px;border:1px solid var(--border-input);border-radius:6px;">' +
+      '<input type="date" id="dshTodoDue" ' +
+      'style="padding:4px 6px;font-size:11px;border:1px solid var(--border-input);border-radius:6px;">' +
+      '<button type="button" id="dshTodoAdd" class="btn-mini" ' +
+      'style="font-size:11px;padding:4px 10px;">添加</button>' +
+      '</div></div>';
+  }
+  el.innerHTML = h;
+  /* ★ 绑定待办添加 */
+  (function () {
+    var addBtn = document.getElementById('dshTodoAdd');
+    var inputEl = document.getElementById('dshTodoInput');
+    if (!addBtn || !inputEl || addBtn._bound) return;
+    addBtn._bound = true;
+    function doAdd() {
+      var txt = String(inputEl.value || '').trim();
+      if (!txt) return;
+      var asgEl = document.getElementById('dshTodoAssignee');
+      var dueEl = document.getElementById('dshTodoDue');
+      var _asgName = asgEl ? String(asgEl.value || '').trim() : '';
+      var _asgId = '';
+      if (_asgName) {
+        for (var _uid in state.users) {
+          if (state.users[_uid] && state.users[_uid].name === _asgName) { _asgId = _uid; break; }
+        }
+        if (!_asgId) {
+          for (var _gid in state.groups) {
+            var _gg = state.groups[_gid];
+            if (_gg && _gg.id === state.currentTarget && _gg.members) {
+              for (var _mi = 0; _mi < _gg.members.length; _mi++) {
+                var _mu = state.users[_gg.members[_mi]];
+                if (_mu && _mu.name === _asgName) { _asgId = _gg.members[_mi]; break; }
+              }
+            }
+          }
+        }
+      }
+      var _dueTs = 0;
+      if (dueEl && dueEl.value) {
+        var _dt = new Date(dueEl.value);
+        if (!isNaN(_dt.getTime())) _dueTs = _dt.getTime();
+      }
+      if (state.socket && state.socket.connected) {
+        state.socket.emit('dsh-group-todo', {
+          groupId: state.currentTarget,
+          content: txt,
+          assigneeId: _asgId,
+          assigneeName: _asgName,
+          dueAt: _dueTs
+        });
+      }
+      inputEl.value = '';
+      if (asgEl) asgEl.value = '';
+      if (dueEl) dueEl.value = '';
+    }
+    addBtn.addEventListener('click', doAdd);
+    inputEl.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); doAdd(); }
+    });
+  })();
+}
+/* 极简 Markdown（仅当 enableMarkdown 开启时用于消息渲染，默认关闭） */
+function renderMarkdownLite(text) {
+  var s = escapeHtml(String(text == null ? '' : text));
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+  /* 反引号代码段：用 String.fromCharCode(96) 构造，避免污染外层模板 */
+  var _bt = String.fromCharCode(96);
+  s = s.replace(new RegExp(_bt + '([^' + _bt + ']+)' + _bt, 'g'), '<code style="background:rgba(0,0,0,.06);padding:1px 4px;border-radius:4px;">$1</code>');
+  s = s.replace(/^&gt; (.+)$/gm, '<blockquote style="border-left:3px solid #ccc;margin:2px 0;padding-left:8px;opacity:.85;">$1</blockquote>');
+  s = s.replace(/\n/g, '<br>');
+  return s;
 }
 
 function globalRefresh() {
@@ -49149,6 +54681,7 @@ dom.memberBtn.addEventListener('click', function () {
   if (!state.currentTarget || state.currentType !== 'group') return;
   var g = state.groups[state.currentTarget];
   if (!g) return;
+
   dom.memberListTitle.textContent = t('groupMembersTitle') + ' - ' + g.name;
   var list = dom.memberListView;
   list.innerHTML = '';
@@ -51135,6 +56668,38 @@ function syncSettingsUI() {
   } catch (e2) {
     console.error('__bindV028Settings 出错:', e2);
   }
+
+  /* 恢复 v0.32.2 的 8 个显示类设置 */
+  try {
+    var _v0322Map = [
+      ['setMsgFontWeight', 'set_msgFontWeight', '400'],
+      ['setMsgAvatarSize', 'set_msgAvatarSize', '38'],
+      ['setImagePreviewMode', 'set_imagePreviewMode', 'modal'],
+      ['setContactTimeFormat', 'set_contactTimeFormat', 'smart']
+    ];
+    for (var _vi = 0; _vi < _v0322Map.length; _vi++) {
+      var _sel = document.getElementById(_v0322Map[_vi][0]);
+      if (_sel) {
+        _sel.value = localStorage.getItem(_v0322Map[_vi][1]) || _v0322Map[_vi][2];
+      }
+    }
+    var _v0322Chk = [
+      ['setMsgBubbleShadow', 'set_msgBubbleShadow', true],
+      ['setVideoMute', 'set_videoMute', true],
+      ['setCopyWithSender', 'set_copyWithSender', true],
+      ['setAutoSaveDraft', 'set_autoSaveDraft', true]
+    ];
+    for (var _ci = 0; _ci < _v0322Chk.length; _ci++) {
+      var _chk2 = document.getElementById(_v0322Chk[_ci][0]);
+      if (_chk2) {
+        var _raw = localStorage.getItem(_v0322Chk[_ci][1]);
+        _chk2.checked = (_raw === null)
+          ? _v0322Chk[_ci][2] : (_raw !== '0');
+      }
+    }
+  } catch (e3) {
+    console.error('[syncSettingsUI] v0.32.2 恢复出错:', e3);
+  }
 }
 
 dom.settingsBtn.addEventListener('click', function () {
@@ -51145,6 +56710,12 @@ dom.settingsBtn.addEventListener('click', function () {
   }
   try {
     dom.settingsModal.classList.add('open');
+    /* ★ 极简模式：自动切到「数据与帮助」，让用户第一眼看到极简开关 */
+    if (typeof window.__isLiteMode === 'function' && window.__isLiteMode()) {
+      if (typeof window.__settingsGoTo === 'function') {
+        window.__settingsGoTo('data');
+      }
+    }
   } catch (e2) {
     console.error('[settings] 面板打开失败:', e2);
   }
@@ -51381,6 +56952,26 @@ dom.shortcutsModal.addEventListener('click', function (e) {
       ? isEventOnOverlayBackground(e, ov)
       : e.target === ov) ov.classList.remove('open');
 });
+
+/* 可录制的快捷键面板（复用 renderShortcutSettings，按 ? 触发） */
+(function _initShortcutPanel() {
+  function _open() {
+    if (typeof renderShortcutSettings === 'function') {
+      renderShortcutSettings();
+    } else if (dom.shortcutsModal) {
+      dom.shortcutsModal.classList.add('open');
+    }
+  }
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== '?') return;
+    var ae = document.activeElement;
+    var isTyping = ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA');
+    if (isTyping || e.ctrlKey || e.metaKey || e.altKey) return;
+    e.preventDefault();
+    _open();
+  });
+  window.__openShortcutPanel = _open;
+})();
 
 (function initAbout() {
   if (!dom.aboutModal) return;
@@ -52246,7 +57837,7 @@ dom.shortcutsModal.addEventListener('click', function (e) {
         try { localStorage.setItem('set_bubbleRadius', _brEl.value); } catch (e) {}
       });
     }
-    
+
     var _mgEl = document.getElementById('setMsgGap');
     var _mgVal = document.getElementById('setMsgGapVal');
     var _mgSaved = parseInt(localStorage.getItem('set_msgGap') || '6', 10);
@@ -52263,6 +57854,36 @@ dom.shortcutsModal.addEventListener('click', function (e) {
       });
       _mgEl.addEventListener('change', function () {
         try { localStorage.setItem('set_msgGap', _mgEl.value); } catch (e) {}
+      });
+    }
+
+    /* 输入框最大高度 */
+    var _mihEl = document.getElementById('setMaxInputHeight');
+    var _mihVal = document.getElementById('setMaxInputHeightVal');
+    var _mihSaved = parseInt(localStorage.getItem('set_maxInputHeight') || '120', 10);
+    if (isNaN(_mihSaved) || _mihSaved < 60 || _mihSaved > 300) _mihSaved = 120;
+    if (_mihEl) {
+      _mihEl.value = String(_mihSaved);
+      if (_mihVal) _mihVal.textContent = _mihSaved + 'px';
+      state.maxInputHeight = _mihSaved;
+      document.documentElement.style.setProperty('--max-input-height', _mihSaved + 'px');
+      _mihEl.addEventListener('input', function () {
+        var v = parseInt(_mihEl.value, 10);
+        if (isNaN(v)) v = 120;
+        if (_mihVal) _mihVal.textContent = v + 'px';
+        state.maxInputHeight = v;
+        document.documentElement.style.setProperty('--max-input-height', v + 'px');
+        /* 立即应用到当前 textarea */
+        try {
+          var ta = dom.msgInput;
+          if (ta && ta.tagName === 'TEXTAREA') {
+            ta.style.height = 'auto';
+            ta.style.height = Math.min(Math.max(ta.scrollHeight, 40), v) + 'px';
+          }
+        } catch (e) {}
+      });
+      _mihEl.addEventListener('change', function () {
+        try { localStorage.setItem('set_maxInputHeight', _mihEl.value); } catch (e) {}
       });
     }
   } catch (e) {}
@@ -53022,6 +58643,11 @@ dom.shortcutsModal.addEventListener('click', function (e) {
     }
 
     function saveAndApplyBackground(dataUrl, tip) {
+      /* 主背景图也控制在 400KB 内，避免 localStorage 爆配额 */
+      if (typeof dataUrl === 'string' && dataUrl.length > 400 * 1024) {
+        showToast('背景图过大（> 400KB），请换一张更小的');
+        return false;
+      }
       try {
         localStorage.setItem('bgImage', dataUrl);
         localStorage.setItem('bgType', 'image');
@@ -53309,7 +58935,7 @@ if (state.acrylicSecondary) {
         showToast('已清除背景图片');
       });
     }
-  })();   /* ★ v0.26.1 修复：initAcrylicAndBackground 的 IIFE 结尾 */
+  })();   /* 修复：initAcrylicAndBackground 的 IIFE 结尾 */
 
   if (dom.signinBtn) {
     dom.signinBtn.addEventListener('click', function () {
@@ -54364,14 +59990,15 @@ function drawChatToCanvas(msgs, opts) {
         document.body.removeChild(fi);
         return;
       }
-      var rd = new FileReader();
-      rd.onload = function (ev) {
-        compressImage(ev.target.result, 1280, 0.75).then(function (c) {
-          sendFileMessage('photo_' + Date.now() + '.jpg',
-            Math.round(c.length * 0.75), 'image/jpeg', c);
-        });
-      };
-      rd.readAsDataURL(f);
+      var _photoName = 'photo_' + Date.now() + '.jpg';
+      var _photoFile;
+      try {
+        _photoFile = new File([f], _photoName, { type: 'image/jpeg' });
+      } catch (eMk) {
+        _photoFile = f;
+        _photoFile.name = _photoName;
+      }
+      sendFileObject(_photoFile);
       document.body.removeChild(fi);
     });
     fi.click();
@@ -54580,8 +60207,7 @@ function showMsgMenuTagPicker(msgId, curTag) {
         '<span style="font-size:16px;opacity:.55;">🔎</span>' +
         '<input type="text" class="global-search-input" ' +
           'id="globalSearchInput" ' +
-          'placeholder="' + (state.lang === 'en'
-            ? 'Search all chats…' : '在所有会话中搜索…') + '" ' +
+          'placeholder="' + (state.lang === 'en' ? 'Search all chats…' : '在所有会话中搜索…') + '" ' +
           'autocomplete="off" spellcheck="false">' +
         '<span class="global-search-count" id="globalSearchCount">—</span>' +
       '</div>' +
@@ -54610,8 +60236,7 @@ function showMsgMenuTagPicker(msgId, curTag) {
       return;
     }
     if (!state.socket || !state.socket.connected) {
-      listEl.innerHTML = '<div style="text-align:center;padding:30px;' +
-        'color:var(--text-muted);font-size:13px;">' +
+      listEl.innerHTML = '<div style="text-align:center;padding:30px;color:var(--text-muted);font-size:13px;">' +
         (state.lang === 'en' ? 'Not connected' : '未连接') + '</div>';
       return;
     }
@@ -54635,70 +60260,73 @@ function showMsgMenuTagPicker(msgId, curTag) {
   });
 
   document.addEventListener('keydown', function (e) {
-    if ((e.ctrlKey || e.metaKey) && e.shiftKey &&
-        (e.key === 'f' || e.key === 'F')) {
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'f' || e.key === 'F')) {
       e.preventDefault();
       if (panel.classList.contains('open')) close();
       else open();
     }
   });
 
-  if (state.socket) {
-    state.socket.on('global-search-result', function (d) {
-      if (!d) return;
-      var arr = d.results || [];
-      countEl.textContent = arr.length + (state.lang === 'en' ? ' found' : ' 条');
-      if (!arr.length) {
-        listEl.innerHTML = '<div style="text-align:center;padding:30px;' +
-          'color:var(--text-muted);font-size:13px;">' +
-          (state.lang === 'en' ? 'No results' : '没有找到结果') + '</div>';
-        return;
-      }
-      var html = '';
-      for (var i = 0; i < arr.length; i++) {
-        var r = arr[i];
-        var hlText = escapeHtml(r.preview);
-        try {
-          var re = new RegExp('(' +
-            String(d.q).replace(/[\\^$.*+?()[\]{}|]/g, '\\$&') + ')', 'gi');
-          hlText = hlText.replace(re, '<mark>$1</mark>');
-        } catch (e) {}
-        html += '<div class="global-search-item" ' +
-          'data-tid="' + escapeHtml(r.targetId) + '" ' +
-          'data-ttype="' + escapeHtml(r.type) + '" ' +
-          'data-mid="' + escapeHtml(r.msgId) + '">' +
-          '<div class="gsi-head">' +
-            '<span class="gsi-chat">' + escapeHtml(r.chatName) + '</span>' +
-            '<span>·</span>' +
-            '<span>' + escapeHtml(r.fromName || '') + '</span>' +
-            '<span>·</span>' +
-            '<span>' + escapeHtml(r.time || '') + '</span>' +
-          '</div>' +
-          '<div class="gsi-text">' + hlText + '</div>' +
-          '</div>';
-      }
-      listEl.innerHTML = html;
-      var items = listEl.querySelectorAll('.global-search-item');
-      for (var j = 0; j < items.length; j++) {
-        (function (el) {
-          el.addEventListener('click', function () {
-            var tid = el.getAttribute('data-tid');
-            var ttype = el.getAttribute('data-ttype');
-            var mid = el.getAttribute('data-mid');
-            close();
-            if (ttype === 'private' && state.users[tid]) {
-              selectContact(tid, 'private');
-            } else if (ttype === 'group' && state.groups[tid]) {
-              selectContact(tid, 'group');
-            }
-            setTimeout(function () { jumpToMessage(mid); }, 350);
-          });
-        })(items[j]);
-      }
-    });
-  }
+  window.__handleGlobalSearchResult = function (d) {
+    if (!d) return;
+    var arr = d.results || [];
+    countEl.textContent = arr.length + (state.lang === 'en' ? ' found' : ' 条');
+    if (!arr.length) {
+      listEl.innerHTML = '<div style="text-align:center;padding:30px;color:var(--text-muted);font-size:13px;">' +
+        (state.lang === 'en' ? 'No results' : '没有找到结果') + '</div>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < arr.length; i++) {
+      var r = arr[i];
+      var hlText = escapeHtml(r.preview);
+      try {
+        var re = new RegExp('(' + String(d.q).replace(/[\\^$.*+?()[\]{}|]/g, '\\$&') + ')', 'gi');
+        hlText = hlText.replace(re, '<mark>$1</mark>');
+      } catch (e) {}
+      html += '<div class="global-search-item" ' +
+        'data-tid="' + escapeHtml(r.targetId) + '" ' +
+        'data-ttype="' + escapeHtml(r.type) + '" ' +
+        'data-mid="' + escapeHtml(r.msgId) + '">' +
+        '<div class="gsi-head">' +
+          '<span class="gsi-chat">' + escapeHtml(r.chatName) + '</span>' +
+          '<span>·</span>' +
+          '<span>' + escapeHtml(r.fromName || '') + '</span>' +
+          '<span>·</span>' +
+          '<span>' + escapeHtml(r.time || '') + '</span>' +
+        '</div>' +
+        '<div class="gsi-text">' + hlText + '</div>' +
+        '</div>';
+    }
+    listEl.innerHTML = html;
+    var items = listEl.querySelectorAll('.global-search-item');
+    for (var j = 0; j < items.length; j++) {
+      (function (el) {
+        el.addEventListener('click', function () {
+          var tid = el.getAttribute('data-tid');
+          var ttype = el.getAttribute('data-ttype');
+          var mid = el.getAttribute('data-mid');
+          close();
+          if (ttype === 'private' && state.users[tid]) {
+            selectContact(tid, 'private');
+          } else if (ttype === 'group' && state.groups[tid]) {
+            selectContact(tid, 'group');
+          }
+          setTimeout(function () { jumpToMessage(mid); }, 350);
+        });
+      })(items[j]);
+    }
+  };
 
   window.__openGlobalSearch = open;
+
+  var _gbtn = document.getElementById('globalSearchBtn');
+  if (_gbtn) {
+    _gbtn.addEventListener('click', function () {
+      if (panel.classList.contains('open')) close();
+      else open();
+    });
+  }
 })();
 
 (function initExportImage() {
@@ -55137,18 +60765,7 @@ function _showExportPreview(msgs, chatName) {
             (state.maxFileSize / 1048576).toFixed(0) + t('qqFileTooLargeSuffix'));
           return;
         }
-        var rd = new FileReader();
-        rd.onload = function (ev) {
-          var dataUrl = ev.target.result;
-          if (f.type && f.type.indexOf('image/') === 0) {
-            compressImage(dataUrl, 1280, 0.75).then(function (c) {
-              sendFileMessage(f.name, Math.round(c.length * 0.75), 'image/jpeg', c);
-            });
-          } else {
-            sendFileMessage(f.name, f.size, f.type || 'application/octet-stream', dataUrl);
-          }
-        };
-        rd.readAsDataURL(f);
+        sendFileObject(f);
       })(files[i]);
     }
   });
@@ -55156,13 +60773,22 @@ function _showExportPreview(msgs, chatName) {
 
 function fmtMoney(cents) {
   var n = Number(cents);
-  if (isNaN(n)) n = 0;
+  if (isNaN(n) || n > 1e16) n = 1e16; // 限制上限，防溢出
   n = Math.round(n);
   var negative = n < 0;
   n = Math.abs(n);
+  
   var intPart = Math.floor(n / 100);
   var decPart = n % 100;
-  var intStr = String(intPart).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  
+  // 处理超大数转为普通字符串
+  var intStr = "";
+  if (intPart > 1e15) {
+    intStr = "9,999,999,999,999,999";
+  } else {
+    intStr = String(intPart).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+  
   var decStr = decPart < 10 ? ('0' + decPart) : String(decPart);
   return (negative ? '-' : '') + intStr + '.' + decStr;
 }
@@ -57543,6 +63169,47 @@ function exportCurrentChat(format) {
     msgs = state.groups[id].messages || [];
   }
   if (!msgs.length) { showToast(t('toastChatEmpty')); return; }
+
+  /* HTML 导出 */
+  if (format === 'html') {
+    var _stamp0 = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    var _rows = '';
+    for (var _hi = 0; _hi < msgs.length; _hi++) {
+      var _hm = msgs[_hi];
+      if (!_hm) continue;
+      var _hTs = parseMsgTime(_hm);
+      var _hTime = formatFullTime(_hTs);
+      var _hSelf = (_hm.from === state.myId);
+      var _hWho = _hSelf ? state.myName
+        : (state.users[_hm.from] ? state.users[_hm.from].name
+          : (_hm.fromName || _hm.from));
+      var _hBody = _hm.recalled ? '[已撤回]' : msgPreviewText(_hm, 99999);
+      _rows += '<div class="msg ' + (_hSelf ? 'self' : 'other') + '">' +
+        '<div class="bubble"><div class="meta">' +
+        escapeHtml(_hWho) + ' · ' + escapeHtml(_hTime) +
+        '</div><div class="body">' + escapeHtml(_hBody) + '</div></div></div>';
+    }
+    var _htmlExport = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">' +
+      '<title>' + escapeHtml(name) + ' · 聊天记录</title>' +
+      '<style>body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;' +
+      'background:#ededed;padding:20px;max-width:720px;margin:0 auto;}' +
+      'h1{font-size:18px;color:#07c160;margin-bottom:16px;}' +
+      '.msg{margin-bottom:10px;display:flex;}' +
+      '.msg.self{justify-content:flex-end;}' +
+      '.bubble{max-width:78%;padding:8px 12px;border-radius:12px;' +
+      'background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.06);}' +
+      '.msg.self .bubble{background:#95ec69;}' +
+      '.meta{font-size:11px;color:#999;margin-bottom:3px;}' +
+      '.body{font-size:14px;line-height:1.5;white-space:pre-wrap;word-break:break-word;}' +
+      '</style></head><body><h1>' + escapeHtml(name) + ' · 聊天记录</h1>' +
+      '<div style="font-size:12px;color:#999;margin-bottom:20px;">导出时间：' +
+      escapeHtml(new Date().toLocaleString('zh-CN')) + ' · 共 ' + msgs.length + ' 条</div>' +
+      _rows + '</body></html>';
+    var _blobH = new Blob([_htmlExport], { type: 'text/html;charset=utf-8' });
+    downloadBlob(_blobH, name + '_' + _stamp0 + '.html');
+    showToast(t('toastExported'));
+    return;
+  }
   var stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   if (format === 'json') {
     var dump = {
@@ -57575,8 +63242,10 @@ function exportCurrentChat(format) {
 (function bindExport() {
   var b1 = $id('exportTxtBtn');
   var b2 = $id('exportJsonBtn');
+  var b3 = $id('exportHtmlBtn');
   if (b1) b1.addEventListener('click', function () { exportCurrentChat('txt'); });
   if (b2) b2.addEventListener('click', function () { exportCurrentChat('json'); });
+  if (b3) b3.addEventListener('click', function () { exportCurrentChat('html'); });
 })();
 
 var CMD_P = {
@@ -58716,26 +64385,26 @@ document.addEventListener('paste', function (e) {
           (state.maxFileSize / 1048576).toFixed(0) + t('qqFileTooLargeSuffix'));
         return;
       }
-      var rd = new FileReader();
-      rd.onload = function (ev) {
-        compressImage(ev.target.result, 1280, 0.75).then(function (c) {
-          sendFileMessage('pasted_' + Date.now() + '.png',
-            Math.round(c.length * 0.75), 'image/jpeg', c);
-        });
-      };
-      rd.readAsDataURL(blob);
+      var _pastedName = 'pasted_' + Date.now() + '.png';
+      var _pastedFile;
+      try {
+        _pastedFile = new File([blob], _pastedName,
+          { type: blob.type || 'image/png' });
+      } catch (eMk) {
+        /* 极老浏览器无 File 构造函数 → 回退 FileReader */
+        _pastedFile = blob;
+        _pastedFile.name = _pastedName;
+      }
+      sendFileObject(_pastedFile);
       e.preventDefault();
       break;
     }
   }
 });
 
-var CALL_ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun.services.mozilla.com' },
-  { urls: 'stun:stun.cloudflare.com:3478' }
-];
+/* ★ DSH 通话修复：默认不再硬编码公网 STUN（局域网无外网时会导致 ICE 卡死）。
+   ICE 配置统一由 login-success 下发的 state.callConfig.iceServers 提供。 */
+var CALL_ICE_SERVERS = [];   /* 由 login-success 的 callConfig 下发 */
 var CALL_TIMEOUT_MS = 35000;
 var CALL_SILENT_MUTE_MS = 800;
 var CALL_QUALITY_INTERVAL = 2000;
@@ -58904,15 +64573,9 @@ function showCallAvatar(u, verified) {
 function startCall(callType) {
   if (!callCheckEnvironment()) return;
 
-  /* ★ v0.34.0：无外网 → PeerJS；有外网 → 原生 WebRTC + TURN */
-  if (state.callConfig && state.callConfig.usePeerJS) {
-    if (typeof window.startPeerJSCall === 'function') {
-      return window.startPeerJSCall(callType);
-    }
-    showToast('PeerJS 模块未加载');
-    return;
-  }
-
+  /* ★ DSH 通话修复 R2/R4：局域网内统一只走 Socket.IO 信令 + 原生 WebRTC。
+     同一网段的 host candidate 直连不需要 STUN/TURN，也不依赖 PeerJS；
+     原分支引用的 window.startPeerJSCall 从未定义，一进无外网模式必失败。 */
   _startWebRTCCall(callType);
 }
 
@@ -59148,40 +64811,10 @@ function acceptCall() {
   dom.callAcceptBtn.style.display = 'none';
   dom.callHangupBtn.style.display = 'flex';
 
-  // ★ 使用 PeerJS 接听
-  getUserMediaStream(c.type).then(function (stream) {
-    c.localStream = stream;
-    try { dom.callLocalVideo.srcObject = stream; } catch (e) {}
-    setupVolumeDetection(stream, true);
-
-    var call = c._peerjsCall;
-    if (call) {
-      call.answer(stream); // 发送本地流
-      call.on('stream', function (remoteStream) {
-        c.remoteStream = remoteStream;
-        try {
-          dom.callRemoteVideo.srcObject = remoteStream;
-          dom.callModal.classList.add('mode-video');
-        } catch (e) {}
-        if (!c.remoteAnalyser) setupVolumeDetection(remoteStream, false);
-        
-        c.status = 'active';
-        c.connectedAt = Date.now();
-        startCallTimer();
-        setupQualityMonitor(); // 质量监控在新版可能失效，可保留防报错
-      });
-    }
-    
-    if (state.socket && state.socket.connected) {
-      state.socket.emit('call-accept', { to: c.peerId });
-    }
-  }).catch(function (err) {
-    if (err && err.name === 'NotAllowedError') c._permDenied = true;
-    if (state.socket && state.socket.connected) {
-      state.socket.emit('call-reject', { to: c.peerId, reason: 'failed' });
-    }
-    callFinish(t('callFailed'), true, 'rejected');
-  });
+  /* ★ 通话根因修复：原实现【先】emit('call-accept')、【后】才 getUserMedia 建 PC。
+     主叫方收到 accept 后立刻发 offer，而此时被叫方 PC 还没建好，
+     offer 只能被缓存 → 双方互相等待 → 35 秒超时「呼叫失败」。
+     改为：先拿到本地流并建好 PC，最后再通知对端。 */
   dom.callStatus.textContent = t('callConnecting');
   dom.callRejectBtn.style.display = 'none';
   dom.callAcceptBtn.style.display = 'none';
@@ -59202,8 +64835,19 @@ function acceptCall() {
       console.error('[Call] acceptCall 建 PC 失败:', e);
     }
 
+    /* PC 与本地流都就绪后再通知主叫方，避免 offer 早于 PC 到达 */
     if (state.socket && state.socket.connected) {
       state.socket.emit('call-accept', { to: c.peerId });
+    }
+    /* 若 offer 在主叫方抢先到达时被缓存，这里立刻消化它 */
+    if (c._pendingOffer && c.pc) {
+      var _pd = c._pendingOffer;
+      c._pendingOffer = null;
+      try {
+        handleCallSignal({ from: c.peerId, signal: { type: 'offer', sdp: _pd } });
+      } catch (e) {
+        console.warn('[Call] 消化 pendingOffer 失败:', e && e.message);
+      }
     }
   }).catch(function (err) {
     if (err && err.name === 'NotAllowedError') c._permDenied = true;
@@ -59227,6 +64871,15 @@ function rejectCall(reason) {
 
 function saveCallRecord(kind, durationSec, result) {
   try {
+    /* ★ 本地通话统计（用于「通话记录」面板） */
+    try {
+      var _stats = state.callStats || (state.callStats = { total: 0, ended: 0, missed: 0, rejected: 0, totalSec: 0 });
+      _stats.total++;
+      if (result === 'ended') { _stats.ended++; _stats.totalSec += Math.max(0, Number(durationSec) || 0); }
+      else if (result === 'missed') _stats.missed++;
+      else if (result === 'rejected') _stats.rejected++;
+      try { localStorage.setItem('call_stats', JSON.stringify(_stats)); } catch (e) {}
+    } catch (e) {}
     var peerId = state.call.lastPeerId;
     if (!peerId) return;
 
@@ -59293,6 +64946,9 @@ function hangupCall() {
 }
 
 function callFinish(statusText, silent, result) {
+  console.log('[CALL-DIAG] callFinish 触发: result=' + result +
+    ' connectedAt=' + (state.call.connectedAt || 0) +
+    ' pcState=' + (state.call.pc ? state.call.pc.connectionState : 'no-pc'));
   var c = state.call;
   if (!c.active) { try { callResetUI(); } catch (e) {} return; }
 
@@ -59417,13 +65073,16 @@ function ensurePeerConnection() {
 
   var pc;
   try {
-    pc = new RTCPeerConnection({
-      iceServers: CALL_ICE_SERVERS,
+    /* ★ 通话修复：原配置 iceCandidatePoolSize:2 在「无 STUN/TURN」的局域网场景下
+       会预创建候选池，部分浏览器反而收集不到 host 候选，导致协商完成但 ICE 永不连通。
+       局域网直连只需默认配置；显式保留 bundlePolicy 兼容性。 */
+    var _pcCfg = {
+      iceServers: (Array.isArray(CALL_ICE_SERVERS) ? CALL_ICE_SERVERS : []),
       iceTransportPolicy: 'all',
-      bundlePolicy: 'max-bundle',
-      rtcpMuxPolicy: 'require',
-      iceCandidatePoolSize: 2
-    });
+      bundlePolicy: 'max-bundle'
+    };
+    pc = new RTCPeerConnection(_pcCfg);
+    console.log('[CALL-DIAG] 创建 PC, iceServers=' + _pcCfg.iceServers.length);
   } catch (e) {
     console.error('[Call] 创建 PC 失败:', e);
     callFinish(t('callFailed'), true, 'rejected');
@@ -59443,6 +65102,12 @@ function ensurePeerConnection() {
 
   pc.onicecandidate = function (e) {
     if (!c.active || state.call !== c) return;
+    /* ★ 诊断：局域网通话失败最常见于「一个候选都没收集到」 */
+    if (!e.candidate) {
+      console.log('[CALL-DIAG] ICE 收集结束, gatheringState=' + pc.iceGatheringState);
+    } else {
+      console.log('[CALL-DIAG] ICE 候选: ' + (e.candidate.candidate || '').slice(0, 90));
+    }
     if (e.candidate) {
       if (state.socket && state.socket.connected && c.peerId) {
         state.socket.emit('call-signal', {
@@ -59481,7 +65146,10 @@ function ensurePeerConnection() {
 
   pc.onconnectionstatechange = function () {
     var st = pc.connectionState;
-    console.log('[Call] connectionState:', st);
+    console.log('[CALL-DIAG] connectionState=' + st +
+      ' iceState=' + pc.iceConnectionState +
+      ' signaling=' + pc.signalingState +
+      ' 角色=' + (c._isCaller ? '主叫' : '被叫'));
 
     if (st === 'connected') {
       if (c.status !== 'active') {
@@ -59512,13 +65180,26 @@ function ensurePeerConnection() {
     } else if (st === 'closed') {
       if (c.active) callFinish(t('callEnded'), true, 'ended');
     } else if (st === 'disconnected') {
-      tryRestartIce('connection-disconnected');
-      setTimeout(function () {
-        if (state.call.active && state.call.pc &&
-            state.call.pc.connectionState === 'disconnected') {
-          callFinish(t('callEnded'), true, 'ended');
+      /* ★ 抖动恢复：disconnected 先观察 5 秒，期间若回到 connected 就不判失败 */
+      if (c._disconnectTimer) clearTimeout(c._disconnectTimer);
+      c._disconnectTimer = setTimeout(function () {
+        c._disconnectTimer = null;
+        if (!state.call.active || !state.call.pc) return;
+        var _cur = state.call.pc.connectionState;
+        if (_cur === 'disconnected' || _cur === 'failed') {
+          tryRestartIce('connection-disconnected');
+          setTimeout(function () {
+            if (state.call.active && state.call.pc &&
+                state.call.pc.connectionState !== 'connected') {
+              callFinish(t('callEnded'), true, 'ended');
+            }
+          }, 8000);
         }
       }, 5000);
+    } else if (st === 'connected') {
+      /* 恢复后清理断线计时器 */
+      if (c._disconnectTimer) { clearTimeout(c._disconnectTimer); c._disconnectTimer = null; }
+      c._iceRestartCount = 0;
     }
   };
 
@@ -59526,8 +65207,14 @@ function ensurePeerConnection() {
     console.log('[Call] iceConnectionState:', pc.iceConnectionState);
   };
 
+  /* ★ 通话根因修复：原实现这里【只打印日志】，从不发起 offer。
+     被叫方接听后只调用了 ensurePeerConnection()，依赖本回调产生 offer，
+     于是两端永远停在「连接中」，35 秒后超时 —— 这就是「呼叫失败」的根本原因。 */
   pc.onnegotiationneeded = function () {
     console.log('[Call] negotiationneeded');
+    try { makeCallOffer(false); } catch (e) {
+      console.warn('[Call] negotiationneeded 发起 offer 失败:', e && e.message);
+    }
   };
 
   flushPendingCandidates();
@@ -59571,9 +65258,12 @@ function makeCallOffer(isIceRestart) {
 
   pc.createOffer(opts).then(function (offer) {
     if (!c.active || state.call !== c) throw new Error('call-ended');
+    console.log('[CALL-DIAG] createOffer 成功, sdpType=' + offer.type +
+      ' 长度=' + (offer.sdp || '').length);
     return pc.setLocalDescription(offer);
   }).then(function () {
     if (!c.active || state.call !== c) return;
+    console.log('[CALL-DIAG] setLocalDescription 完成, 准备发 offer');
     if (state.socket && state.socket.connected && c.peerId) {
       state.socket.emit('call-signal', {
         to: c.peerId,
@@ -59592,8 +65282,12 @@ function makeCallOffer(isIceRestart) {
 
 function handleCallSignal(data) {
   var c = state.call;
-  if (!c.active || state.call !== c) return;
+  if (!c.active || state.call !== c) {
+    console.warn('[CALL-DIAG] 丢弃信令：通话未激活 active=' + c.active);
+    return;
+  }
   if (!data || !data.signal || !data.from) return;
+  console.log('[CALL-DIAG] 收到信令 type=' + data.signal.type + ' from=' + data.from + ' 角色=' + (c._isCaller ? '主叫' : '被叫'));
 
   if (c.peerId && data.from !== c.peerId) {
     console.warn('[Call] 丢弃非当前对端的信令：from=' + data.from +
@@ -59692,11 +65386,22 @@ function flushPendingCandidates() {
 function tryRestartIce(reason) {
   var c = state.call;
   if (!c.active || !c.pc) return;
-  if (c.status !== 'active') return;
   var now = Date.now();
   if (now - (c.lastIceRestartAt || 0) < CALL_ICE_RESTART_MIN_MS) return;
   c.lastIceRestartAt = now;
-  console.log('[Call] ICE restart:', reason);
+  c._iceRestartCount = (c._iceRestartCount || 0) + 1;
+  var maxTry = (state.callConfig && state.callConfig.reconnectAttempts) || 3;
+  console.log('[CALL-DIAG] ICE restart #' + c._iceRestartCount + ' (' + reason + ')');
+  if (c._iceRestartCount > maxTry) {
+    /* ★ 超过重试上限：明确告知用户，而不是无限重连 */
+    console.warn('[Call] ICE 重启超过 ' + maxTry + ' 次，判定通话不可恢复');
+    showToast('网络不稳定，通话已断开');
+    callFinish(t('callEnded'), true, 'ended');
+    return;
+  }
+  /* ★ 修复：原实现要求 status === 'active' 才重启，
+     但失败往往发生在 connecting 阶段，受限过严导致永远不重试。 */
+  if (c.status !== 'active' && c.status !== 'connecting') return;
   makeCallOffer(true);
 }
 
@@ -60015,6 +65720,37 @@ function setupQualityMonitor() {
   }, CALL_QUALITY_INTERVAL);
 }
 
+/* ★ 通话质量看板：汇总 RTT / 丢包 / 抖动，给出可读等级 */
+function renderCallQuality(stats) {
+  var c = state.call;
+  if (!c || !stats) return;
+  var el = dom.callQuality;
+  if (!el) return;
+  var rtt = Math.round(stats.rtt || 0);
+  var loss = +(stats.loss || 0).toFixed(2);
+  var jitter = Math.round(stats.jitter || 0);
+  var level = 'good';
+  if (rtt > 300 || loss > 8) level = 'bad';
+  else if (rtt > 180 || loss > 3) level = 'poor';
+  else if (rtt > 100 || loss > 1) level = 'fair';
+  el.classList.add('show');
+  el.classList.remove('good', 'fair', 'poor', 'bad');
+  el.classList.add(level);
+  var label = { good: '良好', fair: '一般', poor: '较差', bad: '很差' }[level] || '';
+  var txt = label + ' ' + rtt + 'ms' + (loss ? ' · 丢包 ' + loss + '%' : '');
+  c.lastQuality = { rtt: rtt, loss: loss, jitter: jitter, level: level };
+  var txtEl = document.getElementById('callQualityText');
+  if (txtEl) txtEl.textContent = txt;
+  /* 同步给服务端（用于通话记录与统计） */
+  if (state.socket && state.socket.connected && state.call.peerId && c.active) {
+    try {
+      state.socket.emit('dsh-call-quality', {
+        callId: c.callId || c.peerId, rtt: rtt, loss: loss, jitter: jitter
+      });
+    } catch (e) {}
+  }
+}
+
 function teardownQualityMonitor() {
   var c = state.call;
   if (c.qualityTimer) { clearInterval(c.qualityTimer); c.qualityTimer = null; }
@@ -60131,6 +65867,25 @@ function gcSnapshotMembers() {
     isSelf: true
   });
   return list;
+}
+
+/* ★ 群呼状态栏：显示参与人数 / 连接状态 / 屏幕共享 */
+function gcUpdateStatus() {
+  var g = state.gcall;
+  if (!g || !g.active) return;
+  var total = gcSnapshotMembers().length;
+  var connected = 0;
+  for (var pid in g.peers) {
+    if (!g.peers.hasOwnProperty(pid)) continue;
+    var r = g.peers[pid];
+    if (r && r.pc && r.pc.connectionState === 'connected') connected++;
+  }
+  var txt;
+  if (g.screenSharing) txt = '正在共享屏幕 · ' + total + ' 人';
+  else if (connected === 0 && total > 1) txt = t('gcConnecting');
+  else if (total <= 1) txt = t('gcWaiting');
+  else txt = '通话中 · ' + total + ' 人（已连接 ' + connected + '）';
+  if (dom.gcStatus) dom.gcStatus.textContent = txt;
 }
 
 function gcRenderGrid() {
@@ -60339,17 +66094,21 @@ function gcBecomeParticipant(snapshot, isHost) {
 
   function _buildMesh() {
     gcRenderGrid();
-    if (snapshot.participants && snapshot.participants.length) {
-      for (var i = 0; i < snapshot.participants.length; i++) {
-        var m = snapshot.participants[i];
-        if (m.id === state.myId) continue;
-        gcCreatePeer(m.id, m.name, m.avatar, m.verified, true);
-      }
+    /* ★ 通话修复：统一建连策略 —— 只有「后加入者」主动向已有成员发起 offer，
+       已有成员被动应答。原先双方都可能主动，产生 glare 导致协商失败。
+       发起者快照里只有自己时不会建任何 peer，这是正常的，等他人加入即可。 */
+    var list = snapshot.participants || [];
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i];
+      if (!m || m.id === state.myId) continue;
+      gcCreatePeer(m.id, m.name, m.avatar, m.verified, true);
     }
     gcStartTimer();
     if (gcSnapshotMembers().length <= 1) {
       dom.gcStatus.textContent = t('gcWaiting');
     }
+    console.log('[GC-DIAG] 建网完成，已有 peer 数=' + Object.keys(g.peers || {}).length +
+      ' 参与者快照=' + list.length);
   }
 
   if (g.localStream) {
@@ -60357,20 +66116,42 @@ function gcBecomeParticipant(snapshot, isHost) {
     return;
   }
 
-  navigator.mediaDevices.getUserMedia({
+  /* ★ 视频通话：按 type 请求摄像头，音频参数保持降噪 */
+  var _gcVideo = (g.type === 'video');
+  var _gcConstraints = {
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    video: false
-  }).then(function (stream) {
+    video: _gcVideo ? { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24 } } : false
+  };
+  navigator.mediaDevices.getUserMedia(_gcConstraints).then(function (stream) {
     if (!g.active) {
       try { stream.getTracks().forEach(function (tk) { tk.stop(); }); } catch (e) {}
       return;
     }
     g.localStream = stream;
+    g.videoEnabled = _gcVideo;
+    console.log('[GC-DIAG] 本地流就绪 视频=' + _gcVideo +
+      ' tracks=' + stream.getTracks().length);
     _buildMesh();
+    /* ★ 修复：流就绪后，把之前因「无本地流」而缓存的 offer 全部补处理 */
+    gcFlushPendingOffers();
   }).catch(function () {
     showToast(t('callMicDenied'));
     gcLeave(true);
   });
+}
+
+/* ★ 新增：消费缓存的 offer（本地流就绪后调用） */
+function gcFlushPendingOffers() {
+  var g = state.gcall;
+  if (!g || !g.active || !g._pendingOffers) return;
+  var keys = Object.keys(g._pendingOffers);
+  if (!keys.length) return;
+  console.log('[GC-DIAG] 补处理 ' + keys.length + ' 个缓存 offer');
+  for (var i = 0; i < keys.length; i++) {
+    var data = g._pendingOffers[keys[i]];
+    delete g._pendingOffers[keys[i]];
+    if (data) { try { gcHandleSignal(data); } catch (e) {} }
+  }
 }
 
 function gcJoinIncoming() {
@@ -60418,14 +66199,27 @@ function gcHandleJoined(data) {
       return;
     }
     g.localStream = stream;
+    /* ★ 修复：旧实现让新加入者也主动向所有已有成员建连，
+       与「已有成员向新成员建连」形成双向 offer → glare。
+       统一为：新加入者被动，由已有成员发起 offer。
+       这里只登记已有成员，不发 offer。 */
     var list = data.members || [];
     for (var i = 0; i < list.length; i++) {
       var m = list[i];
-      if (m.id === state.myId) continue;
-      gcCreatePeer(m.id, m.name, m.avatar, m.verified, true);
+      if (!m || m.id === state.myId) continue;
+      if (!g.peers[m.id]) {
+        g.peers[m.id] = {
+          pc: null, stream: null, name: m.name,
+          avatar: m.avatar || '', verified: m.verified || '',
+          audioEl: null, videoEl: null, muted: false, pending: true,
+          pendingCandidates: []
+        };
+      }
     }
+    console.log('[GC-DIAG] 已加入，已有成员 ' + list.length + ' 人，本端为被动方');
     gcRenderGrid();
     gcStartTimer();
+    gcFlushPendingOffers();
     if (gcSnapshotMembers().length <= 1) dom.gcStatus.textContent = t('gcWaiting');
   }).catch(function () {
     showToast(t('callMicDenied'));
@@ -60439,7 +66233,15 @@ function gcCreatePeer(peerId, name, avatar, verified, isInitiator) {
   if (g.peers[peerId]) return g.peers[peerId];
   if (!g.localStream) return null;
 
-  var pc = new RTCPeerConnection({ iceServers: CALL_ICE_SERVERS });
+  /* ★ 修复：CALL_ICE_SERVERS 可能为 undefined（login-success 未下发时），
+     直接传入会让构造抛错，整个群呼静默失败。 */
+  var pc = new RTCPeerConnection({
+    iceServers: Array.isArray(CALL_ICE_SERVERS) ? CALL_ICE_SERVERS : [],
+    iceTransportPolicy: 'all',
+    bundlePolicy: 'max-bundle'
+  });
+  console.log('[GC-DIAG] 创建 peer ' + peerId + ' initiator=' + !!isInitiator +
+    ' iceServers=' + (Array.isArray(CALL_ICE_SERVERS) ? CALL_ICE_SERVERS.length : 0));
   var rec = {
     pc: pc, stream: null, name: name || peerId,
     avatar: avatar || '', verified: verified || '',
@@ -60476,13 +66278,53 @@ function gcCreatePeer(peerId, name, avatar, verified, isInitiator) {
   };
 
   pc.onconnectionstatechange = function () {
-    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-      gcRemovePeer(peerId);
+    var _cs = pc.connectionState;
+    console.log('[GC-DIAG] peer=' + peerId + ' connectionState=' + _cs +
+      ' iceState=' + pc.iceConnectionState);
+    /* ★ 关键修复：原实现「disconnected 之外」虽然没直接删，但 failed 立即删除；
+       而 WebRTC 在刚建连时经常短暂进入 disconnected（ICE 抖动），
+       部分浏览器直接报 failed。改为：失败先等 8 秒观察期，期间可能自愈。 */
+    if (_cs === 'failed') {
+      if (rec._failTimer) return;
+      /* ★ 先尝试 ICE 重启，再判定失败 */
+      rec._restartCount = (rec._restartCount || 0) + 1;
+      if (rec._restartCount <= 2 && rec.pc) {
+        console.log('[GC-DIAG] peer ' + peerId + ' ICE 重启 #' + rec._restartCount);
+        try {
+          rec.pc.createOffer({ iceRestart: true }).then(function (off) {
+            return rec.pc.setLocalDescription(off);
+          }).then(function () {
+            if (state.socket && state.socket.connected) {
+              state.socket.emit('group-call-signal', {
+                groupId: g.groupId, to: peerId,
+                signal: { type: 'offer', sdp: rec.pc.localDescription }
+              });
+            }
+          }).catch(function () {});
+        } catch (e) {}
+      }
+      rec._failTimer = setTimeout(function () {
+        rec._failTimer = null;
+        if (rec.pc && rec.pc.connectionState === 'failed') {
+          console.warn('[GC] peer ' + peerId + ' 连接失败，移除');
+          gcRemovePeer(peerId);
+        }
+      }, 8000);
+      return;
     }
+    if (rec._failTimer && _cs !== 'failed') {
+      clearTimeout(rec._failTimer);
+      rec._failTimer = null;
+    }
+    if (_cs === 'closed') gcRemovePeer(peerId);
+    try { gcUpdateStatus(); } catch (e) {}
   };
 
   if (isInitiator) {
-    pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false })
+    pc.createOffer({
+      offerToReceiveAudio: true,
+      offerToReceiveVideo: (g.type === 'video') || !!g.screenSharing
+    })
       .then(function (offer) { return pc.setLocalDescription(offer); })
       .then(function () {
         state.socket.emit('group-call-signal', {
@@ -60490,11 +66332,23 @@ function gcCreatePeer(peerId, name, avatar, verified, isInitiator) {
           to: peerId,
           signal: { type: 'offer', sdp: pc.localDescription }
         });
+        console.log('[GC-DIAG] 已发 offer 给 ' + peerId);
       })
-      .catch(function () { gcRemovePeer(peerId); });
+      .catch(function (e) { console.warn('[GC] createOffer 失败:', e && e.message); gcRemovePeer(peerId); });
   }
   gcRenderGrid();
   return rec;
+}
+
+/* ★ 新增：把缓存中的 ICE 候选在 remoteDescription 就绪后补投进去 */
+function gcFlushCandidates(rec) {
+  if (!rec || !rec.pc || !rec.pendingCandidates || !rec.pendingCandidates.length) return;
+  var list = rec.pendingCandidates.slice();
+  rec.pendingCandidates = [];
+  console.log('[GC-DIAG] 重放 ' + list.length + ' 个缓存 ICE 候选');
+  for (var i = 0; i < list.length; i++) {
+    try { rec.pc.addIceCandidate(new RTCIceCandidate(list[i])).catch(function () {}); } catch (e) {}
+  }
 }
 
 function gcRemovePeer(peerId) {
@@ -60517,8 +66371,18 @@ function gcHandleSignal(data) {
   if (sig.type === 'offer') {
     var rec = g.peers[fromId];
     if (!rec) rec = gcCreatePeer(fromId, data.fromName || fromId, '', '', false);
-    if (!rec) return;
+    if (!rec) {
+      /* ★ 本地流还没就绪（接听流程刚开始）：缓存 offer，等流就绪再处理 */
+      console.warn('[GC-DIAG] 收到 offer 但本地流未就绪，缓存 from=' + fromId);
+      g._pendingOffers = g._pendingOffers || {};
+      g._pendingOffers[fromId] = data;
+      return;
+    }
     rec.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp))
+      .then(function () {
+        /* ★ 修复：remoteDescription 就绪后重放之前缓存的 ICE 候选 */
+        return gcFlushCandidates(rec);
+      })
       .then(function () { return rec.pc.createAnswer(); })
       .then(function (answer) { return rec.pc.setLocalDescription(answer); })
       .then(function () {
@@ -60527,17 +66391,36 @@ function gcHandleSignal(data) {
           to: fromId,
           signal: { type: 'answer', sdp: rec.pc.localDescription }
         });
+        console.log('[GC-DIAG] 已回 answer 给 ' + fromId);
       })
-      .catch(function () { gcRemovePeer(fromId); });
+      .catch(function (err) {
+        console.warn('[GC] 处理 offer 失败:', err && err.message);
+        gcRemovePeer(fromId);
+      });
   } else if (sig.type === 'answer') {
     var rec2 = g.peers[fromId];
     if (rec2 && rec2.pc) {
-      rec2.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp)).catch(function () {});
+      rec2.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp))
+        .then(function () {
+          console.log('[GC-DIAG] 收到 answer from ' + fromId);
+          return gcFlushCandidates(rec2);
+        })
+        .catch(function (e) { console.warn('[GC] answer 失败:', e && e.message); });
     }
   } else if (sig.type === 'ice') {
     var rec3 = g.peers[fromId];
-    if (rec3 && rec3.pc) {
+    /* ★ 修复：原实现在 rec3/pc 还没就绪时【直接丢弃】ICE 候选，
+       导致 offer/answer 期间到达的候选全部丢失 → ICE 永远 collected 不了 → 连不上。 */
+    if (!rec3) {
+      rec3 = gcCreatePeer(fromId, data.fromName || fromId, '', '', false);
+    }
+    if (!rec3) return;
+    if (!rec3.pendingCandidates) rec3.pendingCandidates = [];
+    if (!rec3.pc) { rec3.pendingCandidates.push(sig.candidate); return; }
+    if (rec3.pc.remoteDescription && rec3.pc.remoteDescription.type) {
       try { rec3.pc.addIceCandidate(new RTCIceCandidate(sig.candidate)).catch(function () {}); } catch (e) {}
+    } else {
+      rec3.pendingCandidates.push(sig.candidate);
     }
   }
 }
@@ -60584,6 +66467,93 @@ function gcEndAll() {
   }
   gcLeave(true);
   showToast(t('callEnded'));
+}
+
+/* ★ 新增：群呼屏幕共享（替换摄像头/音频轨道为屏幕轨） */
+/* ★ 通话中发送文字消息（群呼与私聊通用） */
+function sendCallChat(text) {
+  text = String(text || '').trim();
+  if (!text) return false;
+  if (!state.socket || !state.socket.connected) return false;
+  var payload = { text: text };
+  if (state.gcall && state.gcall.active) {
+    payload.groupId = state.gcall.groupId;
+    payload.callId = state.gcall.groupId;
+  } else if (state.call && state.call.active) {
+    payload.callId = state.call.peerId;
+  } else return false;
+  state.socket.emit('dsh-call-chat', payload);
+  var box = document.getElementById('callChatLog') || document.getElementById('gcChatLog');
+  if (box) {
+    var row = document.createElement('div');
+    row.style.cssText = 'padding:3px 8px;font-size:12.5px;color:#fff;background:rgba(7,193,96,.55);border-radius:8px;margin-bottom:4px;text-align:right;';
+    row.textContent = text;
+    box.appendChild(row);
+    box.scrollTop = box.scrollHeight;
+  }
+  return true;
+}
+
+function gcToggleScreenShare() {
+  var g = state.gcall;
+  if (!g.active) return;
+  if (g.screenSharing) { gcStopScreenShare(); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    showToast('当前浏览器不支持屏幕共享');
+    return;
+  }
+  navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
+    .then(function (screenStream) {
+      var track = screenStream.getVideoTracks()[0];
+      if (!track) throw new Error('no video track');
+      g.screenSharing = true;
+      g.screenStream = screenStream;
+      /* 替换所有 peer 的视频轨 */
+      for (var pid in g.peers) {
+        if (!g.peers.hasOwnProperty(pid)) continue;
+        var rec = g.peers[pid];
+        if (!rec || !rec.pc) continue;
+        var sender = rec.pc.getSenders().find(function (s) { return s.track && s.track.kind === 'video'; });
+        try {
+          if (sender) sender.replaceTrack(track);
+          else rec.pc.addTrack(track, screenStream);
+        } catch (e) {}
+      }
+      /* 用户点「停止共享」时自动收尾 */
+      track.onended = function () { gcStopScreenShare(); };
+      if (state.socket && state.socket.connected) {
+        state.socket.emit('dsh-call-screen', { callId: g.groupId, on: true });
+      }
+      showToast('已开始屏幕共享');
+      try { gcRenderGrid(); } catch (e) {}
+      console.log('[GC-DIAG] 屏幕共享已开启');
+    })
+    .catch(function (e) {
+      console.warn('[GC] 屏幕共享启动失败:', e && e.name);
+      if (e && e.name !== 'NotAllowedError') showToast('屏幕共享启动失败');
+    });
+}
+function gcStopScreenShare() {
+  var g = state.gcall;
+  if (!g.active) return;
+  g.screenSharing = false;
+  try {
+    if (g.screenStream) g.screenStream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+  } catch (e) {}
+  g.screenStream = null;
+  /* 还原为无视频（群呼默认纯音频） */
+  for (var pid in g.peers) {
+    if (!g.peers.hasOwnProperty(pid)) continue;
+    var rec = g.peers[pid];
+    if (!rec || !rec.pc) continue;
+    var sender = rec.pc.getSenders().find(function (s) { return s.track && s.track.kind === 'video'; });
+    try { if (sender) sender.replaceTrack(null); } catch (e) {}
+  }
+  if (state.socket && state.socket.connected) {
+    state.socket.emit('dsh-call-screen', { callId: g.groupId, on: false });
+  }
+  showToast('已停止屏幕共享');
+  try { gcRenderGrid(); } catch (e) {}
 }
 
 function gcToggleMute() {
@@ -61874,6 +67844,9 @@ function renderGroupSidePanel() {
 
   var membersHtml =
     '<div class="gsp-members-wrap">' +
+      /* ★ 群文件柜区（放在成员列表上方） */
+      '<div class="gsp-section-title">' + escapeHtml(t('groupFiles')) + '</div>' +
+      '<div id="dshGroupFiles" style="padding:0 12px 8px;font-size:12px;"></div>' +
       '<div class="gsp-members-title">' +
         escapeHtml(t('gspMembers')) + ' (' + memberCount + ')' +
       '</div>' +
@@ -64467,6 +70440,37 @@ if (state.isLoggedIn) {
 }
 
 applyTimeBasedTheme();
+
+/* ★ 优化：强制垃圾回收与内存监控 (配合 --expose-gc 或浏览器原生机制) */
+setInterval(function () {
+    try {
+        if (performance && performance.memory) {
+            var heapLimit = performance.memory.jsHeapSizeLimit;
+            var heapUsed = performance.memory.usedJSHeapSize;
+            // 如果浏览器已用堆内存超过 80%，或者超过 500MB
+            if (heapUsed > heapLimit * 0.8 || heapUsed > 500 * 1024 * 1024) {
+                console.warn('⚠️ 客户端内存占用过高 (' + (heapUsed / 1024 / 1024).toFixed(0) + 'MB)，触发自愈清理...');
+                // 1. 清空所有非当前会话的记录缓存
+                var _curKey = currentChatKey();
+                for (var _k in state.messages) {
+                    if (state.messages.hasOwnProperty(_k) && ('private_' + _k) !== _curKey) {
+                        state.messages[_k] = [];
+                    }
+                }
+                for (var _g in state.groups) {
+                    if (state.groups.hasOwnProperty(_g) && ('group_' + _g) !== _curKey) {
+                        if (state.groups[_g].messages) state.groups[_g].messages = [];
+                    }
+                }
+                // 2. 释放各种全局缓存
+                state.voiceWaveCache = {};
+                state.redPacketCache = {};
+                if (typeof _translateCache !== 'undefined') _translateCache = {};
+                if (window.gc) window.gc();
+            }
+        }
+    } catch (e) {}
+}, 5 * 60 * 1000); // 每 5 分钟自检一次
 setInterval(function () {
   if (state.drafts && Object.keys(state.drafts).length > 0) {
     try { localStorage.setItem('chat_drafts', JSON.stringify(state.drafts)); } catch (e) {}
@@ -64485,6 +70489,15 @@ setInterval(function () {
         if (now - bucket[uid].ts > 30000) delete bucket[uid];
       }
       if (Object.keys(bucket).length === 0) delete state.typingUsers[ck];
+    }
+  } catch (e) { }
+
+  try {
+    var _burnKeys = Object.keys(state.burnReported || {});
+    if (_burnKeys.length > 500) {
+      for (var _bki = 0; _bki < _burnKeys.length - 500; _bki++) {
+        delete state.burnReported[_burnKeys[_bki]];
+      }
     }
   } catch (e) { }
 
@@ -64535,6 +70548,63 @@ if (typeof _updateToastBottom === 'function') {
   });
 }
 
+function _mobileApplyA11y() {
+  try {
+    if (typeof getIsPC === 'function' && getIsPC()) {
+      _mobileClearA11y();
+      return;
+    }
+    var body = document.body;
+    if (!body) return;
+
+    var discoverPage = document.getElementById('mobileDiscoverPage');
+    var mePage = document.getElementById('mobileMePage');
+    var mainEl = document.querySelector('.main');
+
+    var isChat = body.classList.contains('mobile-page-chat') ||
+                 body.classList.contains('mobile-chat-detail');
+    var isDiscover = body.classList.contains('mobile-page-discover');
+    var isMe = body.classList.contains('mobile-page-me');
+
+    function _setInert(el, inertOn) {
+      if (!el) return;
+      try {
+        if (inertOn) {
+          var ae = document.activeElement;
+          if (ae && el.contains(ae) && typeof ae.blur === 'function') {
+            try { ae.blur(); } catch (e) {}
+          }
+          if (!el.hasAttribute('inert')) el.setAttribute('inert', '');
+          el.setAttribute('aria-hidden', 'true');
+        } else {
+          el.removeAttribute('inert');
+          el.removeAttribute('aria-hidden');
+        }
+      } catch (e) {}
+    }
+
+    _setInert(mainEl, !isChat);
+    _setInert(discoverPage, !isDiscover);
+    _setInert(mePage, !isMe);
+  } catch (e) {}
+}
+
+function _mobileClearA11y() {
+  try {
+    var els = [
+      document.getElementById('mobileDiscoverPage'),
+      document.getElementById('mobileMePage'),
+      document.querySelector('.main')
+    ];
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (!el) continue;
+      el.removeAttribute('inert');
+      el.removeAttribute('aria-hidden');
+    }
+  } catch (e) {}
+}
+
 function mobileSetPage(page, opts) {
   opts = opts || {};
   var body = document.body;
@@ -64582,7 +70652,7 @@ function mobileSetPage(page, opts) {
       body.classList.add('mobile-page-chat');
       if (dom.sidebar) {
         dom.sidebar.classList.add('open');
-        /* ★ v0.32.0 加固：在极窄视口下（≤480px）也要确保 sidebar 显示 */
+        /* 加固：在极窄视口下（≤480px）也要确保 sidebar 显示 */
         try {
           dom.sidebar.style.transform = '';
         } catch (eSt) {}
@@ -64596,7 +70666,13 @@ function mobileSetPage(page, opts) {
 
   var tabs = document.querySelectorAll('.mobile-tab-item');
   for (var i = 0; i < tabs.length; i++) {
-    tabs[i].classList.toggle('active', tabs[i].dataset.tab === page);
+    var isActiveTab = (tabs[i].dataset.tab === page);
+    tabs[i].classList.toggle('active', isActiveTab);
+    tabs[i].setAttribute('aria-selected', isActiveTab ? 'true' : 'false');
+  }
+
+  if (typeof _mobileApplyA11y === 'function') {
+    try { _mobileApplyA11y(); } catch (e) {}
   }
 }
 
@@ -64609,7 +70685,13 @@ function mobileEnterChatDetail() {
   if (dom.sidebar) dom.sidebar.classList.remove('open');
   var tabs = document.querySelectorAll('.mobile-tab-item');
   for (var i = 0; i < tabs.length; i++) {
-    tabs[i].classList.toggle('active', tabs[i].dataset.tab === 'chat');
+    var isActiveTab = (tabs[i].dataset.tab === 'chat');
+    tabs[i].classList.toggle('active', isActiveTab);
+    tabs[i].setAttribute('aria-selected', isActiveTab ? 'true' : 'false');
+  }
+
+  if (typeof _mobileApplyA11y === 'function') {
+    try { _mobileApplyA11y(); } catch (e) {}
   }
 }
 
@@ -64625,6 +70707,9 @@ function mobileExitChatDetail() {
       applyReadonlyUI();
     }
   } catch (e) {}
+  if (typeof _mobileApplyA11y === 'function') {
+    try { _mobileApplyA11y(); } catch (e) {}
+  }
 }
 
 function updateMobileMePage() {
@@ -64941,7 +71026,7 @@ window.updateMobileMePage = updateMobileMePage;
   }
   window.__refreshMobileTabBadge = refreshTabBadge;
   refreshTabBadge();
-  setInterval(refreshTabBadge, 1500);
+  setInterval(refreshTabBadge, 3000);
 
   var _lastLoginState = state.isLoggedIn;
   setInterval(function () {
@@ -64952,7 +71037,7 @@ window.updateMobileMePage = updateMobileMePage;
         setTimeout(updateMobileMePage, 200);
       }
     }
-  }, 600);
+  }, 3000);
 })();
 
 renderPlaceholder();
@@ -65124,7 +71209,8 @@ renderPlaceholder();
   function autoGrow() {
     if (isExpanded()) return;
     textarea.style.height = 'auto';
-    var h = Math.min(Math.max(textarea.scrollHeight, 40), 120);
+    var _maxH = state.maxInputHeight || 120;
+    var h = Math.min(Math.max(textarea.scrollHeight, 40), _maxH);
     textarea.style.height = h + 'px';
   }
   textarea.addEventListener('input', autoGrow);
@@ -65316,17 +71402,37 @@ function updateChatAnnouncementDisplay(g) {
         }
       }
 
-      /* ★ v0.32.2：不再抹除客户端消息里的 fileData（图片/视频/语音等）
-         内存优化只做：清理空的会话键 */
       var _emptyKeys = [];
+      var _curKey = (state.currentType === 'private' ? 'private_' : 'group_') + state.currentTarget;
+      
       for (var _ck in state.messages) {
         if (!state.messages.hasOwnProperty(_ck)) continue;
         var _arr0 = state.messages[_ck];
-        if (Array.isArray(_arr0) && _arr0.length === 0 &&
-            !(_ck === state.currentTarget && state.currentType === 'private')) {
-          _emptyKeys.push(_ck);
+        
+        if (Array.isArray(_arr0)) {
+          // 清理空会话
+          if (_arr0.length === 0 && _ck !== _curKey) {
+            _emptyKeys.push(_ck);
+            continue;
+          }
+          
+          // ★ 释放非当前会话的大文件 base64 缓存（> 8KB）
+          // ★ 关键修复：只清理有 fileId 的消息（可从 /api/file/xxx 回源）；
+          //   无 fileId 的小文件（<1.3M 走 dataURL 路径）一旦清掉 fileData
+          //   就永久丢失，刷新/切回会话后显示"数据已丢失"
+          if (_ck !== _curKey) {
+            for (var _mi = 0; _mi < _arr0.length; _mi++) {
+              var _m = _arr0[_mi];
+              if (_m && _m.fileId && _m.fileData &&
+                  typeof _m.fileData === 'string' && _m.fileData.length > 8192) {
+                _m.fileData = null;
+                _m._needsFetch = true; // 标记下次进去时重新拉取
+              }
+            }
+          }
         }
       }
+      
       for (var _ei2 = 0; _ei2 < _emptyKeys.length; _ei2++) {
         delete state.messages[_emptyKeys[_ei2]];
       }
@@ -65637,10 +71743,25 @@ setInterval(function () {
       }
     }
 
-    /* 清理失效的群 */
+    /* 清理失效的群 + 释放历史图片 */
     for (var gk in state.groups) {
       if (!state.groups.hasOwnProperty(gk)) continue;
-      if (!state.groups[gk]) { delete state.groups[gk]; removed++; }
+      var _g = state.groups[gk];
+      if (!_g) { delete state.groups[gk]; removed++; continue; }
+      
+      // ★ 释放历史图片/视频/文件的 fileData（但只在有 fileId 时才释放）
+      // ★ 关键修复：无 fileId 的小文件必须保留 fileData，否则刷新后丢失
+      var _gCurKey = 'group_' + gk;
+      if (_gCurKey !== _curKey && Array.isArray(_g.messages)) {
+        for (var _gi = 0; _gi < _g.messages.length; _gi++) {
+          var _gm = _g.messages[_gi];
+          if (_gm && _gm.fileId && _gm.fileData &&
+              typeof _gm.fileData === 'string' && _gm.fileData.length > 8192) {
+            _gm.fileData = null;
+            _gm._needsFetch = true;
+          }
+        }
+      }
     }
 
     /* 清理失效的用户（自己除外） */
@@ -65668,7 +71789,7 @@ setInterval(function () {
   } catch (e) {}
 }, 5 * 60 * 1000);
 
-/* ★ v0.32.2：新增 8 个显示类设置的读取、绑定与应用 */
+/* 消息显示类设置读取、绑定与应用 */
 (function _initV0322DisplaySettings() {
   var _LS = {
     msgFontWeight: 'set_msgFontWeight',
@@ -65703,6 +71824,17 @@ setInterval(function () {
     state.copyWithSender = localStorage.getItem(_LS.copyWithSender) !== '0';
     state.contactTimeFormat = localStorage.getItem(_LS.contactTimeFormat) || 'smart';
     state.autoSaveDraft = localStorage.getItem(_LS.autoSaveDraft) !== '0';
+
+    var _sas = parseInt(localStorage.getItem('set_sidebarAvatarSize') || '0', 10);
+    if ([32, 36, 40, 48].indexOf(_sas) === -1) _sas = 0;
+    state.sidebarAvatarSize = _sas;
+    if (_sas > 0) {
+      root.style.setProperty('--sidebar-avatar-size', _sas + 'px');
+      document.body.classList.add('has-custom-sidebar-avatar');
+    } else {
+      root.style.removeProperty('--sidebar-avatar-size');
+      document.body.classList.remove('has-custom-sidebar-avatar');
+    }
   }
   _apply();
 
@@ -65784,13 +71916,29 @@ setInterval(function () {
         _apply();
       });
     }
+    el = document.getElementById('setSidebarAvatarSize');
+    if (el && !el._v0322) {
+      el._v0322 = true;
+      el.value = String(state.sidebarAvatarSize || '36');
+      el.addEventListener('change', function () {
+        var v = parseInt(el.value, 10);
+        if (isNaN(v) || [32, 36, 40, 48].indexOf(v) === -1) return;
+        localStorage.setItem('set_sidebarAvatarSize', String(v));
+        _apply();
+        try {
+          document.documentElement.style.setProperty('--sidebar-avatar-size', v + 'px');
+          document.body.classList.add('has-custom-sidebar-avatar');
+        } catch (e) {}
+        if (typeof renderContacts === 'function') renderContacts();
+      });
+    }
   }
   _bind();
   setTimeout(_bind, 600);
   setTimeout(_bind, 2000);
 })();
 
-/* ★ v0.32.4：Windows 风格警告对话框（支持自动关闭倒计时） */
+/* Windows 风格警告对话框（支持自动关闭倒计时） */
 function showWinAlert(opts) {
   opts = opts || {};
   return new Promise(function (resolve) {
@@ -65993,7 +72141,7 @@ function showWinAlert(opts) {
 }
 window.showWinAlert = showWinAlert;
 
-/* ★ v0.32.4：强制布局模式切换（立即应用 + 10 秒倒计时自动还原，Windows 风格） */
+/* 强制布局模式切换（立即应用 + 10s 倒计时还原） */
 (function _initForceLayoutMode() {
   function _bind() {
     var sel = document.getElementById('setForceLayoutMode');
@@ -66087,12 +72235,544 @@ window.showWinAlert = showWinAlert;
   setTimeout(_bind, 3000);
 })();
 
+(function initToolkit() {
+  // 强行退出
+  window.__closeForceToolkit = function() {
+    var el = document.getElementById('__forceToolkitOverlay');
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+  };
+
+  // 强行注入：完全重新生成独立的 DOM 树，不依赖页面原有内容
+  window.__openForceToolkit = function() {
+    window.__closeForceToolkit();
+
+    var el = document.createElement('div');
+    el.id = '__forceToolkitOverlay';
+    el.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:2147483647;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;';
+    
+    var html = '';
+    html += '<div style="background:var(--bg-modal, #fff);width:100%;max-width:680px;height:100%;max-height:600px;border-radius:16px;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,0.4);overflow:hidden;position:relative;">';
+    
+    // 顶栏
+    html += '<div style="display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border-modal, #eee);flex-shrink:0;">';
+    html += '<span style="font-size:18px;font-weight:bold;color:var(--text-primary, #333);">🧰 小工具</span>';
+    html += '<div style="flex:1;"></div>';
+    html += '<button id="__ftkX" style="background:none;border:none;font-size:20px;cursor:pointer;color:var(--text-muted, #999);">✕</button>';
+    html += '</div>';
+    
+    // Tab
+    html += '<div style="display:flex;gap:4px;padding:8px 12px;border-bottom:1px solid var(--border-modal, #eee);flex-shrink:0;">';
+    html += '<button class="__ftk-tab active" data-tab="calc" style="padding:6px 12px;border:none;border-radius:8px;background:var(--bg-surface-2, #f0f0f0);color:var(--text-primary, #333);cursor:pointer;font-weight:bold;">🔢 计算器</button>';
+    html += '<button class="__ftk-tab" data-tab="player" style="padding:6px 12px;border:none;border-radius:8px;background:transparent;color:var(--text-secondary, #666);cursor:pointer;">🎵 播放器</button>';
+    html += '<button class="__ftk-tab" data-tab="recorder" style="padding:6px 12px;border:none;border-radius:8px;background:transparent;color:var(--text-secondary, #666);cursor:pointer;">🎤 录音机</button>';
+    html += '<button class="__ftk-tab" data-tab="clock" style="padding:6px 12px;border:none;border-radius:8px;background:transparent;color:var(--text-secondary, #666);cursor:pointer;">⏰ 时钟</button>';
+    html += '</div>';
+    
+    // 内容区
+    html += '<div style="flex:1;overflow-y:auto;position:relative;">';
+    
+    // 1. 计算器面板
+    html += '<div class="__ftk-panel" data-panel="calc" style="display:flex;flex-direction:column;gap:10px;padding:16px;height:100%;box-sizing:border-box;">';
+    html += '<div id="__ftkCalcHist" style="height:40px;text-align:right;color:var(--text-muted, #999);font-size:13px;overflow:hidden;"></div>';
+    html += '<input id="__ftkCalcDisp" readonly style="width:100%;padding:12px;font-size:24px;text-align:right;border:1px solid var(--border-input, #ddd);border-radius:10px;background:var(--bg-input, #fff);color:var(--text-primary, #333);outline:none;box-sizing:border-box;">';
+    html += '<div id="__ftkCalcSci" style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;"></div>';
+    html += '<div id="__ftkCalcBasic" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;flex:1;"></div>';
+    html += '</div>';
+    
+    // 2. 播放器面板
+    html += '<div class="__ftk-panel" data-panel="player" style="display:none;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;height:100%;box-sizing:border-box;">';
+    html += '<div style="font-size:48px;">🎵</div>';
+    html += '<button id="__ftkPlayerPick" style="padding:10px 20px;border:none;border-radius:20px;background:var(--bg-btn-primary, #07c160);color:#fff;font-size:14px;cursor:pointer;">📂 选择本地音频</button>';
+    html += '<audio id="__ftkPlayerAudio" controls style="width:100%;max-width:400px;"></audio>';
+    html += '</div>';
+    
+    // 3. 录音机面板
+    html += '<div class="__ftk-panel" data-panel="recorder" style="display:none;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;height:100%;box-sizing:border-box;">';
+    html += '<div id="__ftkRecStatus" style="font-size:15px;color:var(--text-secondary, #666);">准备录音</div>';
+    html += '<div style="display:flex;gap:12px;">';
+    html += '<button id="__ftkRecStart" style="padding:10px 20px;border:none;border-radius:20px;background:var(--bg-btn-primary, #07c160);color:#fff;cursor:pointer;">⏺ 开始</button>';
+    html += '<button id="__ftkRecStop" disabled style="padding:10px 20px;border:none;border-radius:20px;background:var(--bg-btn-danger, #fa5151);color:#fff;cursor:pointer;opacity:0.5;">⏹ 停止</button>';
+    html += '</div>';
+    html += '<audio id="__ftkRecAudio" controls style="display:none;width:100%;max-width:400px;"></audio>';
+    html += '</div>';
+    
+    // 4. 高级日历时钟面板
+    html += '<div class="__ftk-panel" data-panel="clock" style="display:none;height:100%;box-sizing:border-box;padding:16px;overflow-y:auto;">';
+    html += '<div id="__ftkClockContainer" style="max-width:380px;margin:0 auto;"></div>';
+    html += '</div>';
+    
+    html += '</div>'; // 内容区结束
+    
+    // 底部强行退出按钮
+    html += '<div style="padding:12px 16px;border-top:1px solid var(--border-modal, #eee);flex-shrink:0;text-align:center;background:var(--bg-app, #fff);">';
+    html += '<button id="__ftkExit" style="width:100%;padding:12px;border:none;border-radius:12px;background:#fa5151;color:#fff;font-size:16px;font-weight:bold;cursor:pointer;box-shadow:0 4px 12px rgba(250,81,81,0.3);">🚪 强行退出小工具</button>';
+    html += '</div>';
+    
+    html += '</div>'; // 容器结束
+
+    el.innerHTML = html;
+    document.body.appendChild(el);
+    
+    // --- 绑定退出 ---
+    document.getElementById('__ftkX').onclick = window.__closeForceToolkit;
+    document.getElementById('__ftkExit').onclick = window.__closeForceToolkit;
+    
+    // --- Tab 切换 ---
+    var tabs = el.querySelectorAll('.__ftk-tab');
+    var panels = el.querySelectorAll('.__ftk-panel');
+    for (var i = 0; i < tabs.length; i++) {
+      (function(tab) {
+        tab.onclick = function() {
+          var t = tab.getAttribute('data-tab');
+          for (var j = 0; j < tabs.length; j++) {
+            tabs[j].classList.toggle('active', tabs[j] === tab);
+            tabs[j].style.background = (tabs[j] === tab) ? 'var(--bg-surface-2, #f0f0f0)' : 'transparent';
+            tabs[j].style.color = (tabs[j] === tab) ? 'var(--text-primary, #333)' : 'var(--text-secondary, #666)';
+            tabs[j].style.fontWeight = (tabs[j] === tab) ? 'bold' : 'normal';
+          }
+          for (var k = 0; k < panels.length; k++) {
+            var on = panels[k].getAttribute('data-panel') === t;
+            panels[k].style.display = on ? (t === 'calc' ? 'flex' : (t === 'clock' ? 'block' : 'flex')) : 'none';
+          }
+        };
+      })(tabs[i]);
+    }
+    
+    // ==========================================
+    // 1. 计算器（完美支持 1π、2(3) 等隐式乘号）
+    // ==========================================
+    var calcDisp = document.getElementById('__ftkCalcDisp');
+    var calcHist = document.getElementById('__ftkCalcHist');
+    var calcSci = document.getElementById('__ftkCalcSci');
+    var calcBasic = document.getElementById('__ftkCalcBasic');
+    var expr = '', ans = 0, useDeg = true, degBtn = null;
+    calcDisp.value = '0';
+    
+    function makeCalcBtn(txt, isSci) {
+      var b = document.createElement('button');
+      b.textContent = txt;
+      b.style.cssText = 'padding:' + (isSci ? '8px 0' : '12px 0') + ';border:none;border-radius:8px;font-size:' + (isSci ? '13px' : '18px') + ';font-family:inherit;cursor:pointer;background:var(--bg-surface-2, #f0f0f0);color:var(--text-primary, #333);';
+      if (txt === '=') { b.style.background = 'var(--bg-btn-primary, #07c160)'; b.style.color = '#fff'; }
+      if (txt === 'DEG' || txt === 'RAD') { b.style.color = 'var(--accent, #07c160)'; degBtn = b; }
+      b.onclick = function() {
+        var k = txt;
+        if (k === 'C') { expr = ''; calcDisp.value = '0'; return; }
+        if (k === '⌫') { expr = expr.slice(0, -1); calcDisp.value = expr || '0'; return; }
+        if (k === '±') { if(!expr)expr='-'; else if(expr.charAt(0)==='-')expr=expr.slice(1); else expr='-'+expr; calcDisp.value = expr||'0'; return; }
+        if (k === 'DEG') { useDeg = !useDeg; if(degBtn) degBtn.textContent = useDeg?'DEG':'RAD'; return; }
+        if (k === '=') {
+          var raw = String(expr || '').trim();
+          if (!raw) return;
+          try {
+            var implied = raw;
+            implied = implied.replace(/(\d)(?=[πe(√a-zA-Z])/g, '$1*');
+            implied = implied.replace(/(\))(?=[\dπe(√a-zA-Z])/g, '$1*');
+            implied = implied.replace(/(π|e)(?=[\dπe(√a-zA-Z])/g, '$1*');
+            
+            var safe = implied.replace(/×/g, '*').replace(/÷/g, '/').replace(/−/g, '-')
+              .replace(/π/g, 'Math.PI').replace(/√/g, 'sqrt').replace(/\bANS\b/g, '__ans')
+              .replace(/\^/g, '**').replace(/%/g, '/100')
+              .replace(/(\d+(?:\.\d+)?)!/g, 'fact($1)')
+              .replace(/(^|[^a-zA-Z0-9_])e([^a-zA-Z0-9_]|$)/g, '$1Math.E$2');
+              
+            if (!/^[0-9+\-*/().,\sA-Za-z_]+$/.test(safe)) throw 0;
+            
+            var fn = new Function('sin','cos','tan','asin','acos','atan','log','ln','sqrt','fact','__ans','"use strict";return (' + safe + ');');
+            var r = fn(
+              function(x){return Math.sin(useDeg?x*Math.PI/180:x)},
+              function(x){return Math.cos(useDeg?x*Math.PI/180:x)},
+              function(x){return Math.tan(useDeg?x*Math.PI/180:x)},
+              function(x){var v=Math.asin(x);return useDeg?v*180/Math.PI:v},
+              function(x){var v=Math.acos(x);return useDeg?v*180/Math.PI:v},
+              function(x){var v=Math.atan(x);return useDeg?v*180/Math.PI:v},
+              function(x){return Math.log10(x)}, function(x){return Math.log(x)},
+              function(x){return Math.sqrt(x)},
+              function(n){ n=Number(n); if(n<0||n>170||n%1!==0) throw 0; var r=1; for(var i=2;i<=n;i++) r*=i; return r; },
+              ans
+            );
+            if (typeof r !== 'number' || !isFinite(r)) throw 0;
+            
+            var out = Math.round(r * 1e12) / 1e12;
+            ans = out;
+            if (calcHist) {
+              var it = document.createElement('div');
+              it.textContent = raw + ' = ' + out;
+              it.style.cssText = 'cursor:pointer;padding:1px 4px;';
+              it.onclick = function() { expr = raw; calcDisp.value = expr; };
+              calcHist.insertBefore(it, calcHist.firstChild);
+              if (calcHist.children.length > 6) calcHist.removeChild(calcHist.lastChild);
+            }
+            expr = String(out);
+            calcDisp.value = expr;
+          } catch (e) { calcDisp.value = '错误'; expr = ''; }
+          return;
+        }
+        if (expr.length > 200) expr = expr.slice(-200);
+        expr += k;
+        calcDisp.value = expr;
+      };
+      return b;
+    }
+    
+    var sciKeys = [['sin(','cos(','tan(','log(','ln('],['√(','^','!','e','ANS'],['asin(','acos(','atan(','DEG','π']];
+    var basicKeys = [['C','⌫','(',')'],['7','8','9','÷'],['4','5','6','×'],['1','2','3','−'],['0','.','%','+'],['±','ANS','π','=']];
+    for(var i=0;i<sciKeys.length;i++) for(var j=0;j<sciKeys[i].length;j++) calcSci.appendChild(makeCalcBtn(sciKeys[i][j],true));
+    for(var i=0;i<basicKeys.length;i++) for(var j=0;j<basicKeys[i].length;j++) calcBasic.appendChild(makeCalcBtn(basicKeys[i][j],false));
+    
+    // ==========================================
+    // 2. 播放器
+    // ==========================================
+    document.getElementById('__ftkPlayerPick').onclick = function() {
+      var inp = document.createElement('input');
+      inp.type = 'file'; inp.accept = 'audio/*';
+      inp.onchange = function() {
+        var f = this.files[0]; if (!f) return;
+        var a = document.getElementById('__ftkPlayerAudio');
+        a.src = URL.createObjectURL(f);
+        a.play().catch(function(){});
+      };
+      inp.click();
+    };
+    
+    // ==========================================
+    // 3. 录音机
+    // ==========================================
+    var recStart = document.getElementById('__ftkRecStart');
+    var recStop = document.getElementById('__ftkRecStop');
+    var recAudio = document.getElementById('__ftkRecAudio');
+    var recStatus = document.getElementById('__ftkRecStatus');
+    var mediaRecorder = null, chunks = [], recStream = null;
+    
+    recStart.onclick = function() {
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+        recStream = stream;
+        try { mediaRecorder = new MediaRecorder(stream); } catch (e) { mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' }); }
+        chunks = [];
+        mediaRecorder.ondataavailable = function(e) { if (e.data && e.data.size > 0) chunks.push(e.data); };
+        mediaRecorder.onstop = function() {
+          var blob = new Blob(chunks, { type: 'audio/webm' });
+          recAudio.src = URL.createObjectURL(blob);
+          recAudio.style.display = 'block';
+          recStatus.textContent = '录音完成，可试听';
+          recStart.disabled = false; recStop.disabled = true; recStop.style.opacity = '0.5';
+          if (recStream) { recStream.getTracks().forEach(function(t){ t.stop(); }); recStream = null; }
+        };
+        mediaRecorder.start();
+        recStatus.textContent = '🎙️ 正在录音...';
+        recStart.disabled = true; recStop.disabled = false; recStop.style.opacity = '1'; recAudio.style.display = 'none';
+      }).catch(function() { recStatus.textContent = '❌ 无法访问麦克风'; });
+    };
+    
+    recStop.onclick = function() {
+      if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+    };
+    
+    // ==========================================
+    // 4. 高级日历 & 专注时钟（强行内置）
+    // ==========================================
+    var clockContainer = document.getElementById('__ftkClockContainer');
+    var cHtml = '';
+    cHtml += '<style>';
+    cHtml += '.tc-container { background: #222; border-radius: 16px; width: 100%; margin: 0 auto; color: #fff; font-family: -apple-system, sans-serif; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }';
+    cHtml += '.tc-header { padding: 24px 24px 16px; position: relative; border-bottom: 1px solid rgba(255,255,255,0.05); }';
+    cHtml += '.tc-time { font-size: 46px; font-weight: 600; letter-spacing: -1px; line-height: 1.1; font-variant-numeric: tabular-nums; margin-bottom: 6px; }';
+    cHtml += '.tc-date { font-size: 14px; color: #aaa; }';
+    cHtml += '.tc-toggle { position: absolute; right: 24px; top: 24px; width: 28px; height: 28px; border-radius: 8px; background: rgba(255,255,255,0.1); border: none; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 12px; }';
+    cHtml += '.tc-calendar { padding: 16px 24px 20px; display: block; }';
+    cHtml += '.tc-cal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }';
+    cHtml += '.tc-cal-title { font-size: 16px; font-weight: 600; color: #ddd; }';
+    cHtml += '.tc-cal-nav { display: flex; gap: 6px; }';
+    cHtml += '.tc-cal-nav button { background: none; border: none; color: #aaa; cursor: pointer; font-size: 12px; padding: 4px; }';
+    cHtml += '.tc-weekdays { display: grid; grid-template-columns: repeat(7, 1fr); text-align: center; font-size: 12px; color: #888; margin-bottom: 8px; }';
+    cHtml += '.tc-days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }';
+    cHtml += '.tc-day { height: 42px; display: flex; flex-direction: column; align-items: center; justify-content: center; border-radius: 10px; cursor: pointer; }';
+    cHtml += '.tc-day .d-solar { font-size: 16px; font-weight: 500; line-height: 1.2; color: #eee; }';
+    cHtml += '.tc-day .d-lunar { font-size: 10px; color: #777; line-height: 1.2; transform: scale(0.9); }';
+    cHtml += '.tc-day.today { background: #007aff; color: #fff; box-shadow: 0 4px 12px rgba(0,122,255,0.4); }';
+    cHtml += '.tc-day.today .d-solar { color: #fff; }';
+    cHtml += '.tc-day.today .d-lunar { color: rgba(255,255,255,0.8); }';
+    cHtml += '.tc-focus { background: #2a2a2a; padding: 16px 20px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid rgba(255,255,255,0.05); }';
+    cHtml += '.tc-focus-left { display: flex; align-items: center; gap: 12px; }';
+    cHtml += '.tc-focus-btn { width: 28px; height: 28px; border-radius: 6px; border: none; background: rgba(255,255,255,0.1); color: #eee; cursor: pointer; font-size: 16px; }';
+    cHtml += '.tc-focus-time { font-size: 15px; font-weight: 600; min-width: 80px; text-align: center; }';
+    cHtml += '.tc-focus-start { background: rgba(255,255,255,0.15); border: none; color: #fff; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }';
+    cHtml += '</style>';
+    
+    cHtml += '<div class="tc-container">';
+    cHtml += '  <div class="tc-header">';
+    cHtml += '    <div class="tc-time" id="tcTime">00:00:00</div>';
+    cHtml += '    <div class="tc-date" id="tcDate">1月1日</div>';
+    cHtml += '    <button class="tc-toggle" id="tcToggle">▲</button>';
+    cHtml += '  </div>';
+    cHtml += '  <div class="tc-calendar" id="tcCalendar" style="display:none;">';
+    cHtml += '    <div class="tc-cal-head">';
+    cHtml += '      <div class="tc-cal-title" id="tcCalTitle">2026年</div>';
+    cHtml += '      <div class="tc-cal-nav">';
+    cHtml += '        <button id="tcPrevBtn">◀</button>';
+    cHtml += '        <button id="tcNextBtn">▶</button>';
+    cHtml += '      </div>';
+    cHtml += '    </div>';
+    cHtml += '    <div class="tc-weekdays"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>';
+    cHtml += '    <div class="tc-days" id="tcDays"></div>';
+    cHtml += '  </div>';
+    cHtml += '  <div class="tc-focus">';
+    cHtml += '    <div class="tc-focus-left">';
+    cHtml += '      <button class="tc-focus-btn" id="tcFocusMinus">-</button>';
+    cHtml += '      <span class="tc-focus-time" id="tcFocusTime">30 分钟</span>';
+    cHtml += '      <button class="tc-focus-btn" id="tcFocusPlus">+</button>';
+    cHtml += '    </div>';
+    cHtml += '    <button class="tc-focus-start" id="tcFocusStart">▶ 开始</button>';
+    cHtml += '  </div>';
+    cHtml += '</div>';
+
+    clockContainer.innerHTML = cHtml;
+    
+    var tcTime = document.getElementById('tcTime');
+    var tcDate = document.getElementById('tcDate');
+    var tcToggle = document.getElementById('tcToggle');
+    var tcCal = document.getElementById('tcCalendar');
+    var tcTitle = document.getElementById('tcCalTitle');
+    var tcDays = document.getElementById('tcDays');
+    var tcFMinus = document.getElementById('tcFocusMinus');
+    var tcFPlus = document.getElementById('tcFocusPlus');
+    var tcFTime = document.getElementById('tcFocusTime');
+    var tcFStart = document.getElementById('tcFocusStart');
+    
+    var viewDate = new Date(), focusMins = 30, focusTimer = null, focusLeft = 0, isFocus = false;
+    
+    function pad(n) { return n < 10 ? '0'+n : n; }
+    
+    function renderCal() {
+      var y = viewDate.getFullYear(), m = viewDate.getMonth();
+      tcTitle.textContent = y + '年' + (m+1) + '月';
+      var firstDay = new Date(y, m, 1).getDay();
+      var startDay = firstDay === 0 ? 6 : firstDay - 1;
+      var daysInMonth = new Date(y, m+1, 0).getDate();
+      var html = '';
+      for (var i=0; i<startDay; i++) html += '<div class="tc-day"></div>';
+      var today = new Date();
+      for (var d=1; d<=daysInMonth; d++) {
+        var isToday = (today.getFullYear()===y && today.getMonth()===m && today.getDate()===d);
+        html += '<div class="tc-day ' + (isToday?'today':'') + '"><span class="d-solar">'+d+'</span><span class="d-lunar">'+(isToday?'今天':'')+'</span></div>';
+      }
+      tcDays.innerHTML = html;
+    }
+    
+    tcToggle.onclick = function() {
+      if (tcCal.style.display === 'none') { tcCal.style.display = 'block'; tcToggle.textContent = '▼'; }
+      else { tcCal.style.display = 'none'; tcToggle.textContent = '▲'; }
+    };
+    
+    document.getElementById('tcPrevBtn').onclick = function() { viewDate.setMonth(viewDate.getMonth()-1); renderCal(); };
+    document.getElementById('tcNextBtn').onclick = function() { viewDate.setMonth(viewDate.getMonth()+1); renderCal(); };
+    
+    function tick() {
+      if (isFocus) return;
+      var d = new Date();
+      tcTime.textContent = pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+      tcDate.textContent = (d.getMonth()+1) + '月' + d.getDate() + '日，星期' + ['日','一','二','三','四','五','六'][d.getDay()];
+    }
+    
+    tcFMinus.onclick = function() { if (isFocus) return; focusMins = Math.max(5, focusMins-5); tcFTime.textContent = focusMins + ' 分钟'; };
+    tcFPlus.onclick = function() { if (isFocus) return; focusMins = Math.min(120, focusMins+5); tcFTime.textContent = focusMins + ' 分钟'; };
+    
+    tcFStart.onclick = function() {
+      if (isFocus) {
+        isFocus = false;
+        clearInterval(focusTimer);
+        tcFStart.textContent = '▶ 开始';
+        tcTime.style.color = '#fff';
+        tick();
+        return;
+      }
+      isFocus = true;
+      focusLeft = focusMins * 60;
+      tcFStart.textContent = '⏸ 停止';
+      tcTime.style.color = '#007aff';
+      
+      function upF() {
+        if (focusLeft <= 0) {
+          clearInterval(focusTimer);
+          isFocus = false;
+          tcFStart.textContent = '▶ 开始';
+          tcTime.style.color = '#fff';
+          alert('🎉 专注完成！');
+          tick();
+          return;
+        }
+        tcTime.textContent = pad(Math.floor(focusLeft/60)) + ':' + pad(focusLeft%60);
+        tcDate.textContent = '🍅 保持专注...';
+        focusLeft--;
+      }
+      upF();
+      focusTimer = setInterval(upF, 1000);
+    };
+    
+    tick();
+    setInterval(tick, 1000);
+    renderCal();
+  };
+
+  // 捕获全局点击（强行注入拦截）
+  window.addEventListener('click', function(e) {
+    var t = e.target;
+    if (!t || !t.closest) return;
+    if (t.closest('#toolkitBtn, #mpToolkitBtn, [data-open-toolkit]')) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof window.__closeMoreMenus === 'function') window.__closeMoreMenus();
+      window.__openForceToolkit();
+    }
+  }, true);
+
+  // 捕获全局 Esc 退出
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && document.getElementById('__forceToolkitOverlay')) {
+      e.preventDefault();
+      window.__closeForceToolkit();
+    }
+  });
+})();
+
+/* ============================================================
+   极简原生桌面通知（无需 Service Worker）
+   ============================================================ */
+(function initNativeNotifyClient() {
+  var card     = document.getElementById('pushSubCard');
+  var btn      = document.getElementById('pushSubBtn');
+  var unsubBtn = document.getElementById('pushUnsubBtn');
+  var hint     = document.getElementById('pushSubHint');
+  if (!card || !btn) return;
+
+  var ua = navigator.userAgent || '';
+  var isIOS = /iPad|iPhone|iPod/.test(ua) && !window.MSStream;
+  var isInAppBrowser = /MicroMessenger|aweme|FBAN|FBAV|Instagram|Line\//i.test(ua);
+
+  function render() {
+    card.style.display = 'none';
+    btn.style.display = '';
+    btn.textContent = '🔔 开启通知';
+    unsubBtn.style.display = 'none';
+    hint.textContent = '开启后，页面挂在后台（最小化）时可收到新消息弹窗提醒。';
+
+    if (!state.isLoggedIn) return;
+
+    // 内置浏览器（微信/抖音）不支持
+    if (isInAppBrowser) {
+      card.style.display = '';
+      btn.style.display = 'none';
+      hint.textContent = '⚠️ 当前是内置浏览器，不支持系统通知，请用系统原生浏览器打开。';
+      return;
+    }
+
+    // iOS 必须安装 PWA 才能推送，否则只能前台提示
+    if (isIOS) {
+      card.style.display = '';
+      btn.style.display = 'none';
+      hint.textContent = '⚠️ iOS 系统限制：必须添加到主屏幕 (PWA) 才能开启通知。';
+      return;
+    }
+
+    // 检查浏览器是否支持
+    if (typeof Notification === 'undefined') {
+      return;
+    }
+
+    card.style.display = '';
+
+    // 如果已经授权，显示已开启
+    if (Notification.permission === 'granted') {
+      btn.style.display = 'none';
+      unsubBtn.style.display = '';
+      hint.textContent = '✅ 已开启系统通知。请保持页面最小化，彻底关闭浏览器将无法接收。';
+    }
+  }
+
+  btn.addEventListener('click', function () {
+    if (typeof Notification === 'undefined') return;
+    btn.disabled = true;
+    btn.textContent = '授权中…';
+    
+    Notification.requestPermission().then(function (permission) {
+      btn.disabled = false;
+      render();
+      if (permission === 'granted') {
+        showToast('🔔 通知已开启');
+        // 顺便把原代码里的设置开关打开
+        var _nChk = document.getElementById('setNotify');
+        if (_nChk && !_nChk.checked) {
+          _nChk.checked = true;
+          _nChk.dispatchEvent(new Event('change'));
+        }
+      } else {
+        showToast('❌ 权限被拒绝，请在浏览器地址栏左侧图标处恢复权限');
+      }
+    });
+  });
+
+  unsubBtn.addEventListener('click', function () {
+    showToast('如需关闭，请点击浏览器地址栏左侧的 🔒 图标，将「通知」设为「阻止」');
+  });
+
+  setInterval(function () {
+    var _last = state.isLoggedIn;
+    if (state.isLoggedIn !== _last) render();
+  }, 2000);
+  
+  setTimeout(render, 1200);
+  setTimeout(render, 3000);
+
+  var _settingsBtn = document.getElementById('settingsBtn');
+  if (_settingsBtn) {
+    _settingsBtn.addEventListener('click', function () { setTimeout(render, 300); });
+  }
+})();
+
 console.log('🚀 客户端已加载，等待登录');
+
 </script>
 </body>
 </html>`;
 
 var CHANGELOG_DATA = [
+  {
+    v: '0.33.0', d: '2026-11-14', t: '通话重做 · 群功能增强 · 安全加固 · 全设备适配',
+    s: {
+      Added: [
+        '群公告、群待办、@所有人',
+        '消息编辑、已读回执、多端同步',
+        '收藏标签、存储配额进度',
+        '群通话：多方接入、屏幕共享、连接质量显示',
+        '局域网自动发现，同网段设备互相可见',
+        '监控指标面板与健康自检页',
+        '日志查询、备份恢复、证书管理',
+        '夜间免打扰、消息预览、字体与气泡更多选项'
+      ],
+      Changed: [
+        '通话改为局域网直连，不再依赖外网服务',
+        '设置项分类整理，新增多项开关',
+        '更新日志改为简洁说明',
+        '电脑、手机、平板、电视、手表分别优化布局'
+      ],
+      Fixed: [
+        '修复群通话一直显示"连接中"后自动挂断',
+        '修复发起群通话后无法进入通话',
+        '修复消息引用导致消息丢失',
+        '修复断线后已读状态不更新',
+        '修复只读模式切换后界面不刷新',
+        '修复网页端部分页面打不开',
+        '修复小屏设备联系人栏显示异常'
+      ],
+      Security: [
+        '密码改为加盐强哈希存储',
+        '修复登录接口越权风险',
+        '加强上传文件类型校验',
+        '收紧管理接口访问权限',
+        '修复文件下载路径穿越风险',
+        '通话信令增加身份校验'
+      ]
+    }
+  },
   {
     v: '0.32.0', d: '2026-10-26', t: '智能通话 · 小屏修复 · 内存与安全加固',
     s: {
@@ -66846,7 +73526,7 @@ async function buildHtml() {
   return skeleton;
 }
 
-/* ★ v0.32.0 启动优化：原始 HTML 回退版本（仅做版本号替换，同步完成，10ms 内） */
+/* 启动优化：原始 HTML 回退版本（仅做版本号替换，同步完成，10ms 内） */
 var HTML_RAW_FALLBACK = (function () {
   try {
     var raw = String(html);
@@ -66871,14 +73551,12 @@ function precompressHtml(htmlStr) {
   try {
     var _devList = ['full', 'desktop', 'mobile', 'watch'];
     var _report = [];
+    
+    // 1. 构建标准版本
     for (var _di = 0; _di < _devList.length; _di++) {
       var _dev = _devList[_di];
       var _stat = _buildDeviceVersion(_dev, htmlStr);
-      if (_stat) {
-        var _brKB = (_stat.br / 1024).toFixed(1);
-        var _gzKB = (_stat.gz / 1024).toFixed(1);
-        _report.push(_dev + ': ' + _brKB + 'KB/br');
-      }
+
     }
     if (_report.length) {
       console.log('🎯 设备分流构建完成 · ' + _report.join(' · '));
@@ -67016,6 +73694,7 @@ function serveHtml(req, res) {
   /* ★ 优先使用已构建好的压缩版本 */
   if (HTML_BUILD_DONE && HTML_BY_DEVICE && HTML_BY_DEVICE.full && HTML_BY_DEVICE.full.raw) {
     var _dev = _detectDevice(req);
+    /* ★ 如果客户端强行要求极简模式（或者通过 URL 参数 ?lite=1 访问），下发极简版 */
     var _ver = HTML_BY_DEVICE[_dev];
     if (!_ver || !_ver.raw) _ver = HTML_BY_DEVICE.full;
     if (_ver && _ver.raw) {
@@ -67035,7 +73714,7 @@ function serveHtml(req, res) {
     return;
   }
 
-  /* ★ v0.32.0 启动优化：构建未完成时，直接返回原始未压缩 HTML（局域网毫秒级），
+  /* 启动优化：构建未完成时，直接返回原始未压缩 HTML（局域网毫秒级），
      后台继续构建压缩版；用户首屏 0 等待，压缩版构建好后续请求自然升级 */
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache');
@@ -67055,8 +73734,23 @@ var READONLY_HTTP_OK = {
   '/readonly-check': 1,
   '/favicon.ico': 1,
   '/jb': 1,
-  '/jb/api/list': 1
+  '/jb/api/list': 1,
+  /* ★ 新增：PWA 和 Web Push 必需接口（即使处于只读模式，也必须放行） */
+  '/manifest.json': 1,
+  '/sw.js': 1,
+  '/api/vapid-public-key': 1
 };
+function _readonlyHttpAllowed(req) {
+  var p = String(req.path || '');
+  if (p.indexOf('/socket.io') === 0) return true;
+  if (READONLY_HTTP_OK[p] === 1) return true;
+  
+  /* ★ 高优先级只读规则：所有 GET 请求的 api 获取类接口可以直接放行 */
+  /* 如果你有其它需要放行的只读 API，可以在此扩展 */
+  if (req.method === 'GET' && p === '/api/vapid-public-key') return true;
+  
+  return false;
+}
 function _readonlyHttpAllowed(req) {
   var p = String(req.path || '');
   if (p.indexOf('/socket.io') === 0) return true;
@@ -67132,7 +73826,7 @@ var PUBLIC_IP_GUARD_JS = [
   '      try { document.body.appendChild(ov); } catch (e) {}',
   '    }',
   '    function _check(){',
-  '      /* ★ v0.31.3：改用 /readonly-check —— 只读模式下 /api/* 全部 403，',
+  '      /* 改用 /readonly-check —— 只读模式下 /api/* 全部 403，',
   '         该非 api 路径能同时返回 IP 封禁状态与只读状态。 */',
   '      fetch("/readonly-check", {',
   '        method: "GET",',
@@ -67207,7 +73901,7 @@ var PUBLIC_UI_GUARD_JS = [
   '        actTxt.indexOf("属性:") === 0',
   '          ? ("检测到关键元素属性 " + actTxt.substring(3) + " 被修改。")',
   '          : "检测到关键界面元素被删除。";',
-  '      /* ★ v0.24.6：上报服务端（用于统计 + 封禁） */',
+  '      /* 上报服务端（用于统计 + 封禁） */',
   '      try {',
   '        fetch("/api/ui-guard-violation", {',
   '          method: "POST",',
@@ -67552,7 +74246,7 @@ var GW_LANG = {
   }
 };
 
-/* ★ 判断“浏览器→Cloudflare 边缘”这一段的真实协议（https / http） */
+/* 判断"浏览器→CF 边缘"的真实协议 */
 function _getForwardedProto(req) {
   try {
     var _h = (req && req.headers) || {};
@@ -67733,7 +74427,7 @@ function gwRenderLoginPage(errCode, returnTo) {
     '.hint{margin-top:18px;padding-top:16px;border-top:1px solid #f0f0f0;',
     '  font-size:12px;color:#999;line-height:1.65;text-align:center}',
 
-    '/* ★ v0.23.34：错误提示抖动动画 */',
+    '/* 错误提示抖动动画 */',
     '@keyframes shake{',
     '  0%,100%{transform:translateX(0)}',
     '  20%{transform:translateX(-7px)}',
@@ -67743,7 +74437,7 @@ function gwRenderLoginPage(errCode, returnTo) {
     '}',
     '.err.shake{animation:shake .42s cubic-bezier(.36,.07,.19,.97)}',
 
-    '/* ★ v0.23.34：密码可见切换 */',
+    '/* 密码可见切换 */',
     '.pwd-wrap{position:relative;}',
     '.pwd-wrap input{padding-right:44px;}',
     '.pwd-toggle{',
@@ -68650,7 +75344,7 @@ app.get('/log', function (req, res) {
     '  font-size:13.5px;font-weight:600;transition:filter .15s}',
     '.nav-cta:hover{filter:brightness(1.1)}',
 
-    '/* ★ v0.23.33：顶栏登录状态（深色主题） */',
+    '/* 顶栏登录状态（深色主题） */',
     '.nav-user{',
     '  font-size:13px;color:#8b949e;max-width:120px;',
     '  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
@@ -68671,7 +75365,7 @@ app.get('/log', function (req, res) {
     '}',
     '.nav-btn-logout:hover{border-color:#f85149;color:#f85149}',
 
-    '/* ★ v0.23.33：版本日志页自定义滚动条（深色主题） */',
+    '/* 版本日志页自定义滚动条（深色主题） */',
     '::-webkit-scrollbar{width:10px;height:10px;}',
     '::-webkit-scrollbar-track{background:transparent;}',
     '::-webkit-scrollbar-thumb{',
@@ -68778,7 +75472,7 @@ app.get('/log', function (req, res) {
     '',
     '.ver-empty{text-align:center;color:#8b949e;padding:80px 20px;font-size:14px}',
 
-    '/* ★ v0.23.34：内容切换淡入 */',
+    '/* 内容切换淡入 */',
     '@keyframes verFadeIn{',
     '  from{opacity:0;transform:translateY(10px)}',
     '  to{opacity:1;transform:none}',
@@ -68788,7 +75482,7 @@ app.get('/log', function (req, res) {
     '}',
     '.ver-section:nth-of-type(2){animation-delay:.06s}',
 
-    '/* ★ v0.23.34：回到顶部按钮 */',
+    '/* 回到顶部按钮 */',
     '.back-to-top{',
     '  position:fixed;right:28px;bottom:32px;z-index:90;',
     '  width:44px;height:44px;border-radius:50%;border:none;',
@@ -68801,7 +75495,7 @@ app.get('/log', function (req, res) {
     '.back-to-top.show{opacity:1;pointer-events:auto;transform:none}',
     '.back-to-top:hover{filter:brightness(1.1)}',
 
-    '/* ★ v0.23.34：移动端版本列表横向滚动（避免占据整屏高度） */',
+    '/* 移动端版本列表横向滚动（避免占据整屏高度） */',
     '/* ============ 移动端版本下拉框 ============ */',
     '.mobile-ver-select {',
     '  display: none;',
@@ -68858,7 +75552,7 @@ app.get('/log', function (req, res) {
     '}',
     '',
     '/* ============================================================',
-    '   ★ v0.24.32：版本日志页面动效增强',
+    '   版本日志页面动效增强',
     '   ============================================================ */',
     '/* 版本项滑入 */',
     '@keyframes logItemIn {',
@@ -69075,7 +75769,7 @@ app.get('/log', function (req, res) {
     '          selIdx = parseInt(btn.getAttribute("data-idx"), 10) || 0;',
     '          renderVerList();',
     '          renderContent();',
-    '          /* ★ v0.23.34：切换版本后平滑滚动到内容区顶部 */',
+    '          /* 切换版本后平滑滚动到内容区顶部 */',
     '          try {',
     '            var contentEl = document.getElementById("content");',
     '            if (contentEl){',
@@ -69257,7 +75951,7 @@ app.get('/log', function (req, res) {
     '  renderVerList();',
     '  renderContent();',
     '',
-    '  /* ★ v0.23.34：回顶按钮显隐 + 点击 */',
+    '  /* 回顶按钮显隐 + 点击 */',
     '  try {',
     '    var topBtn = document.getElementById("backToTop");',
     '    if (topBtn){',
@@ -70236,7 +76930,7 @@ app.get('/download', function (req, res) {
     '  display:block;margin-top:8px;font-size:13px;color:#bbb;',
     '}',
 
-    '/* ★ v0.23.34：文件名图标着色 */',
+    '/* 文件名图标着色 */',
     '.dl-name a{display:inline-flex;align-items:center;gap:8px;}',
     '.dl-name .ext{',
     '  display:inline-block;padding:1px 7px;border-radius:6px;',
@@ -70245,10 +76939,10 @@ app.get('/download', function (req, res) {
     '  flex-shrink:0;text-transform:uppercase;',
     '}',
 
-    '/* ★ v0.23.34：行悬停加强 */',
+    '/* 行悬停加强 */',
     'tr:hover td{background:#f0fdf6;transition:background .15s;}',
 
-    '/* ★ v0.23.34：相对时间小字 */',
+    '/* 相对时间小字 */',
     '.dl-time .rel{',
     '  display:block;font-size:11.5px;color:#aaa;margin-top:2px;',
     '}',
@@ -70261,7 +76955,7 @@ app.get('/download', function (req, res) {
     '  color:#999;font-size:13px}',
     '.footer a{color:#07c160}',
 
-    '/* ★ v0.23.33：下载中心自定义滚动条 */',
+    '/* 下载中心自定义滚动条 */',
     '::-webkit-scrollbar{width:10px;height:10px;}',
     '::-webkit-scrollbar-track{background:transparent;}',
     '::-webkit-scrollbar-thumb{',
@@ -70275,7 +76969,7 @@ app.get('/download', function (req, res) {
     '*{scrollbar-width:thin;scrollbar-color:rgba(7,193,96,.6) transparent;}',
     '',
     '/* ============================================================',
-    '   ★ v0.24.32：下载中心动效增强',
+    '   下载中心动效增强',
     '   ============================================================ */',
     '@keyframes dlRowIn {',
     '  from { opacity: 0; transform: translateY(10px); }',
@@ -70357,9 +77051,9 @@ app.get('/download', function (req, res) {
     '    <span style="font-size:13px;color:#666;margin-right:4px;">',
     '      👤 ' + esc(safeUserName()) + '</span>',
     '<a class="nav-btn ghost" href="/gw" data-lk="dl_back">返回官网</a>',
-    '<a class="nav-btn ghost" href="/music" style="color:#9c27b0;border-color:#e1bee7;">🎵 音乐库</a>,',
+    '<a class="nav-btn ghost" href="/music" style="color:#9c27b0;border-color:#e1bee7;">🎵 音乐库</a>',
     '<a class="nav-btn ghost" href="/download/logout" style="color:#c62828;border-color:#f5b5b5;">退出</a>',
-    '    <button type="button" class="theme-btn" id="themeToggle" title="切换主题">🌓</button>',
+    '',
     '    <div class="nav-lang">',
     '      <button class="nav-lang-btn" id="langBtn" type="button">',
     '        <span>🌐</span><span data-lk="lang_label">语言</span>',
@@ -70488,7 +77182,7 @@ app.get('/download', function (req, res) {
 function _handleDlRequest(req, res) {
   try {
     var raw = String(req.params.fileName || '');
-    /* ★ v0.32.0 安全修复：解码 + 拒绝 null 字节 + basename + 绝对路径检查 */
+    /* 安全修复：解码 + 拒绝 null 字节 + basename + 绝对路径检查 */
     try { raw = decodeURIComponent(raw); } catch (e) {}
     if (raw.indexOf('\x00') !== -1) {
       res.status(400).end('bad name'); return;
@@ -70562,6 +77256,107 @@ function _handleDlRequest(req, res) {
 
 app.get('/dl/:fileName', _handleDlRequest);
 
+/* =========================================================================
+   HTTP 下载专用端口（给 PCL / IDM / 迅雷 等 .NET / OpenSSL 下载器使用）
+   —— 自签名证书无法通过 .NET 的 SSL 验证，必须走 HTTP
+   —— 默认 = 主端口 + 1；可用环境变量 HTTP_DL_PORT 覆盖
+   —— 注意：本段代码位于文件前部，此时主端口常量 PORT 尚未定义，
+      直接引用 PORT 会得到 undefined → NaN → listen 抛 ERR_SOCKET_BAD_PORT。
+      所以这里必须自行解析主端口，并做防御性回退。
+   ========================================================================= */
+var HTTP_DL_PORT = 0;
+var httpDlServer = null;
+
+/* 解析主端口：优先已定义的 PORT（若合法），否则回退 process.env.PORT / 3000。
+   用 try/catch 兜底，避免 PORT 处于 let/const 的 TDZ 时抛 ReferenceError。 */
+var _MAIN_PORT = 3000;
+try {
+  if (typeof PORT === 'number' && PORT > 0 && PORT < 65536) {
+    _MAIN_PORT = PORT;
+  } else {
+    var _mp = parseInt(process.env.PORT || '3000', 10);
+    if (!isNaN(_mp) && _mp > 0 && _mp < 65536) _MAIN_PORT = _mp;
+  }
+} catch (e) {
+  var _mp2 = parseInt(process.env.PORT || '3000', 10);
+  if (!isNaN(_mp2) && _mp2 > 0 && _mp2 < 65536) _MAIN_PORT = _mp2;
+}
+
+if (_useHttps) {
+  var _rawDlPort = process.env.HTTP_DL_PORT;
+  var _dlEnv;
+  if (_rawDlPort == null || String(_rawDlPort).trim() === '') {
+    _dlEnv = _MAIN_PORT + 1;
+  } else {
+    _dlEnv = parseInt(String(_rawDlPort), 10);
+  }
+
+  if (isNaN(_dlEnv) || _dlEnv <= 0 || _dlEnv >= 65536) {
+    console.warn('⚠️ HTTP_DL_PORT="' + _rawDlPort +
+      '" 无效，已自动回退到 ' + (_MAIN_PORT + 1));
+    _dlEnv = _MAIN_PORT + 1;
+  }
+  if (_dlEnv >= 65536) {
+    console.warn('⚠️ HTTP 下载备用端口自动计算超出范围，已禁用');
+    _dlEnv = 0;
+  }
+  if (_dlEnv === _MAIN_PORT) {
+    console.warn('⚠️ HTTP_DL_PORT 不能与主端口相同（' + _dlEnv + '），已禁用');
+    _dlEnv = 0;
+  }
+
+  HTTP_DL_PORT = _dlEnv;
+
+  if (HTTP_DL_PORT > 0) {
+    (function startHttpDlServer() {
+      var dlApp = express();
+
+      /* 只放行 /dl/ 和 /dl-music/，其他一律 404，避免误暴露主应用 */
+      dlApp.use(function (req, res, next) {
+        var p = String(req.path || '');
+        if (p.indexOf('/dl/') === 0 || p.indexOf('/dl-music/') === 0) {
+          return next();
+        }
+        if (p === '/health') {
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          return res.end(JSON.stringify({
+            ok: true,
+            role: 'http-download-server',
+            port: HTTP_DL_PORT
+          }));
+        }
+        res.status(404).end('Not Found');
+      });
+
+      dlApp.get('/dl/:fileName', _handleDlRequest);
+      dlApp.get('/dl-music/:fileName', _handleMusicDlRequest);
+
+      dlApp.use(function (req, res) {
+        res.status(404).end('Not Found');
+      });
+
+      httpDlServer = http.createServer(dlApp);
+      httpDlServer.keepAliveTimeout = 5000;
+
+      httpDlServer.on('error', function (err) {
+        if (err && err.code === 'EADDRINUSE') {
+          console.error('❌ HTTP 下载端口 ' + HTTP_DL_PORT +
+            ' 已被占用，下载器将无法使用。请设置环境变量 HTTP_DL_PORT 指定其他端口。');
+        } else {
+          console.error('❌ HTTP 下载服务器错误:', err && err.message);
+        }
+      });
+
+      httpDlServer.listen(HTTP_DL_PORT, function () {
+        console.log('🌐 HTTP 下载端口已启动: http://' + localIp + ':' + HTTP_DL_PORT);
+      });
+    })();
+  }
+} else {
+  /* 主端口本身就是 HTTP，不需要独立下载端口 */
+  HTTP_DL_PORT = _MAIN_PORT;
+}
+
 app.post('/download/login', function (req, res) {
   var ip = _getRealIp(req);
 
@@ -70613,13 +77408,13 @@ app.post('/download/login', function (req, res) {
       redirectErr('nopwd');
       return;
     }
-    var _pwdToCheck = looksLikeSha256Hex(pwd)
-      ? pwd
-      : hashSecret(pwd);
-    if (!safeCompare(_pwdToCheck, userRec.passwordHash)) {
+    /* ★ 安全修复：改为带盐校验，并兼容已 SHA-256 的输入 */
+    var _vr = verifySecretAny(pwd, userRec.passwordHash);
+    if (!_vr.ok) {
       redirectErr('bad');
       return;
     }
+    try { maybeUpgradeSecret(userRec, 'passwordHash', _vr.used); } catch (e) {}
 
     delete gwLoginAttempts[ip];
     var token = gwCreateSession(userRec.id, userRec.name);
@@ -71059,7 +77854,7 @@ function kfRenderPage(sess, isAdmin, sessToken, submitOkId) {
     '  outline:none;cursor:pointer}',
     '.pri-select:focus,.cat-select:focus{border-color:#07c160}',
     '',
-    '/* ★ v0.23.33：反馈中心自定义滚动条 */',
+    '/* 反馈中心自定义滚动条 */',
     '::-webkit-scrollbar{width:10px;height:10px;}',
     '::-webkit-scrollbar-track{background:transparent;}',
     '::-webkit-scrollbar-thumb{',
@@ -71331,37 +78126,37 @@ function kfRenderPage(sess, isAdmin, sessToken, submitOkId) {
     '  /* ============================================================',
     '     渲染单张反馈卡',
     '     ============================================================ */',
-function renderCard(f){
-  var st = normalizeStatus(f.status);
-  var cat = normalizeCategory(f.category);
-  var si = (typeof STATUS !== 'undefined' && STATUS[st]) ? STATUS[st] : { zh: '待处理' };
-  var ci = (typeof CATEGORY !== 'undefined' && CATEGORY[cat]) ? CATEGORY[cat] : { zh: '❓ 提问' };
-  var priKey = f.priority || 'normal';
-  var votes = Array.isArray(f.voters) ? f.voters.length : (Number(f.votes) || 0);
-  var voted = Array.isArray(f.voters) &&
-    f.voters.indexOf(window.__KF_MY_ID__ || '') !== -1;
-
-  var delForm = '<form class="fb-del-form" method="POST" action="/kf/api/delete' +
-    KF_QS + '" onsubmit="return confirm(\'确定删除反馈 ' + esc(f.id) +
-    ' 吗？此操作不可撤销。\')"><input type="hidden" name="id" value="' + esc(f.id) +
-    '"><button type="submit" class="fb-del-btn" title="删除">🗑️</button></form>';
-
-  var titleText = String(f.content || '').replace(/\r?\n/g, ' ');
-
-  return '<div class="bt-row pri-' + esc(priKey) + '" data-id="' + esc(f.id) + '">' +
-    '<div class="bt-id">' + esc(f.id) +
-      '<button type="button" class="fb-copy-btn" data-copy-id="' + esc(f.id) +
-      '" title="复制编号">📋</button></div>' +
-    '<div class="bt-title" title="' + esc(titleText) + '">' + esc(f.content || '') + '</div>' +
-    '<div class="bt-type">' + esc(ci.zh) + '</div>' +
-    '<div class="bt-status ' + esc(st) + '">' + esc(si.zh) + '</div>' +
-    '<div class="bt-meta">' +
-      '<button type="button" class="bt-vote' + (voted ? ' voted' : '') +
-        '" data-vote-id="' + esc(f.id) + '" title="投票">' +
-        '▲ <span class="bt-vote-count">' + votes + '</span></button>' +
-      delForm + '</div></div>';
-}
-    ,
+    '  /* ★ 修复：下面这段原为裸 JS（服务端废函数），已恢复为客户端字符串数组项 */',
+    '  function renderCard(f){',
+    '    var st = normalizeStatus(f.status);',
+    '    var cat = normalizeCategory(f.category);',
+    '    var si = (typeof STATUS !== "undefined" && STATUS[st]) ? STATUS[st] : { zh: "待处理" };',
+    '    var ci = (typeof CATEGORY !== "undefined" && CATEGORY[cat]) ? CATEGORY[cat] : { zh: "❓ 提问" };',
+    '    var priKey = f.priority || "normal";',
+    '    var votes = Array.isArray(f.voters) ? f.voters.length : (Number(f.votes) || 0);',
+    '    var voted = Array.isArray(f.voters) &&',
+    '      f.voters.indexOf(window.__KF_MY_ID__ || "") !== -1;',
+    '',
+    '    var delForm = \'<form class="fb-del-form" method="POST" action="/kf/api/delete\' +',
+    '      KF_QS + \'" onsubmit="return confirm(\\\'确定删除反馈 \' + esc(f.id) +',
+    '      \' 吗？此操作不可撤销。\\\')"><input type="hidden" name="id" value="\' + esc(f.id) +',
+    '      \'"><button type="submit" class="fb-del-btn" title="删除">🗑️</button></form>\';',
+    '',
+    '    var titleText = String(f.content || "").replace(/\\r?\\n/g, " ");',
+    '',
+    '    return \'<div class="bt-row pri-\' + esc(priKey) + \'" data-id="\' + esc(f.id) + \'">\' +',
+    '      \'<div class="bt-id">\' + esc(f.id) +',
+    '        \'<button type="button" class="fb-copy-btn" data-copy-id="\' + esc(f.id) +',
+    '        \'" title="复制编号">📋</button></div>\' +',
+    '      \'<div class="bt-title" title="\' + esc(titleText) + \'">\' + esc(f.content || "") + \'</div>\' +',
+    '      \'<div class="bt-type">\' + esc(ci.zh) + \'</div>\' +',
+    '      \'<div class="bt-status \' + esc(st) + \'">\' + esc(si.zh) + \'</div>\' +',
+    '      \'<div class="bt-meta">\' +',
+    '        \'<button type="button" class="bt-vote\' + (voted ? \' voted\' : \'\') +',
+    '          \'" data-vote-id="\' + esc(f.id) + \'" title="投票">\' +',
+    '          \'▲ <span class="bt-vote-count">\' + votes + \'</span></button>\' +',
+    '        delForm + \'</div></div>\';',
+    '  }',
     '  function renderList(list){',
     '    var box = $("fbList");',
     '    if (!list || !list.length){',
@@ -71408,7 +78203,7 @@ function renderCard(f){
     '            updateStatus(id, st, note, saveBtn);',
     '          });',
     '        }',
-        '        /* ★ v0.24.52：复制编号按钮 */',
+        '        /* 复制编号按钮 */',
     '        var copyBtn = card.querySelector(".fb-copy-btn");',
     '        if (copyBtn) {',
     '          copyBtn.addEventListener("click", function(e){',
@@ -71444,7 +78239,7 @@ function renderCard(f){
     '          });',
     '        }',
     '',
-    '        /* ★ v0.23.32 补全：管理员回复按钮的事件绑定 */',
+    '        /* 补全：管理员回复按钮的事件绑定 */',
     '        var replyBtn = card.querySelector(".fb-reply-btn");',
     '        if (replyBtn){',
     '          replyBtn.addEventListener("click", function(){',
@@ -71668,7 +78463,7 @@ function renderCard(f){
     '    });',
     '  }',
     '',
-    '  /* ★ v0.24.52：事件委托 —— 复制编号按钮（兼容预渲染卡片） */',
+    '  /* 事件委托 —— 复制编号按钮（兼容预渲染卡片） */',
     '  document.addEventListener("click", function(e){',
     '    var btn = e.target && e.target.closest ? e.target.closest(".fb-copy-btn") : null;',
     '    if (!btn) return;',
@@ -72757,7 +79552,7 @@ html += '},true);';
   html += '    function fb(){var ta=document.createElement("textarea");ta.value=cid;ta.style.position="fixed";ta.style.left="-9999px";document.body.appendChild(ta);ta.select();try{document.execCommand("copy");done();}catch(e){}document.body.removeChild(ta);}';
   html += '    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(cid).then(done).catch(function(){fb();});}else{fb();}return;}';
   html += '});';
-    html += '/* ★ v0.24.57：管理员操作 */';
+    html += '/* 管理员操作 */';
   html += 'function admQ(id){return document.getElementById(id);}';
   html += 'document.addEventListener("click",function(e){';
   html += '  var t=e.target;if(!t||!t.closest)return;';
@@ -72800,7 +79595,7 @@ html += '},true);';
   html += '      .then(function(d){rv.disabled=false;rv.textContent="发送回复";if(d&&d.ok){rEl.value="";toast("✅ 回复已发送");setTimeout(function(){location.reload();},600);}else{toast((d&&d.error)||"发送失败",true);}})';
   html += '      .catch(function(){rv.disabled=false;rv.textContent="发送回复";toast("网络错误",true);});return;}';
   html += '});';
-  html += '/* ★ v0.24.58：详情弹窗 */';
+  html += '/* 详情弹窗 */';
   html += 'var _M=document.getElementById("btModal"),_MB=document.getElementById("btModalBody"),_MT=document.getElementById("btModalTitle");';
   html += 'function _closeD(){if(_M)_M.classList.remove("open");}';
   html += 'if(_M){';
@@ -73928,6 +80723,59 @@ app.post('/jb/api/status', function (req, res) {
   });
 });
 
+app.get('/sw.js', function (req, res) {
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Service-Worker-Allowed', '/');
+  res.end([
+    '/* Web Push Service Worker */',
+    'self.addEventListener("push", function (event) {',
+    '  var data = {};',
+    '  try { data = event.data ? event.data.json() : {}; } catch (e) {}',
+    '  var title = data.title || "微信 · 局域网";',
+    '  var options = {',
+    '    body: data.body || "你有一条新消息",',
+    '    icon: data.icon || "/favicon.ico",',
+    '    badge: data.badge || "/favicon.ico",',
+    '    data: { url: data.url || "/" },',
+    '    vibrate: [80, 40, 80],',
+    '    tag: data.tag || "lanchat-message",',
+    '    renotify: true',
+    '  };',
+    '  event.waitUntil(self.registration.showNotification(title, options));',
+    '});',
+    'self.addEventListener("notificationclick", function (event) {',
+    '  event.notification.close();',
+    '  var url = (event.notification.data && event.notification.data.url) || "/";',
+    '  event.waitUntil(',
+    '    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(function (list) {',
+    '      for (var i = 0; i < list.length; i++) {',
+    '        var c = list[i];',
+    '        if (c.url.indexOf(url) === 0 && "focus" in c) return c.focus();',
+    '      }',
+    '      if (self.clients.openWindow) return self.clients.openWindow(url);',
+    '    })',
+    '  );',
+    '});'
+  ].join('\n'));
+});
+
+app.get('/manifest.json', function (req, res) {
+  res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+  res.json({
+    name: '微信 · 局域网',
+    short_name: '微信局域网',
+    start_url: '/',
+    scope: '/',
+    display: 'standalone',
+    background_color: '#ededed',
+    theme_color: '#07c160',
+    icons: [
+      { src: '/favicon.ico', sizes: '64x64 32x32 16x16', type: 'image/x-icon' }
+    ]
+  });
+});
+
 app.get('/root', function (req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache');
@@ -74164,15 +81012,64 @@ app.get('/root', function (req, res) {
   ].join('\n'));
 });
 
-function csrfGuard(req, res, next) {
-  var m = String(req.method || '').toUpperCase();
-  if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return next();
-  if (_csrfSameOrigin(req)) return next();
-  console.warn('🛡️ [CSRF] 拒绝跨站请求: ' + m + ' ' + req.originalUrl +
-    '  Origin=' + (req.headers.origin || '-') +
-    '  Referer=' + (req.headers.referer || '-'));
-  res.status(403).json({ ok: false, error: 'CSRF check failed' });
+/* ★ 修复：同源判定函数曾在一次大合并中丢失，导致 csrfGuard 处理每个 POST
+   时都抛 ReferenceError，被 catch 放行 —— 等于 CSRF 防护完全失效。此处补回。 */
+function _csrfSameOrigin(req) {
+  try {
+    var headers = req.headers || {};
+    var host = String(headers.host || '').toLowerCase();
+    if (!host) return true;
+    var origin = String(headers.origin || '').toLowerCase();
+    var referer = String(headers.referer || '').toLowerCase();
+    if (origin) {
+      var m = /^https?:\/\/([^\/]+)/.exec(origin);
+      return !!(m && m[1] === host);
+    }
+    if (referer) {
+      var m2 = /^https?:\/\/([^\/]+)/.exec(referer);
+      return !!(m2 && m2[1] === host);
+    }
+    /* 无 Origin/Referer：非浏览器客户端（curl / 内部调用）放行；
+       跨站表单与 fetch 的 POST 必定携带 Origin，仍会被上面拦截。 */
+    return true;
+  } catch (e) { return true; }
 }
+
+function csrfGuard(req, res, next) {
+  try {
+    var m = String(req.method || '').toUpperCase();
+    if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return next();
+    if (_csrfSameOrigin(req)) return next();
+    console.warn('🛡️ [CSRF] 拒绝跨站请求: ' + m + ' ' + req.originalUrl +
+      '  Origin=' + (req.headers.origin || '-') +
+      '  Referer=' + (req.headers.referer || '-'));
+    res.status(403).json({ ok: false, error: 'CSRF check failed' });
+  } catch (e) {
+    console.error('❌ [CSRF] 中间件异常:', e && e.message);
+    try { next(); } catch (e2) {}
+  }
+}
+
+/* ===== PWA Manifest（iOS 必须，否则从主屏幕打开也无 PushManager） ===== */
+app.get('/manifest.json', function (req, res) {
+  res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  res.json({
+    name: '微信 · 局域网',
+    short_name: '微信局域网',
+    description: '局域网即时通讯演示',
+    start_url: '/',
+    scope: '/',
+    display: 'standalone',
+    display_override: ['standalone', 'minimal-ui'],
+    background_color: '#ededed',
+    theme_color: '#07c160',
+    orientation: 'any',
+    icons: [
+      { src: '/favicon.ico', sizes: '64x64 32x32 16x16', type: 'image/x-icon' }
+    ]
+  });
+});
 
 app.get('/privacy', function (req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -74399,9 +81296,56 @@ app.get('/privacy', function (req, res) {
 app.use('/api', csrfGuard);
 
 app.use('/kf/api', csrfGuard);
+/* ★ 全局 DDoS 自杀检测机制 */
+var _globalReqTimestamps = [];
+var _isShuttingDown = false;
+
+function _triggerDdosShutdown(reqCount) {
+  if (_isShuttingDown) return;
+  _isShuttingDown = true;
+  
+  console.error('');
+  console.error('╔═══════════════════════════════════════════════════════════╗');
+  console.error('║ 🚨 严重警告：检测到 DDoS 攻击流量！                       ║');
+  console.error('║ 1 秒内并发请求数达到: ' + reqCount + ' 次                             ║');
+  console.error('║ 为防止服务器资源彻底崩溃，服务器将在 5 秒后自动关闭！     ║');
+  console.error('╚═══════════════════════════════════════════════════════════╝');
+  console.error('');
+
+  try {
+    if (typeof io !== 'undefined' && io.emit) {
+      io.emit('account-banned', {
+        reason: '服务器遭受 DDoS 攻击，启动安全保护机制，即将断开所有连接并关闭。',
+        bannedUntil: 0
+      });
+    }
+  } catch (e) {}
+
+  setTimeout(function () {
+    // 强制终止进程，不保存任何状态，防止文件被攻击者写坏
+    process.exit(1);
+  }, 5000);
+}
+
 function attackGuardMiddleware(req, res, next) {
   var ip = _getRealIp(req);
   if (!ip) return next();
+
+  /* ★ DDoS 高频检测：记录全局请求时间戳（排除正常的静态资源与 Socket 握手） */
+  if (req.path.indexOf('/socket.io') === -1) {
+    var now = Date.now();
+    _globalReqTimestamps.push(now);
+    // 仅保留最近 1 秒的请求时间戳
+    while (_globalReqTimestamps.length > 0 && _globalReqTimestamps[0] < now - 1000) {
+      _globalReqTimestamps.shift();
+    }
+    // 阈值：1 秒内超过 800 次请求判定为 DDoS
+    if (_globalReqTimestamps.length > 800) {
+      _triggerDdosShutdown(_globalReqTimestamps.length);
+      res.status(503).end('Service Unavailable');
+      return;
+    }
+  }
 
   if (_agIsBanned(ip)) {
     res.status(429).json({ ok: false, error: 'too many requests' });
@@ -74420,217 +81364,7 @@ app.use('/api', attackGuardMiddleware);
 app.use('/kf/api', attackGuardMiddleware);
 app.use('/download/login', attackGuardMiddleware);
 
-app.get('/api/contact-tags', function (req, res) {
-  var uid = String(req.query.userId || '');
-  if (!uid) { res.status(400).json({ ok: false, error: 'userId required' }); return; }
-  var tags = contactTags[uid] || [];
-  res.json({ ok: true, tags: tags });
-});
-
-app.post('/api/contact-tags', function (req, res) {
-  var uid = String(req.body && req.body.userId || '');
-  var tags = req.body && req.body.tags;
-  if (!uid || !Array.isArray(tags)) { res.status(400).json({ ok: false }); return; }
-  contactTags[uid] = tags;
-  saveContactTags();
-  res.json({ ok: true });
-});
-
-app.get('/api/remarks', function (req, res) {
-  var uid = String(req.query.userId || '');
-  if (!uid) { res.status(400).json({ ok: false }); return; }
-  res.json({ ok: true, remarks: remarks[uid] || {} });
-});
-
-app.post('/api/remarks', function (req, res) {
-  var uid = String(req.body && req.body.userId || '');
-  var targetId = String(req.body && req.body.targetId || '');
-  var remark = String(req.body && req.body.remark || '');
-  if (!uid || !targetId) { res.status(400).json({ ok: false }); return; }
-  var sess = gwGetSession(req);
-  if (!sess || sess.userId !== uid) {
-    console.warn('🛡️ [IDOR] 拒绝越权访问 /api/remarks: sess=' +
-      (sess ? sess.userId : 'none') + ' body=' + uid);
-    res.status(403).json({ ok: false, error: 'forbidden' });
-    return;
-  }
-  if (!remarks[uid]) remarks[uid] = {};
-  if (remark) remarks[uid][targetId] = remark;
-  else delete remarks[uid][targetId];
-  saveRemarks();
-  res.json({ ok: true });
-});
-
-app.get('/api/archived', function (req, res) {
-  var uid = String(req.query.userId || '');
-  if (!uid) { res.status(400).json({ ok: false }); return; }
-  res.json({ ok: true, archived: archivedChats[uid] || {} });
-});
-
-app.post('/api/archived', function (req, res) {
-  var uid = String(req.body && req.body.userId || '');
-  var key = String(req.body && req.body.key || '');
-  var archived = !!req.body.archived;
-  if (!uid || !key) { res.status(400).json({ ok: false }); return; }
-  if (!archivedChats[uid]) archivedChats[uid] = {};
-  if (archived) archivedChats[uid][key] = true;
-  else delete archivedChats[uid][key];
-  saveArchived();
-  res.json({ ok: true });
-});
-
-app.get('/api/chat-sounds', function (req, res) {
-  var uid = String(req.query.userId || '');
-  if (!uid) { res.status(400).json({ ok: false }); return; }
-  res.json({ ok: true, sounds: chatSounds[uid] || {} });
-});
-
-app.post('/api/chat-sounds', function (req, res) {
-  var uid = String(req.body && req.body.userId || '');
-  var key = String(req.body && req.body.key || '');
-  var sound = String(req.body && req.body.sound || 'default');
-  if (!uid || !key) { res.status(400).json({ ok: false }); return; }
-  if (!chatSounds[uid]) chatSounds[uid] = {};
-  chatSounds[uid][key] = sound;
-  saveChatSounds();
-  res.json({ ok: true });
-});
-
-app.get('/api/devices', function (req, res) {
-  var uid = String(req.query.userId || '');
-  if (!uid) { res.status(400).json({ ok: false }); return; }
-  res.json({ ok: true, devices: devices[uid] || [] });
-});
-
-app.delete('/api/devices', function (req, res) {
-  var uid = String(req.body && req.body.userId || '');
-  var token = String(req.body && req.body.token || '');
-  if (!uid || !token) { res.status(400).json({ ok: false }); return; }
-  var removed = removeDevice(uid, token);
-  res.json({ ok: removed });
-});
-
-app.get('/api/scheduled', function (req, res) {
-  var uid = String(req.query.userId || '');
-  if (!uid) { res.status(400).json({ ok: false }); return; }
-  res.json({ ok: true, scheduled: scheduledMessages[uid] || [] });
-});
-
-app.post('/api/scheduled', function (req, res) {
-  var uid = String(req.body && req.body.userId || '');
-  var task = req.body && req.body.task;
-  if (!uid || !task) { res.status(400).json({ ok: false }); return; }
-  if (!scheduledMessages[uid]) scheduledMessages[uid] = [];
-  task.id = 'sch_' + Date.now().toString(36) + Math.random().toString(36).substring(2, 6);
-  task.sendAt = Number(task.sendAt) || Date.now();
-  scheduledMessages[uid].push(task);
-  saveScheduled();
-  res.json({ ok: true, id: task.id });
-});
-
-app.delete('/api/scheduled', function (req, res) {
-  var uid = String(req.body && req.body.userId || '');
-  var id = String(req.body && req.body.id || '');
-  if (!uid || !id) { res.status(400).json({ ok: false }); return; }
-  if (!scheduledMessages[uid]) { res.json({ ok: true }); return; }
-  scheduledMessages[uid] = scheduledMessages[uid].filter(function (t) { return t.id !== id; });
-  saveScheduled();
-  res.json({ ok: true });
-});
-
-app.get('/api/auto-replies', function (req, res) {
-  var uid = String(req.query.userId || '');
-  if (!uid) { res.status(400).json({ ok: false }); return; }
-  res.json({ ok: true, rules: autoReplies[uid] || [] });
-});
-
-app.post('/api/auto-replies', function (req, res) {
-  var uid = String(req.body && req.body.userId || '');
-  var rules = req.body && req.body.rules;
-  if (!uid || !Array.isArray(rules)) { res.status(400).json({ ok: false }); return; }
-  autoReplies[uid] = rules;
-  saveAutoReplies();
-  res.json({ ok: true });
-});
-
-app.get('/api/announcement-reads', function (req, res) {
-  var gid = String(req.query.groupId || '');
-  if (!gid) { res.status(400).json({ ok: false }); return; }
-  res.json({ ok: true, reads: announcementReads[gid] || {} });
-});
-
-app.post('/api/announcement-reads', function (req, res) {
-  var gid = String(req.body && req.body.groupId || '');
-  var uid = String(req.body && req.body.userId || '');
-  var text = String(req.body && req.body.text || '');
-  if (!gid || !uid) { res.status(400).json({ ok: false }); return; }
-  if (!announcementReads[gid]) announcementReads[gid] = {};
-  if (!announcementReads[gid][text]) announcementReads[gid][text] = [];
-  if (announcementReads[gid][text].indexOf(uid) === -1) {
-    announcementReads[gid][text].push(uid);
-    saveAnnouncementReads();
-  }
-  res.json({ ok: true });
-});
-
-app.get('/api/group-activity', function (req, res) {
-  var gid = String(req.query.groupId || '');
-  if (!gid) { res.status(400).json({ ok: false }); return; }
-  var acts = groupActivity[gid] || [];
-  res.json({ ok: true, activities: acts.slice().reverse() });
-});
-
-app.get('/api/announcement-history', function (req, res) {
-  var gid = String(req.query.groupId || '');
-  if (!gid) { res.status(400).json({ ok: false }); return; }
-  var hist = announcementHistory[gid] || [];
-  res.json({ ok: true, history: hist.slice().reverse() });
-});
-
-app.get('/api/keyword-rules', function (req, res) {
-  var uid = String(req.query.userId || '');
-  if (!uid) { res.status(400).json({ ok: false }); return; }
-  res.json({ ok: true, rules: keywordRules[uid] || { alerts: [], highlight: [] } });
-});
-
-app.post('/api/keyword-rules', function (req, res) {
-  var uid = String(req.body && req.body.userId || '');
-  var rules = req.body && req.body.rules;
-  if (!uid || !rules) { res.status(400).json({ ok: false }); return; }
-  keywordRules[uid] = rules;
-  saveKeywordRules();
-  res.json({ ok: true });
-});
-
-app.get('/api/shortcuts', function (req, res) {
-  var uid = String(req.query.userId || '');
-  if (!uid) { res.status(400).json({ ok: false }); return; }
-  res.json({ ok: true, shortcuts: customShortcuts[uid] || {} });
-});
-
-app.post('/api/shortcuts', function (req, res) {
-  var uid = String(req.body && req.body.userId || '');
-  var sc = req.body && req.body.shortcuts;
-  if (!uid || !sc) { res.status(400).json({ ok: false }); return; }
-  customShortcuts[uid] = sc;
-  saveShortcuts();
-  res.json({ ok: true });
-});
-
-app.get('/api/time-theme', function (req, res) {
-  var uid = String(req.query.userId || '');
-  if (!uid) { res.status(400).json({ ok: false }); return; }
-  res.json({ ok: true, timeTheme: timeTheme[uid] || { enabled: false, dayStart: '08:00', dayEnd: '20:00' } });
-});
-
-app.post('/api/time-theme', function (req, res) {
-  var uid = String(req.body && req.body.userId || '');
-  var tt = req.body && req.body.timeTheme;
-  if (!uid || !tt) { res.status(400).json({ ok: false }); return; }
-  timeTheme[uid] = tt;
-  saveTimeTheme();
-  res.json({ ok: true });
-});
+/* 已删除 13 个与 Socket.IO 重复的 REST 路由（客户端从未调用） */
 
 app.get('/music', function (req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -74867,6 +81601,439 @@ app.get('/music', function (req, res) {
   res.end(parts.join('\n'));
 });
 
+/* 秒传检查 */
+app.post('/api/upload/check', attackGuardMiddleware, csrfGuard,
+  express.json({ limit: '64kb' }),
+  function (req, res) {
+    var uid = verifyUploadTicket(req);
+    if (!uid) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+
+    var sha256 = String((req.body && req.body.sha256) || '').trim();
+    if (!sha256) {
+        /* 非 HTTPS / 老浏览器无法计算 SHA-256，直接走真实上传 */
+        return res.json({ ok: false, needUpload: true });
+    }
+
+    for (var fid in fileOwners) {
+        if (!fileOwners.hasOwnProperty(fid)) continue;
+        var f = fileOwners[fid];
+        if (!f || f.sha256 !== sha256) continue;
+        if (!fs.existsSync(path.join(FILE_STORE_DIR, fid))) {
+            delete fileOwners[fid];
+            continue;
+        }
+        f.lastAccess = Date.now();
+        saveFileOwners();
+        return res.json({ ok: true, fileId: fid });
+    }
+    res.json({ ok: false, needUpload: true });
+});
+
+/* 大文件上传接口：带配额与哈希校验 */
+app.post('/api/upload-file', attackGuardMiddleware, csrfGuard,
+  express.json({ limit: '150mb' }),
+  function (req, res) {
+    try {
+        var uid = verifyUploadTicket(req);
+        if (!uid) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+
+        var body = req.body || {};
+        var base64Data = String(body.fileData || '');
+        var fileName = String(body.fileName || 'file.bin');
+        var fileType = String(body.fileType || 'application/octet-stream');
+        var sha256 = String(body.sha256 || '');
+        
+        if (!base64Data || base64Data.indexOf('data:') !== 0) return res.status(400).json({ ok: false, error: '无效的文件数据' });
+        
+        var m = /^data:([^;]+);base64,(.+)$/.exec(base64Data);
+        if (!m) return res.status(400).json({ ok: false, error: '无效的 Base64' });
+        var buf = Buffer.from(m[2], 'base64');
+        var size = buf.length;
+
+        // 配额检查 (2GB)
+        var MAX_QUOTA = 2 * 1024 * 1024 * 1024;
+        var curQuota = userUploadQuota[uid] || 0;
+        if (curQuota + size > MAX_QUOTA) {
+            return res.status(403).json({ ok: false, error: '您的上传配额已用尽（超过 2GB），请清理历史记录' });
+        }
+
+        // 强制重算哈希防伪造
+        var actualSha256 = crypto.createHash('sha256').update(buf).digest('hex');
+        if (sha256 && sha256 !== actualSha256) {
+            return res.status(400).json({ ok: false, error: '文件哈希不匹配，可能传输损坏' });
+        }
+        sha256 = actualSha256;
+
+        // 并发防重秒传
+        for (var fid in fileOwners) {
+            if (fileOwners[fid].sha256 === sha256 && fileOwners[fid].size === size) {
+                if (fs.existsSync(path.join(FILE_STORE_DIR, fid))) {
+                    fileOwners[fid].lastAccess = Date.now();
+                    saveFileOwners();
+                    return res.json({ ok: true, fileId: fid, fileName: fileName, fileSize: size, fileType: fileType });
+                }
+            }
+        }
+
+        // 存盘
+        var saved = _fileStoreSave(base64Data, path.extname(fileName));
+        if (!saved) return res.status(500).json({ ok: false, error: '保存文件失败' });
+        
+        fileOwners[saved.fileId] = {
+            userId: uid,
+            size: size,
+            sha256: sha256,
+            lastAccess: Date.now(),
+            createdAt: Date.now(),
+            fileName: fileName
+        };
+        userUploadQuota[uid] = (userUploadQuota[uid] || 0) + size;
+        saveFileOwners();
+
+        res.json({ ok: true, fileId: saved.fileId, fileName: fileName, fileSize: size, fileType: fileType });
+    } catch (e) {
+        console.error('❌ /api/upload-file 出错:', e.message);
+        res.status(500).json({ ok: false, error: '服务器内部错误' });
+    }
+});
+
+/* 大文件下载/预览接口：带 20MB/s 限速、断点续传与 LRU 更新 */
+app.get('/api/file/:fileId', attackGuardMiddleware, function (req, res) {
+  try {
+    var fileId = String(req.params.fileId || '');
+    /* ★ 安全加固：原实现只拦 '..'，Windows 下 '..\\' 或绝对路径仍可能穿越。
+       改为白名单字符 + 仅允许单段文件名 + 分隔符/NUL 全拒绝。 */
+    if (!fileId || fileId.length > 200 ||
+        fileId.indexOf('..') !== -1 ||
+        fileId.indexOf('/') !== -1 || fileId.indexOf('\\') !== -1 ||
+        fileId.indexOf('\x00') !== -1 ||
+        !/^[A-Za-z0-9._-]+$/.test(fileId) ||
+        path.basename(fileId) !== fileId) {
+      return res.status(400).end();
+    }
+    var fullPath = path.join(FILE_STORE_DIR, fileId);
+    if (path.resolve(fullPath).indexOf(path.resolve(FILE_STORE_DIR)) !== 0) {
+      return res.status(400).end();
+    }
+    if (!fs.existsSync(fullPath)) return res.status(404).end('file not found');
+    
+    if (fileOwners[fileId]) {
+        fileOwners[fileId].lastAccess = Date.now();
+    }
+
+    var stat = fs.statSync(fullPath);
+    var ext = path.extname(fileId).toLowerCase();
+    var mimeMap = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.gif': 'image/gif',
+      '.webp': 'image/webp', '.webm': 'audio/webm', '.ogg': 'audio/ogg',
+      '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.mp4': 'video/mp4',
+      '.pdf': 'application/pdf'
+    };
+    var mime = mimeMap[ext] || 'application/octet-stream';
+
+    var _isDl = String((req.query && req.query.dl) || '') === '1';
+    if (_isDl) {
+      var _safeName = String(
+        (fileOwners && fileOwners[fileId] && fileOwners[fileId].fileName) ||
+        fileId
+      ).replace(/["\r\n\\\/]/g, '_');
+      /* ASCII fallback + RFC 5987 UTF-8 filename* 双保险，
+         中文 / emoji 文件名在任何浏览器都能正确识别 */
+      var _asciiName = _safeName.replace(/[^\x20-\x7e]/g, '_');
+      res.setHeader('Content-Disposition',
+        'attachment; filename="' + _asciiName + '"; ' +
+        "filename*=UTF-8''" + encodeURIComponent(_safeName));
+    }
+
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=31536000');
+    
+    var range = req.headers.range;
+    if (range) {
+      var m = /bytes=(\d*)-(\d*)/.exec(range);
+      if (m) {
+        var start = m[1] ? parseInt(m[1], 10) : 0;
+        var end = m[2] ? parseInt(m[2], 10) : stat.size - 1;
+        if (isNaN(start) || start < 0) start = 0;
+        if (isNaN(end) || end >= stat.size) end = stat.size - 1;
+        
+        res.status(206);
+        res.setHeader('Content-Range', 'bytes ' + start + '-' + end + '/' + stat.size);
+        res.setHeader('Content-Length', end - start + 1);
+        var stream = fs.createReadStream(fullPath, { start: start, end: end });
+        return streamWithLimit(stream, res);
+      }
+    }
+    
+    res.setHeader('Content-Length', stat.size);
+    var fullStream = fs.createReadStream(fullPath);
+    streamWithLimit(fullStream, res);
+  } catch (e) {
+    console.error('❌ /api/file 出错:', e.message);
+    try { res.status(500).end(); } catch (e2) {}
+  }
+});
+
+/* ===== 分片上传：支持大文件、CF 隧道、流式写盘 ===== */
+var UPLOAD_CHUNK_DIR = path.join(DATA_DIR_EARLY, 'upload_chunks');
+try { if (!fs.existsSync(UPLOAD_CHUNK_DIR)) fs.mkdirSync(UPLOAD_CHUNK_DIR, { recursive: true }); }
+catch (e) { console.error('❌ 创建 upload_chunks 目录失败:', e.message); }
+
+var uploadSessions = Object.create(null);
+var UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;      // 4MB / 片
+var UPLOAD_MAX_TOTAL  = 500 * 1024 * 1024;    // 单文件 500MB 上限
+var UPLOAD_SESSION_TTL = 30 * 60 * 1000;      // 30 分钟无活动自动清理
+
+setInterval(function () {
+  var now = Date.now();
+  for (var sid in uploadSessions) {
+    var s = uploadSessions[sid];
+    if (!s) continue;
+    if (now - (s.lastActiveAt || s.createdAt) > UPLOAD_SESSION_TTL) {
+      try { fs.unlinkSync(s.tmpPath); } catch (e) {}
+      delete uploadSessions[sid];
+    }
+  }
+}, 5 * 60 * 1000);
+
+/* ① 初始化：秒传检查 + 创建会话 */
+app.post('/api/upload/init', attackGuardMiddleware, csrfGuard,
+  express.json({ limit: '64kb' }),
+  function (req, res) {
+    try {
+      var uid = verifyUploadTicket(req);
+      if (!uid) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+
+      var b = req.body || {};
+      var sha256 = String(b.sha256 || '').trim();
+      var size = Number(b.size || 0);
+      var fileName = String(b.fileName || 'file.bin').slice(0, 200);
+      var fileType = String(b.fileType || 'application/octet-stream').slice(0, 100);
+      var totalChunks = Number(b.totalChunks || 0);
+
+      if (!size || size <= 0 || size > UPLOAD_MAX_TOTAL) {
+        return res.status(400).json({ ok: false, error: '文件大小无效或超过 ' +
+          Math.round(UPLOAD_MAX_TOTAL / 1048576) + 'MB 上限' });
+      }
+      if (!totalChunks || totalChunks > 5000) {
+        return res.status(400).json({ ok: false, error: '分片数量无效' });
+      }
+      if (totalChunks !== Math.ceil(size / UPLOAD_CHUNK_SIZE)) {
+        return res.status(400).json({ ok: false, error: '分片数计算不一致' });
+      }
+
+      /* 秒传：仅按 sha256 匹配 */
+      if (sha256) {
+        for (var fid in fileOwners) {
+          if (!fileOwners.hasOwnProperty(fid)) continue;
+          var f = fileOwners[fid];
+          if (!f || f.sha256 !== sha256) continue;
+          if (!fs.existsSync(path.join(FILE_STORE_DIR, fid))) {
+            delete fileOwners[fid];
+            continue;
+          }
+          f.lastAccess = Date.now();
+          saveFileOwners();
+          return res.json({ ok: true, fileId: fid, needUpload: false });
+        }
+      }
+
+      /* 配额 */
+      var MAX_QUOTA = 2 * 1024 * 1024 * 1024;
+      var curQuota = userUploadQuota[uid] || 0;
+      if (curQuota + size > MAX_QUOTA) {
+        return res.status(403).json({ ok: false,
+          error: '上传配额不足（已用 ' +
+            (curQuota / 1048576).toFixed(1) + 'MB，上限 2GB）' });
+      }
+
+      var uploadId = 'u' + Date.now().toString(36) +
+        crypto.randomBytes(8).toString('hex');
+      var tmpPath = path.join(UPLOAD_CHUNK_DIR, uploadId + '.part');
+      fs.writeFileSync(tmpPath, '');
+
+      uploadSessions[uploadId] = {
+        userId: uid,
+        fileName: fileName,
+        fileType: fileType,
+        size: size,
+        sha256: sha256,
+        totalChunks: totalChunks,
+        received: Object.create(null),
+        receivedCount: 0,
+        tmpPath: tmpPath,
+        createdAt: Date.now(),
+        lastActiveAt: Date.now()
+      };
+
+      res.json({
+        ok: true,
+        uploadId: uploadId,
+        needUpload: true,
+        chunkSize: UPLOAD_CHUNK_SIZE
+      });
+    } catch (e) {
+      console.error('❌ /api/upload/init:', e.message);
+      try { res.status(500).json({ ok: false, error: '服务器内部错误' }); } catch (e2) {}
+    }
+  }
+);
+
+/* ② 接收分片：raw 二进制，流式追加写盘，不整块进内存 */
+app.post('/api/upload/chunk',
+  attackGuardMiddleware,
+  function (req, res, next) {
+    var uid = verifyUploadTicket(req);
+    if (!uid) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    req._uploadUid = uid;
+    next();
+  },
+  express.raw({ limit: '8mb', type: 'application/octet-stream' }),
+  function (req, res) {
+    try {
+      var uid = req._uploadUid;
+      var uploadId = String((req.query && req.query.uploadId) || '');
+      var index = parseInt(req.query && req.query.index, 10);
+      var s = uploadSessions[uploadId];
+      if (!s) return res.status(404).json({ ok: false, error: '会话不存在或已过期' });
+      if (s.userId !== uid) return res.status(403).json({ ok: false, error: '无权操作' });
+      if (isNaN(index) || index < 0 || index >= s.totalChunks) {
+        return res.status(400).json({ ok: false, error: '分片索引无效' });
+      }
+      if (!Buffer.isBuffer(req.body) || !req.body.length) {
+        return res.status(400).json({ ok: false, error: '空分片' });
+      }
+      /* 严格顺序：与已有的分片数一致 */
+      if (index !== s.receivedCount) {
+        return res.status(400).json({
+          ok: false,
+          error: '分片乱序（期望 #' + s.receivedCount + '，收到 #' + index + '）'
+        });
+      }
+      fs.appendFileSync(s.tmpPath, req.body);
+      s.received[index] = true;
+      s.receivedCount++;
+      s.lastActiveAt = Date.now();
+      res.json({
+        ok: true,
+        received: s.receivedCount,
+        total: s.totalChunks
+      });
+    } catch (e) {
+      console.error('❌ /api/upload/chunk:', e.message);
+      try { res.status(500).json({ ok: false, error: '服务器内部错误' }); } catch (e2) {}
+    }
+  }
+);
+
+/* ③ 完成：校验大小与 sha256 → 移入 filestore → 返回 fileId */
+app.post('/api/upload/complete', attackGuardMiddleware, csrfGuard,
+  express.json({ limit: '64kb' }),
+  function (req, res) {
+    try {
+      var uid = verifyUploadTicket(req);
+      if (!uid) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+
+      var uploadId = String((req.body && req.body.uploadId) || '');
+      var s = uploadSessions[uploadId];
+      if (!s) return res.status(404).json({ ok: false, error: '会话不存在或已过期' });
+      if (s.userId !== uid) return res.status(403).json({ ok: false, error: '无权操作' });
+      if (s.receivedCount !== s.totalChunks) {
+        return res.status(400).json({
+          ok: false,
+          error: '分片未收齐 (' + s.receivedCount + '/' + s.totalChunks + ')'
+        });
+      }
+
+      var buf;
+      try { buf = fs.readFileSync(s.tmpPath); }
+      catch (e) {
+        return res.status(500).json({ ok: false, error: '读取临时文件失败' });
+      }
+      if (buf.length !== s.size) {
+        try { fs.unlinkSync(s.tmpPath); } catch (e) {}
+        delete uploadSessions[uploadId];
+        return res.status(400).json({ ok: false,
+          error: '合并后大小不符（期望 ' + s.size + '，实际 ' + buf.length + '）' });
+      }
+
+      /* ★ DSH P1：文件头魔数校验，防止改扩展名上传可执行体 */
+      var _magic = dshValidateMagic(buf, s.fileName);
+      if (!_magic.ok) {
+        try { fs.unlinkSync(s.tmpPath); } catch (e) {}
+        delete uploadSessions[uploadId];
+        dshLog('warn', 'upload.magic.rejected', { name: s.fileName, reason: _magic.reason });
+        return res.status(400).json({ ok: false, error: _magic.reason });
+      }
+      var actualSha = crypto.createHash('sha256').update(buf).digest('hex');
+      if (s.sha256 && s.sha256 !== actualSha) {
+        try { fs.unlinkSync(s.tmpPath); } catch (e) {}
+        delete uploadSessions[uploadId];
+        return res.status(400).json({ ok: false, error: '文件哈希校验失败' });
+      }
+
+      var ext = path.extname(s.fileName).toLowerCase();
+      if (!/^\.[a-z0-9]{1,8}$/i.test(ext)) ext = '';
+      var fileId = 'f' + Date.now().toString(36) +
+        crypto.randomBytes(4).toString('hex') + ext;
+      var destPath = path.join(FILE_STORE_DIR, fileId);
+      try {
+        fs.renameSync(s.tmpPath, destPath);
+      } catch (eRename) {
+        /* 跨设备 fallback */
+        fs.writeFileSync(destPath, buf);
+        try { fs.unlinkSync(s.tmpPath); } catch (e) {}
+      }
+
+      fileOwners[fileId] = {
+        userId: uid,
+        size: buf.length,
+        sha256: actualSha,
+        lastAccess: Date.now(),
+        createdAt: Date.now(),
+        fileName: s.fileName
+      };
+      userUploadQuota[uid] = (userUploadQuota[uid] || 0) + buf.length;
+      saveFileOwners();
+
+      delete uploadSessions[uploadId];
+
+      res.json({
+        ok: true,
+        fileId: fileId,
+        fileName: s.fileName,
+        fileSize: buf.length,
+        fileType: s.fileType
+      });
+    } catch (e) {
+      console.error('❌ /api/upload/complete:', e.message);
+      try { res.status(500).json({ ok: false, error: '服务器内部错误' }); } catch (e2) {}
+    }
+  }
+);
+
+/* ④ 取消：删除临时文件 + 会话（幂等） */
+app.post('/api/upload/cancel', attackGuardMiddleware, csrfGuard,
+  express.json({ limit: '64kb' }),
+  function (req, res) {
+    try {
+      var uid = verifyUploadTicket(req);
+      if (!uid) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+      var uploadId = String((req.body && req.body.uploadId) || '');
+      var s = uploadSessions[uploadId];
+      if (!s) return res.json({ ok: true });     // 幂等
+      if (s.userId !== uid) return res.status(403).json({ ok: false, error: '无权操作' });
+      try { fs.unlinkSync(s.tmpPath); } catch (e) {}
+      delete uploadSessions[uploadId];
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('❌ /api/upload/cancel:', e.message);
+      try { res.status(500).json({ ok: false, error: '服务器内部错误' }); } catch (e2) {}
+    }
+  }
+);
+
 app.get('/api/music/play', function (req, res) {
   var id = String(req.query.id || '');
   if (id) {
@@ -74880,7 +82047,7 @@ app.get('/api/music/play', function (req, res) {
   res.json({ ok: true });
 });
 
-app.get('/dl-music/:fileName', function (req, res) {
+function _handleMusicDlRequest(req, res) {
   try {
     var raw = String(req.params.fileName || '');
     var safe = path.basename(raw);
@@ -74898,7 +82065,7 @@ app.get('/dl-music/:fileName', function (req, res) {
 
     var payload = safe + '|' + uid + '|' + exp;
     var expect = crypto.createHmac('sha256', DL_SECRET).update(payload).digest('hex');
-    
+
     var isValid = false;
     try {
       var a = Buffer.from(expect, 'hex');
@@ -74922,8 +82089,7 @@ app.get('/dl-music/:fileName', function (req, res) {
       '.opus': 'audio/opus', '.flac': 'audio/flac', '.weba': 'audio/webm'
     };
     var mime = MIME[ext] || 'application/octet-stream';
-    
-    // ★ 如果是直接下载请求，使用 res.download 彻底接管，避免部分浏览器/下载器的 Range 冲突
+
     var isDownload = req.query.dl === '1';
     if (isDownload) {
       res.download(full, safe, function (err) {
@@ -74960,7 +82126,9 @@ app.get('/dl-music/:fileName', function (req, res) {
     console.error('❌ /dl-music 出错:', e.message);
     try { res.status(500).end('error'); } catch (e2) { }
   }
-});
+}
+
+app.get('/dl-music/:fileName', _handleMusicDlRequest);
 
 var devExemptTokens = {};
 var DEV_EXEMPT_TTL = 5 * 60 * 1000;   /* 5 分钟 */
@@ -74973,13 +82141,17 @@ app.post('/api/dev-exempt', csrfGuard, function (req, res) {
       return res.status(400).json({ ok: false, error: '密码格式无效' });
     }
     var matched = null;
+    var _verifiedPlain = '';
     for (var name in persistentUsers) {
       if (!persistentUsers.hasOwnProperty(name)) continue;
       var rec = persistentUsers[name];
       if (!rec || !rec.isAdmin) continue;
       if (!rec.passwordHash) continue;
-      if (rec.passwordHash === pwd) { matched = rec; break; }
+      /* ★ 安全修复：原为 passwordHash === pwd 明文比较；改用带盐校验 */
+      var _v = verifySecretAny(pwd, rec.passwordHash);
+      if (_v.ok) { matched = rec; _verifiedPlain = _v.used; break; }
     }
+    if (matched) { try { maybeUpgradeSecret(matched, 'passwordHash', _verifiedPlain); } catch (e) {} }
     if (!matched) {
       var _ip = _getRealIp(req);
       console.log('🛡️ [dev-exempt] 验证失败 @ ' + _ip);
@@ -75222,26 +82394,7 @@ app.get('/api/stats', attackGuardMiddleware, function (req, res) {
   }
 });
 
-app.get('/api/ip-location', attackGuardMiddleware, function (req, res) {
-  var ip = String((req.query && req.query.ip) || _getRealIp(req));
-  if (!ip) { res.status(400).json({ ok: false, error: '缺少 IP' }); return; }
-  var loc = getIpLocation(ip);
-  if (!loc) {
-    res.json({ ok: true, ip: ip, location: null, regionText: '未知' });
-    return;
-  }
-  res.json({
-    ok: true,
-    ip: ip,
-    location: {
-      country: loc.country,
-      province: loc.province,
-      city: loc.city,
-      isp: loc.isp
-    },
-    regionText: loc.regionText
-  });
-});
+/* 已删除重复路由：保留带 cf-ipcountry 的第二份 /api/ip-location */
 
 app.get('/api/ip-location', attackGuardMiddleware, function (req, res) {
   var ip = String((req.query && req.query.ip) || _getRealIp(req));
@@ -75286,117 +82439,27 @@ app.get('/api/ip-status', attackGuardMiddleware, function (req, res) {
   }
 });
 
-var _WBI_CACHE = { keys: null, ts: 0 };
-var _WBI_TTL = 6 * 3600 * 1000;   /* 密钥缓存 6 小时 */
+/* 已删除 B 站爬取残留（_WBI_CACHE / _wbiMixinKey / _wbiSign / _getWbiKeys / _biliGet，无任何调用点） */
 
-function _wbiMixinKey(imgKey, subKey) {
-  var orig = String(imgKey + subKey);
-  var MIXIN_TAB = [
-    46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,
-    27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,
-    37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,
-    22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52
-  ];
-  var out = '';
-  for (var i = 0; i < 32; i++) {
-    out += orig.charAt(MIXIN_TAB[i] % orig.length);
+/* ===== /api 专用错误处理：任何未捕获错误都返回 JSON，绝不吐 HTML ===== */
+app.use('/api', function (err, req, res, next) {
+  console.error('❌ [API 异常]', req.method, req.originalUrl,
+    err && (err.stack || err.message));
+  if (res.headersSent) return next(err);
+  var _code = 500;
+  if (err && err.status && err.status >= 400 && err.status < 600) _code = err.status;
+  else if (err && err.statusCode && err.statusCode >= 400 && err.statusCode < 600) {
+    _code = err.statusCode;
   }
-  return out;
-}
-
-function _wbiSign(params, imgKey, subKey) {
-  var mixinKey = _wbiMixinKey(imgKey, subKey);
-  var wts = Math.floor(Date.now() / 1000);
-  params.wts = wts;
-  var keys = Object.keys(params).sort();
-  var query = '';
-  for (var i = 0; i < keys.length; i++) {
-    if (i > 0) query += '&';
-    query += encodeURIComponent(keys[i]) + '=' + encodeURIComponent(params[keys[i]]);
-  }
-  var w_rid = crypto.createHash('md5').update(query + mixinKey).digest('hex');
-  return query + '&w_rid=' + w_rid;
-}
-
-function _getWbiKeys(callback) {
-  if (_WBI_CACHE.keys && Date.now() - _WBI_CACHE.ts < _WBI_TTL) {
-    callback(null, _WBI_CACHE.keys);
-    return;
-  }
-  var httpsMod = require('https');
-  var opt = {
-    hostname: 'api.bilibili.com',
-    path: '/x/web-interface/nav',
-    method: 'GET',
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Referer': 'https://www.bilibili.com/'
-    },
-    timeout: 6000
-  };
-  var r = httpsMod.request(opt, function (res) {
-    var chunks = [];
-    res.on('data', function (c) { chunks.push(c); });
-    res.on('end', function () {
-      try {
-        var d = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        var wbi = d.data && d.data.wbi_img;
-        if (!wbi) return callback(new Error('no wbi keys'));
-        var imgKey = wbi.img_url.split('/').pop().split('.')[0];
-        var subKey = wbi.sub_url.split('/').pop().split('.')[0];
-        _WBI_CACHE.keys = { img: imgKey, sub: subKey };
-        _WBI_CACHE.ts = Date.now();
-        callback(null, _WBI_CACHE.keys);
-      } catch (e) { callback(e); }
+  try {
+    res.status(_code).json({
+      ok: false,
+      error: err && err.message ? String(err.message).slice(0, 200) : 'server error'
     });
-  });
-  r.on('timeout', function () { r.destroy(); callback(new Error('timeout')); });
-  r.on('error', callback);
-  r.end();
-}
-
-function _biliGet(path, params, useWbi, callback) {
-  var httpsMod = require('https');
-  var doRequest = function (query) {
-    var opt = {
-      hostname: 'api.bilibili.com',
-      path: path + '?' + query,
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://www.bilibili.com/',
-        'Accept': 'application/json'
-      },
-      timeout: 8000
-    };
-    var req = httpsMod.request(opt, function (res) {
-      var chunks = [];
-      res.on('data', function (c) { chunks.push(c); });
-      res.on('end', function () {
-        try { callback(null, JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
-        catch (e) { callback(e); }
-      });
-    });
-    req.on('timeout', function () { req.destroy(); callback(new Error('timeout')); });
-    req.on('error', callback);
-    req.end();
-  };
-
-  var keys = Object.keys(params).sort();
-  var q = '';
-  for (var i = 0; i < keys.length; i++) {
-    if (i > 0) q += '&';
-    q += encodeURIComponent(keys[i]) + '=' + encodeURIComponent(params[keys[i]]);
+  } catch (e) {
+    try { res.status(_code).end('server error'); } catch (e2) {}
   }
-
-  if (!useWbi) { doRequest(q); return; }
-
-  _getWbiKeys(function (err, k) {
-    if (err) { doRequest(q); return; }
-    var signed = _wbiSign(Object.assign({}, params), k.img, k.sub);
-    doRequest(signed);
-  });
-}
+});
 
 app.get('/api/changelog', function (req, res) {
   try {
@@ -75492,6 +82555,407 @@ app.post('/api/shutdown', function (req, res) {
     try { server.close(_exit); } catch (e) { _exit(); }
     setTimeout(_exit, 3000);
   }, 200);
+});
+
+/* ===== 管理员文件工具：回填 fileId / 清理大文件 / 清理孤立文件 ===== */
+function _isLoopbackIpStr(ip) {
+  var s = _agNormIp(ip);
+  return s === '127.0.0.1' || s === '::1' ||
+         s.indexOf('127.') === 0 || s === '0:0:0:0:0:0:0:1';
+}
+
+function _scanAndFixFileIds() {
+  var byKey = Object.create(null);
+  for (var fid in fileOwners) {
+    if (!fileOwners.hasOwnProperty(fid)) continue;
+    var fo = fileOwners[fid];
+    if (!fo || !fo.fileName || !fo.size) continue;
+    var k = fo.fileName + '\x1f' + fo.size;
+    if (byKey[k] === undefined) byKey[k] = fid;
+    else byKey[k] = null;   /* 不唯一，跳过 */
+  }
+  var fixed = 0, total = 0;
+  for (var hk in messageHistory) {
+    if (!messageHistory.hasOwnProperty(hk)) continue;
+    var arr = messageHistory[hk];
+    if (!Array.isArray(arr)) continue;
+    for (var mi = 0; mi < arr.length; mi++) {
+      total++;
+      var m = arr[mi];
+      if (!m || m.type !== 'file') continue;
+      if (m.fileId) continue;
+      if (!m.fileName || !m.fileSize) continue;
+      var hit = byKey[m.fileName + '\x1f' + m.fileSize];
+      if (!hit) continue;
+      m.fileId = hit;
+      m._needsFetch = true;
+      fixed++;
+    }
+  }
+  if (fixed > 0) saveHistoryNow();
+  return { fixed: fixed, total: total };
+}
+
+function _cleanFilesBySize(mb, opts) {
+  opts = opts || {};
+  var limitBytes = mb * 1024 * 1024;
+  var cutoff = Date.now() - (opts.minAgeMs || 24 * 3600 * 1000);
+  var removed = 0, freed = 0;
+  var removedIds = Object.create(null);
+  try {
+    var files = fs.readdirSync(FILE_STORE_DIR);
+    for (var i = 0; i < files.length; i++) {
+      var fn = files[i];
+      var fp = path.join(FILE_STORE_DIR, fn);
+      try {
+        var st = fs.statSync(fp);
+        if (!st.isFile()) continue;
+        if (st.size < limitBytes) continue;
+        if (st.mtimeMs > cutoff) continue;
+        freed += st.size;
+        fs.unlinkSync(fp);
+        removedIds[fn] = true;
+        removed++;
+        if (fileOwners[fn]) delete fileOwners[fn];
+      } catch (e) {}
+    }
+  } catch (e) {}
+  var clearedMsgs = 0;
+  if (removed > 0) {
+    for (var hk in messageHistory) {
+      if (!messageHistory.hasOwnProperty(hk)) continue;
+      var arr = messageHistory[hk];
+      if (!Array.isArray(arr)) continue;
+      for (var mi = 0; mi < arr.length; mi++) {
+        var m = arr[mi];
+        if (!m || !m.fileId) continue;
+        if (!removedIds[m.fileId]) continue;
+        m.fileId = null;
+        m.fileData = null;
+        m._needsFetch = false;
+        m.fileDataMissing = true;
+        clearedMsgs++;
+      }
+    }
+    if (clearedMsgs > 0) saveHistoryNow();
+    saveFileOwners();
+    rebuildUploadQuota();
+  }
+  return { removed: removed, freed: freed, clearedMsgs: clearedMsgs };
+}
+
+function _cleanOrphanFiles(opts) {
+  opts = opts || {};
+  var cutoff = Date.now() - (opts.minAgeMs || 24 * 3600 * 1000);
+  var refs = Object.create(null);
+  for (var hk in messageHistory) {
+    if (!messageHistory.hasOwnProperty(hk)) continue;
+    var arr = messageHistory[hk];
+    if (!Array.isArray(arr)) continue;
+    for (var mi = 0; mi < arr.length; mi++) {
+      var m = arr[mi];
+      if (m && m.fileId) refs[m.fileId] = true;
+    }
+  }
+  var removed = 0, freed = 0;
+  try {
+    var files = fs.readdirSync(FILE_STORE_DIR);
+    for (var i = 0; i < files.length; i++) {
+      var fn = files[i];
+      if (refs[fn]) continue;
+      var fp = path.join(FILE_STORE_DIR, fn);
+      try {
+        var st = fs.statSync(fp);
+        if (!st.isFile()) continue;
+        if (st.mtimeMs > cutoff) continue;
+        freed += st.size;
+        fs.unlinkSync(fp);
+        removed++;
+        if (fileOwners[fn]) delete fileOwners[fn];
+      } catch (e) {}
+    }
+  } catch (e) {}
+  if (removed > 0) {
+    saveFileOwners();
+    rebuildUploadQuota();
+  }
+  return { removed: removed, freed: freed };
+}
+
+app.get('/api/admin/scanfix', attackGuardMiddleware, function (req, res) {
+  if (!_isLoopbackIpStr(_getRealIp(req))) {
+    res.status(403).json({ ok: false, error: 'forbidden' }); return;
+  }
+  var r = _scanAndFixFileIds();
+  console.log('✅ [scanfix] 扫描 ' + r.total + ' 条消息，回填 fileId ' + r.fixed + ' 条');
+  res.json({ ok: true, total: r.total, fixed: r.fixed });
+});
+
+app.get('/api/admin/cleanfiles', attackGuardMiddleware, function (req, res) {
+  if (!_isLoopbackIpStr(_getRealIp(req))) {
+    res.status(403).json({ ok: false, error: 'forbidden' }); return;
+  }
+  var mb = parseFloat(req.query.mb);
+  if (isNaN(mb) || mb <= 0) {
+    res.status(400).json({ ok: false, error: 'mb 参数无效（用法：?mb=10）' }); return;
+  }
+  var r = _cleanFilesBySize(mb);
+  console.log('🧹 [cleanfiles] 清理 >' + mb + 'MB 且 24h 未修改文件：删除 ' +
+    r.removed + ' 个，释放 ' + (r.freed / 1048576).toFixed(2) +
+    'MB，影响 ' + r.clearedMsgs + ' 条消息');
+  res.json({
+    ok: true, mb: mb, removed: r.removed,
+    freedMB: +(r.freed / 1048576).toFixed(2),
+    clearedMessages: r.clearedMsgs
+  });
+});
+
+app.get('/api/admin/cleanorphans', attackGuardMiddleware, function (req, res) {
+  if (!_isLoopbackIpStr(_getRealIp(req))) {
+    res.status(403).json({ ok: false, error: 'forbidden' }); return;
+  }
+  var r = _cleanOrphanFiles();
+  console.log('🧹 [cleanorphans] 清理孤立文件 ' + r.removed + ' 个，释放 ' +
+    (r.freed / 1048576).toFixed(2) + 'MB');
+  res.json({
+    ok: true, removed: r.removed,
+    freedMB: +(r.freed / 1048576).toFixed(2)
+  });
+});
+
+
+/* ==================================================================
+   ★ DSH HTTP 路由（必须注册在 404 兜底之前）
+   ================================================================== */
+var DSH_JSON = express.json({ limit: '256kb' });
+
+/* 管理员鉴权：gw_session 或 adminDevTokens，或本地回环（运维脚本） */
+function dshIsAdminReq(req) {
+  /* ★ 安全：不再仅凭回环地址放行管理员端点（本机恶意页面/脚本也能打 127.0.0.1）。
+     必须提供有效管理员会话、管理员调试令牌，或显式的运维令牌。 */
+  try {
+    const s = gwGetSession(req);
+    if (s && s.userName && persistentUsers[s.userName] &&
+        persistentUsers[s.userName].isAdmin === true) return true;
+    const hdr = String(req.headers['x-admin-token'] || '');
+    if (hdr && adminDevTokens[hdr] && adminDevTokens[hdr].expires > Date.now()) return true;
+    const op = String(process.env.DSH_OPS_TOKEN || '').trim();
+    if (op && String(req.headers['x-ops-token'] || '') === op) return true;
+  } catch (e) {}
+  return false;
+}
+function dshAdminGuard(req, res, next) {
+  if (!dshIsAdminReq(req)) {
+    return res.status(403).json({ ok: false, error: 'admin required' });
+  }
+  try { const s = gwGetSession(req); req.adminName = s ? s.userName : 'admin'; } catch (e) { req.adminName = 'admin'; }
+  next();
+}
+
+/* 观测计数 + 结构化访问日志 */
+app.use(function (req, res, next) {
+  DSH.metrics.httpRequests++;
+  const p = String(req.path || '');
+  if (p === '/health' || p === '/health/quick' || p === '/metrics' ||
+      p.indexOf('/socket.io') === 0) return next();
+  const t0 = Date.now();
+  res.on('finish', function () {
+    if (res.statusCode >= 500) DSH.metrics.httpErrors++;
+    try {
+      dshLog('access', 'http.request', {
+        method: req.method, path: String(req.originalUrl || req.url).slice(0, 200),
+        status: res.statusCode, ms: Date.now() - t0,
+        ip: _getRealIp(req)
+      });
+    } catch (e) {}
+  });
+  next();
+});
+
+/* ---- P0-B /health ---- */
+app.get('/health', function (req, res) {
+  const h = dshHealth();
+  res.status(h.ok ? 200 : 503);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(h);
+});
+app.get('/health/quick', function (req, res) {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, uptimeSec: Math.round((Date.now() - DSH.startedAt) / 1000) });
+});
+
+/* ---- P3 /metrics ---- */
+app.get('/metrics', function (req, res) {
+  res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(dshMetricsText());
+});
+
+/* ---- P0-D 日志查询 ---- */
+/* P0-C CI 静态扫描（只读自身源码，CI/流水线可直接调用） */
+/* 通话记录查询 */
+app.get('/api/call/log', dshAdminGuard, function (req, res) {
+  var uid = req.query && req.query.userId ? String(req.query.userId) : '';
+  var limit = parseInt(req.query && req.query.limit, 10) || 50;
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, entries: dshCallLogList(uid, limit) });
+});
+
+/* cloudflared 隧道管理 */
+app.get('/api/tunnel', function (req, res) {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(dshTunnelStatus());
+});
+app.post('/api/tunnel', dshAdminGuard, DSH_JSON, function (req, res) {
+  var body = (req.body && typeof req.body === 'object') ? req.body : {};
+  var act = String(body.action || 'status');
+  if (act === 'start') return res.json(dshTunnelStart({ mode: body.mode, name: body.name }));
+  if (act === 'stop') return res.json(dshTunnelStop());
+  return res.json(dshTunnelStatus());
+});
+
+app.get('/api/scan', function (req, res) {
+  const r = dshStaticScan({});
+  res.status(r.ok ? 200 : 500);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(r);
+});
+
+app.get('/api/logs', dshAdminGuard, function (req, res) {
+  const limit = Math.min(500, parseInt(req.query && req.query.limit, 10) || 100);
+  const level = req.query && req.query.level ? String(req.query.level) : '';
+  res.json({ ok: true, entries: dshReadLogs(limit, level) });
+});
+
+/* ---- P0-E 阈值配置中心 ---- */
+app.get('/api/config/thresholds', dshAdminGuard, function (req, res) {
+  res.json({ ok: true, config: dshAllThresholds() });
+});
+app.post('/api/config/thresholds', dshAdminGuard, DSH_JSON, function (req, res) {
+  const body = (req.body && typeof req.body === 'object') ? req.body : {};
+  const changed = [];
+  for (const k in body) {
+    if (!Object.prototype.hasOwnProperty.call(DSH_DEFAULTS, k)) continue;
+    const val = typeof body[k] === 'boolean' ? body[k] : Number(body[k]);
+    if (typeof val === 'number' && (!isFinite(val) || val < 0)) continue;
+    if (dshSetThreshold(k, val)) changed.push(k);
+  }
+  dshAudit(req.adminName, 'config.threshold', changed.join(','), { values: body }, _getRealIp(req));
+  res.json({ ok: true, changed: changed, config: dshAllThresholds() });
+});
+
+/* ---- P1 全文检索 ---- */
+app.get('/api/search', dshAdminGuard, function (req, res) {
+  const q = String((req.query && req.query.q) || '').trim().slice(0, 200);
+  if (!q) return res.json({ ok: false, error: 'missing q' });
+  const limit = Math.min(dshT('searchMaxResults'), parseInt(req.query && req.query.limit, 10) || 20);
+  res.json(dshSearch(q, limit));
+});
+app.post('/api/search/reindex', dshAdminGuard, function (req, res) {
+  res.json({ ok: true, indexed: dshIndexHistory() });
+});
+
+/* ---- P1 审计流水 ---- */
+app.get('/api/audit', dshAdminGuard, function (req, res) {
+  const limit = Math.min(500, parseInt(req.query && req.query.limit, 10) || 100);
+  res.json({ ok: true, entries: dshAuditList(limit) });
+});
+
+/* ---- P1 备份 / 回滚 ---- */
+app.get('/api/backups', dshAdminGuard, function (req, res) {
+  res.json({ ok: true, backups: dshBackupList() });
+});
+app.post('/api/backups', dshAdminGuard, function (req, res) {
+  const r = dshBackup('manual');
+  dshAudit(req.adminName, 'backup.manual', '', r, _getRealIp(req));
+  res.status(r.ok ? 200 : 500).json(r);
+});
+app.post('/api/backups/restore', dshAdminGuard, DSH_JSON, function (req, res) {
+  const r = dshRestore(req.body && req.body.name);
+  dshAudit(req.adminName, 'backup.restore', String(req.body && req.body.name || ''), r, _getRealIp(req));
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+/* ---- P1 证书管理 ---- */
+app.get('/api/cert', dshAdminGuard, function (req, res) {
+  let subject = '', issuer = '', notAfter = '';
+  try {
+    const out = require('child_process').execSync(
+      'openssl x509 -in "' + CERT_FILE + '" -noout -subject -issuer -enddate',
+      { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] });
+    subject = (/subject=(.+)/.exec(out) || [])[1] || '';
+    issuer = (/issuer=(.+)/.exec(out) || [])[1] || '';
+    notAfter = (/notAfter=(.+)/.exec(out) || [])[1] || '';
+  } catch (e) {}
+  res.json({ ok: true, daysLeft: dshCertDaysLeft(), subject: subject,
+    issuer: issuer, notAfter: notAfter, path: CERT_FILE, https: !!_useHttps });
+});
+app.post('/api/cert/renew', dshAdminGuard, function (req, res) {
+  const r = dshRenewCert();
+  dshAudit(req.adminName, 'cert.renew', '', r, _getRealIp(req));
+  res.status(r.ok ? 200 : 500).json(r);
+});
+
+/* ---- P1 CSRF Token（与现有 Origin 校验叠加） ---- */
+app.get('/api/csrf-token', function (req, res) {
+  const sid = String(req.headers['x-session-id'] || req.ip || 'anon');
+  const token = crypto.randomBytes(24).toString('hex');
+  DSH.csrfTokens[sid] = { token: token, exp: Date.now() + dshT('csrfTtlMs') };
+  res.setHeader('Set-Cookie', 'dsh_csrf=' + token + '; Path=/; SameSite=Strict; Max-Age=' +
+    Math.round(dshT('csrfTtlMs') / 1000));
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, token: token, ttlMs: dshT('csrfTtlMs') });
+});
+
+/* ---- P1 CSP 违规上报 ---- */
+app.post('/api/csp-report', DSH_JSON, function (req, res) {
+  DSH.metrics.cspReports++;
+  dshLog('warn', 'csp.violation', { report: req.body });
+  res.status(204).end();
+});
+
+/* ---- P3 mDNS / 局域网发现端点 ---- */
+app.get('/api/discovery', function (req, res) {
+  const peers = [];
+  for (const k in DSH.discoveredPeers) {
+    if (DSH.discoveredPeers[k] && Date.now() - DSH.discoveredPeers[k].at < 120000) peers.push(DSH.discoveredPeers[k]);
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, name: 'LAN-Chat', version: 'dsh-inline-1.0',
+    host: require('os').hostname(), port: (typeof PORT === 'number' ? PORT : 3000),
+    https: !!_useHttps, peers: peers, mdns: !!dshT('enableMdns') });
+});
+app.post('/api/discovery/announce', DSH_JSON, function (req, res) {
+  const b = req.body || {};
+  const key = String(b.host || b.name || _getRealIp(req));
+  DSH.discoveredPeers[key] = { host: key, port: Number(b.port) || 0,
+    https: !!b.https, at: Date.now(), version: String(b.version || '') };
+  res.json({ ok: true });
+});
+
+/* ---- 通话 ICE 配置（P2 通话修复） ---- */
+app.get('/api/call/ice', function (req, res) {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(dshIceConfig());
+});
+
+/* ---- 手动触发统一清理 ---- */
+app.post('/api/cleanup/filestore', dshAdminGuard, function (req, res) {
+  const r = dshFilestoreCleanup();
+  dshAudit(req.adminName, 'cleanup.filestore', '', r, _getRealIp(req));
+  res.json(Object.assign({ ok: true }, r));
+});
+
+/* ---- P1 登录防爆破状态查询 / P2 群元数据 / 配置下发 ---- */
+app.get('/api/dsh/status', function (req, res) {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, version: 'dsh-inline-1.0',
+    uptimeSec: Math.round((Date.now() - DSH.startedAt) / 1000),
+    sqlite: !!DSH.db, fts5: DSH.fts,
+    mdns: !!dshT('enableMdns'), redisAdapter: !!dshT('enableRedisAdapter'),
+    offlineQueue: !!dshT('enableOfflineQueue'),
+    readReceipt: !!dshT('enableReadReceipt'),
+    multiDeviceSync: !!dshT('enableMultiDeviceSync') });
 });
 
 app.use(function (req, res) {
@@ -75702,9 +83166,346 @@ app.use(function (req, res) {
   res.end(_html);
 });
 
+var _globalConnTimestamps = [];
+
 io.on('connection', function (socket) {
+
+  /* ★ Socket 爆发连接检测：防瞬间建立数万连接耗尽文件描述符 */
+  var _now = Date.now();
+  _globalConnTimestamps.push(_now);
+  while (_globalConnTimestamps.length > 0 && _globalConnTimestamps[0] < _now - 1000) {
+    _globalConnTimestamps.shift();
+  }
+  if (_globalConnTimestamps.length > 300) {
+    _triggerDdosShutdown('Socket爆发连接(' + _globalConnTimestamps.length + '/s)');
+    socket.disconnect(true);
+    return;
+  }
+
   var _agIp = _getRealIpFromSocket(socket);
   socket.data._agIp = _agIp;
+
+  /* ================= DSH P2 业务事件 ================= */
+  /* 登录成功后冲刷离线队列 + 下发扩展能力状态 */
+  socket.on('dsh-ready', function () {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u) return;
+      var _n = dshFlushOffline(_u.id, socket);
+      socket.emit('dsh-status', {
+        ok: true, version: 'dsh-inline-1.0',
+        flushed: _n, snapshot: dshUserSnapshot(_u.id),
+        features: { offlineQueue: !!dshT('enableOfflineQueue'),
+          readReceipt: !!dshT('enableReadReceipt'),
+          multiDeviceSync: !!dshT('enableMultiDeviceSync'),
+          markdown: !!dshT('enableMarkdown') }
+      });
+    } catch (e) {}
+  });
+
+  /* 已读回执：补齐 readUsers 并广播给发送方所有端 */
+  socket.on('dsh-read-receipt', function (d) {
+    try {
+      if (!d || !d.msgId) return;
+      var _u = getUserBySocketId(socket.id);
+      if (!_u) return;
+      DSH.metrics.readReceipts++;
+      var _peer = String(d.peerId || d.from || '');
+      var _key = getHistoryKey(d.type === 'group' ? 'group' : 'private',
+        d.type === 'group' ? String(d.groupId || d.peerId || '') : _u.id,
+        d.type === 'group' ? '' : _peer);
+      var _arr = messageHistory[_key];
+      if (Array.isArray(_arr)) {
+        for (var _i = _arr.length - 1; _i >= 0; _i--) {
+          if (_arr[_i] && _arr[_i].msgId === d.msgId) {
+            if (!Array.isArray(_arr[_i].readUsers)) _arr[_i].readUsers = [];
+            if (_arr[_i].readUsers.indexOf(_u.id) === -1) _arr[_i].readUsers.push(_u.id);
+            break;
+          }
+        }
+      }
+      dshSyncToUser(String(d.from || ''), 'dsh-read-receipt-ack',
+        { msgId: d.msgId, by: _u.id, byName: _u.name, at: Date.now() });
+    } catch (e) {}
+  });
+
+  /* 多端同步：设置 / 草稿 / 已读状态 */
+  socket.on('dsh-sync', function (d) {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u || !d || !d.kind) return;
+      DSH.userState[_u.id] = DSH.userState[_u.id] || {};
+      DSH.userState[_u.id][d.kind] = d.value;
+      DSH.userState[_u.id].updatedAt = Date.now();
+      dshPersist('userState');
+      dshSyncToUser(_u.id, 'dsh-sync-apply',
+        { kind: d.kind, value: d.value, at: Date.now() }, socket.id);
+    } catch (e) {}
+  });
+  socket.on('dsh-sync-get', function () {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (_u) socket.emit('dsh-sync-apply-all', DSH.userState[_u.id] || {});
+    } catch (e) {}
+  });
+
+  /* 群公告 / 待办 / 置顶 / @all */
+  socket.on('dsh-group-announce', function (d) {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u || !d || !d.groupId || !d.content) return;
+      var _m = dshGroupMeta(String(d.groupId));
+      _m.announcements.unshift({ id: generateId(), by: _u.name,
+        content: String(d.content).slice(0, 2000), at: Date.now() });
+      if (_m.announcements.length > 50) _m.announcements.length = 50;
+      _m.updatedAt = Date.now(); dshPersist('groupMeta');
+      /* ★ 公告已读统计：新公告初始化已读名单（含发布者） */
+      _m.announcements[0].readBy = [_u.id];
+      _m.announcements[0].readCount = 1;
+      dshGroupBroadcast(String(d.groupId), 'dsh-group-announce-new',
+        { groupId: d.groupId, item: _m.announcements[0], all: _m.announcements });
+      dshAudit(_u.name, 'group.announce', String(d.groupId), {}, _agIp);
+    } catch (e) {}
+  });
+  /* ★ 公告已读：记录是谁读了 */
+  socket.on('dsh-announce-read', function (d) {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u || !d || !d.groupId || !d.announceId) return;
+      var _g = getGroupById(String(d.groupId));
+      if (!_g || !_g.members || !_g.members.has(_u.id)) return;
+      var _m = dshGroupMeta(String(d.groupId));
+      if (!Array.isArray(_m.announcements)) return;
+      for (var _i = 0; _i < _m.announcements.length; _i++) {
+        var _a = _m.announcements[_i];
+        if (_a.id !== d.announceId) continue;
+        if (!Array.isArray(_a.readBy)) _a.readBy = [];
+        if (_a.readBy.indexOf(_u.id) === -1) {
+          _a.readBy.push(_u.id);
+          _a.readCount = _a.readBy.length;
+          _m.updatedAt = Date.now();
+          dshPersist('groupMeta');
+        }
+        dshGroupBroadcast(String(d.groupId), 'dsh-group-announce-read',
+          { groupId: d.groupId, announceId: _a.id, readBy: _a.readBy, readCount: _a.readCount });
+        break;
+      }
+    } catch (e) {}
+  });
+
+  socket.on('dsh-group-todo', function (d) {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u || !d || !d.groupId) return;
+      var _m = dshGroupMeta(String(d.groupId));
+      if (d.id) {
+        for (var _i = 0; _i < _m.todos.length; _i++) {
+          if (_m.todos[_i].id === d.id) {
+            _m.todos[_i].done = !!d.done;
+            _m.todos[_i].doneBy = _u.name;
+            _m.todos[_i].doneAt = d.done ? Date.now() : 0;
+            break;
+          }
+        }
+      } else if (d.content) {
+        _m.todos.push({
+          id: generateId(),
+          by: _u.name, byId: _u.id,
+          content: String(d.content).slice(0, 500),
+          done: false, at: Date.now(),
+          /* ★ 待办指派：可指定负责人与截止时间 */
+          assigneeId: d.assigneeId ? String(d.assigneeId) : '',
+          assigneeName: d.assigneeName ? String(d.assigneeName).slice(0, 30) : '',
+          dueAt: Number(d.dueAt) || 0
+        });
+      }
+      _m.updatedAt = Date.now(); dshPersist('groupMeta');
+      dshGroupBroadcast(String(d.groupId), 'dsh-group-todos', { groupId: d.groupId, todos: _m.todos });
+    } catch (e) {}
+  });
+  socket.on('dsh-group-file-add', function (d) {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u || !d || !d.groupId || !d.fileId) return;
+      var _g = getGroupById(String(d.groupId));
+      if (!_g || !_g.members || !_g.members.has(_u.id)) return;
+      var _m = dshGroupMeta(String(d.groupId));
+      if (!Array.isArray(_m.files)) _m.files = [];
+      /* 同一文件不重复登记 */
+      for (var _i = 0; _i < _m.files.length; _i++) {
+        if (_m.files[_i].fileId === d.fileId) {
+          socket.emit('dsh-group-files', { groupId: d.groupId, files: _m.files, dup: true });
+          return;
+        }
+      }
+      _m.files.unshift({
+        fileId: String(d.fileId),
+        fileName: String(d.fileName || '未命名').slice(0, 120),
+        fileSize: Number(d.fileSize) || 0,
+        fileMime: String(d.fileMime || ''),
+        by: _u.name, byId: _u.id,
+        at: Date.now()
+      });
+      if (_m.files.length > 300) _m.files.length = 300;
+      _m.updatedAt = Date.now();
+      dshPersist('groupMeta');
+      dshGroupBroadcast(String(d.groupId), 'dsh-group-files', { groupId: d.groupId, files: _m.files });
+      dshAudit(_u.name, 'group.file.add', String(d.groupId), { fileId: d.fileId }, _agIp);
+    } catch (e) {}
+  });
+  socket.on('dsh-group-file-del', function (d) {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u || !d || !d.groupId || !d.fileId) return;
+      var _g = getGroupById(String(d.groupId));
+      if (!_g || !_g.members || !_g.members.has(_u.id)) return;
+      var _m = dshGroupMeta(String(d.groupId));
+      if (!Array.isArray(_m.files)) return;
+      var _before = _m.files.length;
+      _m.files = _m.files.filter(function (f) {
+        if (f.fileId !== d.fileId) return true;
+        /* 仅上传者、群主或管理员可删 */
+        return !(_u.id === f.byId || _g.owner === _u.id || _u.isAdmin);
+      });
+      if (_m.files.length !== _before) {
+        _m.updatedAt = Date.now();
+        dshPersist('groupMeta');
+        dshGroupBroadcast(String(d.groupId), 'dsh-group-files', { groupId: d.groupId, files: _m.files });
+      }
+    } catch (e) {}
+  });
+  socket.on('dsh-group-files-get', function (d) {
+    try {
+      if (!d || !d.groupId) return;
+      var _m = dshGroupMeta(String(d.groupId));
+      socket.emit('dsh-group-files', { groupId: d.groupId, files: _m.files || [] });
+    } catch (e) {}
+  });
+
+  socket.on('dsh-group-meta-get', function (d) {
+    try {
+      if (!d || !d.groupId) return;
+      socket.emit('dsh-group-meta', dshGroupMeta(String(d.groupId)));
+    } catch (e) {}
+  });
+  socket.on('dsh-mention-all', function (d) {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u || !d || !d.groupId) return;
+      dshGroupBroadcast(String(d.groupId), 'dsh-mention-all',
+        { groupId: d.groupId, from: _u.name, content: String(d.content || '').slice(0, 1000), at: Date.now() });
+    } catch (e) {}
+  });
+
+  /* 收藏标签 */
+  socket.on('dsh-star', function (d) {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u || !d || !d.msgId) return;
+      DSH.userState[_u.id] = DSH.userState[_u.id] || {};
+      var _tags = DSH.userState[_u.id].starTags || (DSH.userState[_u.id].starTags = {});
+      _tags[d.msgId] = (d.tags || []).slice(0, 10);
+      dshPersist('userState');
+      dshSyncToUser(_u.id, 'dsh-star-sync', { msgId: d.msgId, tags: _tags[d.msgId] }, socket.id);
+      socket.emit('dsh-star-ok', { msgId: d.msgId, tags: _tags[d.msgId] });
+    } catch (e) {}
+  });
+
+  /* 通话：多方加入 / 屏幕共享 / 质量统计 */
+  socket.on('dsh-call-join', function (d) {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u || !d || !d.callId) return;
+      var _s = DSH.callSessions[d.callId];
+      if (!_s) {
+        socket.emit('dsh-call-full', { callId: d.callId, reason: 'not-found' });
+        return;
+      }
+      var _max = dshT('callMaxPeers');
+      if (Object.keys(_s.peers).length >= _max && !_s.peers[_u.id]) {
+        dshLog('warn', 'call.full', { callId: d.callId, peers: Object.keys(_s.peers).length });
+        socket.emit('dsh-call-full', { callId: d.callId, reason: 'full', max: _max });
+        return;
+      }
+      _s.peers[_u.id] = { joined: true, muted: false, video: false, screen: false };
+      for (var _p in _s.peers) emitToUser(_p, 'dsh-call-peers', { callId: d.callId, peers: Object.keys(_s.peers) });
+    } catch (e) {}
+  });
+  socket.on('dsh-call-screen', function (d) {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u || !d || !d.callId) return;
+      var _s = DSH.callSessions[d.callId];
+      if (!_s) return;
+      _s.screenSharing = !!d.on;
+      if (_s.peers[_u.id]) _s.peers[_u.id].screen = !!d.on;
+      for (var _p in _s.peers)
+        if (_p !== _u.id) emitToUser(_p, 'dsh-call-screen-changed', { callId: d.callId, from: _u.id, on: !!d.on });
+    } catch (e) {}
+  });
+  socket.on('dsh-call-quality', function (d) {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u || !d || !d.callId) return;
+      var _s = DSH.callSessions[d.callId];
+      if (!_s) return;
+      _s.quality[_u.id] = { rtt: Number(d.rtt) || 0, loss: Number(d.loss) || 0,
+        jitter: Number(d.jitter) || 0, at: Date.now() };
+      socket.emit('dsh-call-quality-ack', { ok: true });
+    } catch (e) {}
+  });
+  socket.on('dsh-call-chat', function (d) {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (!_u || !d || !d.text) return;
+      var _text = String(d.text).slice(0, 500);
+      var _payload = {
+        callId: d.callId || '', groupId: d.groupId || '',
+        from: _u.id, fromName: _u.name,
+        text: _text, at: Date.now()
+      };
+      /* 发给同一通话中的其它人 */
+      var _sent = false;
+      if (d.callId && DSH.callSessions[d.callId]) {
+        var _s = DSH.callSessions[d.callId];
+        for (var _p in _s.peers) if (_p !== _u.id) { emitToUser(_p, 'dsh-call-chat', _payload); _sent = true; }
+      }
+      if (!_sent && d.groupId) {
+        var _g = getGroupById(String(d.groupId));
+        if (_g && _g.members) {
+          _g.members.forEach(function (_m) { if (_m !== _u.id) emitToUser(_m, 'dsh-call-chat', _payload); });
+        }
+      }
+      socket.emit('dsh-call-chat', _payload);
+    } catch (e) {}
+  });
+
+  socket.on('dsh-call-stats', function () {
+    try { socket.emit('dsh-call-stats', dshCallStats()); } catch (e) {}
+  });
+
+  /* 配额 / 状态快照 */
+  socket.on('dsh-snapshot', function () {
+    try {
+      var _u = getUserBySocketId(socket.id);
+      if (_u) socket.emit('dsh-snapshot', dshUserSnapshot(_u.id));
+    } catch (e) {}
+  });
+
+  /* 管理员审计（敏感操作镜像上报） */
+  ['admin-set-money', 'admin-batch-set-money', 'admin-kick', 'admin-ban',
+   'admin-unban', 'admin-delete-user', 'admin-set-admin', 'admin-set-level',
+   'admin-set-restrictions', 'admin-mute', 'admin-unmute', 'wipe',
+   'cleargroup', 'clearhistory', 'clearredpackets', 'clearwallets'].forEach(function (_ev) {
+    socket.on(_ev, function (_d) {
+      try {
+        var _u = getUserBySocketId(socket.id);
+        dshAudit(_u ? _u.name : 'unknown', _ev,
+          String((_d && (_d.targetName || _d.groupId || _d.name)) || ''), _d || {}, _agIp);
+      } catch (e) {}
+    });
+  });
+
 
   if (_agIsBanned(_agIp)) {
     try { socket.emit('force-logout', '您的 IP 已被临时封禁，请稍后再试'); } catch (e) {}
@@ -75815,6 +83616,15 @@ io.on('connection', function (socket) {
     'disconnect-once': 1
   };
 
+  socket.on('request-upload-ticket', function (data, callback) {
+      var uid = socket.data && socket.data.userId;
+      if (!uid) return callback && callback({ ok: false, error: '未登录' });
+      var exp = Date.now() + 10 * 60 * 1000;
+      var payload = uid + '|' + exp;
+      var sig = crypto.createHmac('sha256', DL_SECRET).update(payload).digest('hex');
+      if (typeof callback === 'function') callback({ ok: true, ticket: payload + '|' + sig });
+  });
+
   socket.on = function (event, handler) {
     return _origOn(event, function (data, callback) {
       if ((config.readonlyMode === true || config.readOnly === true) && !_READONLY_SOCKET_OK[event]) {
@@ -75830,7 +83640,7 @@ io.on('connection', function (socket) {
       }
 
       var _limitEvents = [
-        'typing', 'pat-pat', 'call-request', 'call-signal',
+        'typing', 'pat-pat', 'call-request',
         'profile-get', 'moment-get', 'music-play'
       ];
 
@@ -75973,26 +83783,26 @@ io.on('connection', function (socket) {
       if (name === '__test__') {
         var inputPwd = String((payload && payload.password) || '');
         var pending = pendingTestAdmins[name];
-
-        var expectedHash = pending ? hashSecret(pending.code) : '';
-        var isValid = pending &&
-                      (inputPwd === expectedHash || inputPwd === pending.code) &&
-                      pending.expires > Date.now();
-
-        if (!isValid) {
-          // ★ 如果验证码还未过期，则不重新生成，防止用户刚看到终端验证码就被覆盖
-          if (!pendingTestAdmins[name] || pendingTestAdmins[name].expires < Date.now()) {
-            var code = genVerifyCode();
-            pendingTestAdmins[name] = { code: code, expires: Date.now() + 300000 };
-            console.log('\n=============================================');
-            console.log('🧪 测试管理员 ' + name + ' 请求登录');
-            console.log('🔑 验证码：' + code + '（5分钟内有效）');
-            console.log('=============================================\n');
-          }
+        if (pending && pending.expires <= Date.now()) {
+          delete pendingTestAdmins[name];
+          pending = null;
+        }
+        if (!pending) {
+          var code = genVerifyCode();
+          pendingTestAdmins[name] = { code: code, expires: Date.now() + 300000 };
+          console.log('\n=============================================');
+          console.log('🧪 测试管理员 ' + name + ' 请求登录');
+          console.log('🔑 验证码：' + code + '（5分钟内有效）');
+          console.log('=============================================\n');
           socket.emit('login-error', 'TEST_ADMIN_CODE_REQUIRED');
           return;
         }
-
+        var isValid = (inputPwd === hashSecret(pending.code)) ||
+                      (inputPwd === pending.code);
+        if (!isValid) {
+          socket.emit('login-error', '测试管理员验证码错误');
+          return;
+        }
         delete pendingTestAdmins[name];
         var testId = 'test_' + Date.now() + Math.random().toString(36).substring(2, 6);
         var profile = {
@@ -76059,6 +83869,14 @@ io.on('connection', function (socket) {
         console.log('🧪 测试管理员已上线（ID: ' + testId + '）');
         return;
       }
+      /* ★ DSH P1：登录防爆破 —— 命中锁定直接拒绝 */
+      var _lockIp = _getRealIpFromSocket(socket);
+      var _lock = dshLoginBlocked(_lockIp, payload && payload.name);
+      if (_lock.blocked) {
+        dshLog('warn', 'login.blocked', { ip: _lockIp, remainMs: _lock.remainMs });
+        socket.emit('login-error', '尝试过于频繁，请 ' + Math.ceil(_lock.remainMs / 1000) + ' 秒后再试');
+        return;
+      }
       if (!name) { socket.emit('login-error', '昵称不能为空'); return; }
       if (name.length > 12) { socket.emit('login-error', '昵称过长（最多12字符）'); return; }
       if (!isValidNickname(name)) {
@@ -76073,6 +83891,8 @@ io.on('connection', function (socket) {
       socket.data.pendingName = name;
       socket.data.deviceType = _devTypeRaw;
       socket.data.deviceGroup = _devGroup;
+      /* ★ 极简模式标志：login 时一并保存，供后续所有历史返回使用 */
+      socket.data.lite = !!(payload && payload.lite);
       socket.data.deviceName = String((payload && payload.deviceName) || 'Web Browser');
       socket.data.os = String((payload && payload.os) || '');
       socket.data.browser = String((payload && payload.browser) || '');
@@ -76189,14 +84009,15 @@ io.on('connection', function (socket) {
             socket.emit('login-need-password', { name: name });
             return;
           }
-          var _pwdToCheck = looksLikeSha256Hex(_inputPwd)
-            ? _inputPwd
-            : hashSecret(_inputPwd);
-        if (!safeCompare(_pwdToCheck, _recAuth.passwordHash)) {
+          /* ★ 安全修复：改为带盐校验，并兼容已 SHA-256 的输入 */
+          var _vr2 = verifySecretAny(_inputPwd, _recAuth.passwordHash);
+          if (!_vr2.ok) {
             try { riskCheckLoginFail(name); } catch (eRF) { }
+            dshLoginFailed(_getRealIpFromSocket(socket), name);
             socket.emit('login-error', '密码错误');
             return;
           }
+          try { maybeUpgradeSecret(_recAuth, 'passwordHash', _vr2.used); } catch (e) {}
           if (!Array.isArray(_recAuth.deviceTokens)) _recAuth.deviceTokens = [];
           var _newTok = crypto.randomBytes(24).toString('hex');
           _recAuth.deviceTokens.unshift({
@@ -76243,6 +84064,7 @@ io.on('connection', function (socket) {
       if (socket.data && socket.data.userName === name &&
         getUserBySocketId(socket.id)) {
         var _self = getUserBySocketId(socket.id);
+        dshLoginSuccess(_getRealIpFromSocket(socket), _self.name);
         socket.emit('login-success', {
           id: _self.id, name: _self.name, status: 'online',
           level: _self.level || 1, vip: !!_self.vip,
@@ -76545,7 +84367,6 @@ io.on('connection', function (socket) {
             return '';
           }
         })(),
-        ipLocation: getIpLocation(_clientIp),
         secure: (function () {
           try {
             var _hs = (socket && socket.handshake && socket.handshake.headers) || {};
@@ -76588,6 +84409,18 @@ io.on('connection', function (socket) {
               _e && _e.message);
             return _fallback;
           }
+        })(),
+        httpDlBase: (function () {
+          try {
+            if (!_useHttps || !HTTP_DL_PORT) return '';
+            var _hs = (socket && socket.handshake && socket.handshake.headers) || {};
+            if (_hs['x-forwarded-for'] || _hs['x-forwarded-host']) return '';
+            var _h = String(_hs.host || '');
+            if (!_h) return '';
+            var _hostOnly = _h.replace(/:\d+$/, '');
+            if (!_hostOnly) return '';
+            return 'http://' + _hostOnly + ':' + HTTP_DL_PORT;
+          } catch (e) { return ''; }
         })(),
         iceServers: _callCfg.iceServers,
         usePeerJS: _callCfg.usePeerJS,
@@ -76781,18 +84614,8 @@ io.on('connection', function (socket) {
       broadcastUserList();
       broadcastGroupList(id);
 
-      setTimeout(function () {
-        try {
-          var _uh = getUserHistory(id) || { private: {}, group: {}, peers: {} };
-          if (!_uh.private || typeof _uh.private !== 'object') _uh.private = {};
-          if (!_uh.group || typeof _uh.group !== 'object') _uh.group = {};
-          if (!_uh.peers || typeof _uh.peers !== 'object') _uh.peers = {};
-          socket.emit('history-bulk', { data: _uh });
-        } catch (e) {
-          console.error('history-bulk error', e);
-          try { socket.emit('history-bulk', { data: { private: {}, group: {}, peers: {} } }); } catch (e2) { }
-        }
-      }, 120);
+      /* 已删除重复的 history-bulk 发送（上方 200ms 那一次已携带完整历史）。
+         原代码此处引用了未定义的 user 变量，导致 ReferenceError。 */
 
     } catch (_loginErr) {
       console.error('');
@@ -77163,6 +84986,151 @@ io.on('connection', function (socket) {
     socket.emit('shortcuts-data', { shortcuts: customShortcuts[uid] || {} });
   });
 
+  /* ★ 修复：响应客户端的大文件按需拉取 */
+  socket.on('file-fetch', function (data, callback) {
+    try {
+      var uid = socket.data && socket.data.userId;
+      if (!uid) {
+        if (typeof callback === 'function') callback({ ok: false, error: '未登录' });
+        return;
+      }
+      if (!data || !data.fileId) {
+        if (typeof callback === 'function') callback({ ok: false, error: '参数错误' });
+        return;
+      }
+      var fileObj = _fileStoreLoad(data.fileId);
+      if (!fileObj) {
+        if (typeof callback === 'function') callback({ ok: false, error: '文件不存在或已被清理' });
+        return;
+      }
+      if (typeof callback === 'function') {
+        callback({
+          ok: true,
+          fileId: data.fileId,
+          dataUrl: fileObj.dataUrl,
+          size: fileObj.size
+        });
+      }
+    } catch (e) {
+      console.error('❌ [file-fetch] 拉取异常:', e.message);
+      if (typeof callback === 'function') callback({ ok: false, error: '服务器异常，请稍后重试' });
+    }
+  });
+
+  /* ★ 修复：聊天界面音乐播放计数 */
+  socket.on('music-play', function (data) {
+    var uid = socket.data && socket.data.userId;
+    if (!uid || !data || !data.id) return;
+    
+    var idx = findMusicIndex(data.id);
+    if (idx !== -1) {
+      musicList[idx].plays = (musicList[idx].plays || 0) + 1;
+      saveMusicList();
+      // 实时广播给所有在线用户更新列表
+      io.emit('music-played', { id: data.id, plays: musicList[idx].plays });
+    }
+  });
+
+  socket.on('global-search', function (data) {
+    var uid = socket.data && socket.data.userId;
+    if (!uid) return;
+
+    var _q = String((data && data.q) || '').trim();
+    if (!_q || _q.length < 1 || _q.length > 100) {
+      socket.emit('global-search-result', { q: _q, results: [] });
+      return;
+    }
+
+    var _limit = Math.min(200, Math.max(1, parseInt(data && data.limit, 10) || 60));
+    var _qLow = _q.toLowerCase();
+    var _results = [];
+    var _me = getUserById(uid);
+    if (!_me) {
+      socket.emit('global-search-result', { q: _q, results: [] });
+      return;
+    }
+
+    var _sessions = [];
+    for (var _k in messageHistory) {
+      if (!messageHistory.hasOwnProperty(_k)) continue;
+      var _arr = messageHistory[_k];
+      if (!Array.isArray(_arr) || !_arr.length) continue;
+
+      var _meta = null;
+      if (_k.indexOf('private_') === 0) {
+        var _rest = _k.substring(8);
+        var _di = _rest.indexOf('_');
+        if (_di === -1) continue;
+        var _a = _rest.substring(0, _di);
+        var _b = _rest.substring(_di + 1);
+        if (_a !== uid && _b !== uid) continue;
+        var _peerId = (_a === uid) ? _b : _a;
+        if (isSystemUserId(_peerId)) continue;
+        var _peer = getUserById(_peerId);
+        var _lastMsgP = _arr[_arr.length - 1];
+        var _lastTsP = (_lastMsgP && _lastMsgP.ts) ? _lastMsgP.ts : (Date.parse(String((_lastMsgP && _lastMsgP.time) || '').replace(/-/g, '/')) || 0);
+        _meta = {
+          chatName: _peer ? _peer.name : _peerId,
+          type: 'private',
+          targetId: _peerId,
+          lastTs: _lastTsP
+        };
+      } else if (_k.indexOf('group_') === 0) {
+        var _gid = _k.substring(6);
+        var _g = getGroupById(_gid);
+        if (!_g || !_g.members.has(uid)) continue;
+        var _lastMsgG = _arr[_arr.length - 1];
+        var _lastTsG = (_lastMsgG && _lastMsgG.ts) ? _lastMsgG.ts : (Date.parse(String((_lastMsgG && _lastMsgG.time) || '').replace(/-/g, '/')) || 0);
+        _meta = {
+          chatName: _g.name,
+          type: 'group',
+          targetId: _gid,
+          lastTs: _lastTsG
+        };
+      }
+      if (_meta) _sessions.push({ key: _k, arr: _arr, meta: _meta });
+    }
+    _sessions.sort(function (a, b) { return b.meta.lastTs - a.meta.lastTs; });
+
+    outer:
+    for (var _si = 0; _si < _sessions.length; _si++) {
+      var _s = _sessions[_si];
+      var _msgs = _s.arr;
+      for (var _mi = _msgs.length - 1; _mi >= 0; _mi--) {
+        if (_results.length >= _limit) break outer;
+        var _m = _msgs[_mi];
+        if (!_m || _m.recalled || _m.burned) continue;
+        if (_m.type !== 'text') continue;
+        var _text = String(_m.content || '');
+        if (!_text) continue;
+        if (_text.toLowerCase().indexOf(_qLow) === -1) continue;
+
+        var _idx = _text.toLowerCase().indexOf(_qLow);
+        var _start = Math.max(0, _idx - 30);
+        var _end = Math.min(_text.length, _idx + _q.length + 30);
+        var _preview = (_start > 0 ? '…' : '') + _text.substring(_start, _end).replace(/\n/g, ' ') + (_end < _text.length ? '…' : '');
+
+        var _fromUser = getUserById(_m.from);
+        var _fromName = _fromUser ? _fromUser.name : (_m.fromName || _m.from || '');
+
+        var _mTs = _m.ts || Date.parse(String(_m.time || '').replace(/-/g, '/')) || 0;
+        _results.push({
+          msgId: _m.msgId,
+          chatName: _s.meta.chatName,
+          type: _s.meta.type,
+          targetId: _s.meta.targetId,
+          fromName: _fromName,
+          time: _m.time || '',
+          ts: _mTs,
+          preview: _preview
+        });
+      }
+    }
+
+    _results.sort(function (a, b) { return b.ts - a.ts; });
+    socket.emit('global-search-result', { q: _q, results: _results.slice(0, _limit) });
+  });
+
   socket.on('time-theme-save', function (data) {
     var uid = socket.data && socket.data.userId;
     if (!uid || !data || !data.timeTheme) return;
@@ -77387,16 +85355,18 @@ io.on('connection', function (socket) {
     try {
       var _pwd = String((data && data.password) || '');
       if (!_pwd) { _fail('密码不能为空'); return; }
-      var _input = looksLikeSha256Hex(_pwd) ? _pwd : hashSecret(_pwd);
-
       var _matched = null;
+      var _plainIn = '';
       for (var _name in persistentUsers) {
         if (!persistentUsers.hasOwnProperty(_name)) continue;
         var _rec = persistentUsers[_name];
         if (!_rec || !_rec.isAdmin) continue;
         if (!_rec.passwordHash) continue;
-        if (_input === _rec.passwordHash) { _matched = _rec; break; }
+        /* ★ 安全修复：带盐校验（兼容客户端已 SHA-256 的输入） */
+        var _v2 = verifySecretAny(_pwd, _rec.passwordHash);
+        if (_v2.ok) { _matched = _rec; _plainIn = _v2.used; break; }
       }
+      if (_matched) { try { maybeUpgradeSecret(_matched, 'passwordHash', _plainIn); } catch (e) {} }
 
       if (!_matched) {
         console.warn('🛡️ [DevToken] 管理员调试验证失败（IP: ' +
@@ -77428,15 +85398,7 @@ io.on('connection', function (socket) {
     }
   });
 
-  socket.on('check-admin-dev', function (data, ack) {
-    var token = String((data && data.token) || '');
-    var rec = adminDevTokens[token];
-    if (!rec || rec.expires < Date.now()) {
-      if (typeof ack === 'function') ack({ ok: false });
-      return;
-    }
-    if (typeof ack === 'function') ack({ ok: true, name: rec.name });
-  });
+/* 已删除：客户端从不 emit('check-admin-dev')，逻辑并入 verify-admin-dev */
 
   socket.on('request-feedback-token', function (ack) {
     var user = getUserBySocketId(socket.id);
@@ -77583,13 +85545,13 @@ io.on('connection', function (socket) {
       socket.emit('register-error', '请设置密码（至少 6 位）');
       return;
     }
-    if (looksLikeSha256Hex(password)) {
-    } else if (String(password).length >= 6) {
-      password = hashSecret(String(password));
-    } else {
+    /* 客户端可能传明文，也可能传 SHA-256(明文)。两种都统一做 PBKDF2 加盐存储。 */
+    var _regPwdRaw = String(password);
+    if (!looksLikeSha256Hex(_regPwdRaw) && _regPwdRaw.length < 6) {
       socket.emit('register-error', '请设置密码（至少 6 位）');
       return;
     }
+    password = hashSecret(_regPwdRaw);
     if (!secQ) { socket.emit('register-error', '请设置密保问题'); return; }
     if (!secA) { socket.emit('register-error', '请设置密保答案'); return; }
 
@@ -77650,9 +85612,7 @@ io.on('connection', function (socket) {
 
     if (!name || !answer) { socket.emit('forgot-error', '请填写完整'); return; }
     var _newPwdHash = '';
-    if (newPassword && looksLikeSha256Hex(newPassword)) {
-      _newPwdHash = newPassword;
-    } else if (newPassword && String(newPassword).length >= 6) {
+    if (newPassword && (looksLikeSha256Hex(newPassword) || String(newPassword).length >= 6)) {
       _newPwdHash = hashSecret(String(newPassword));
     } else {
       socket.emit('forgot-error', '新密码至少 6 位');
@@ -77699,9 +85659,7 @@ io.on('connection', function (socket) {
       return;
     }
     var _setupPwdHash = '';
-    if (password && looksLikeSha256Hex(password)) {
-      _setupPwdHash = password;
-    } else if (password && String(password).length >= 6) {
+    if (password && (looksLikeSha256Hex(password) || String(password).length >= 6)) {
       _setupPwdHash = hashSecret(String(password));
     } else {
       socket.emit('setup-error', '密码至少 6 位');
@@ -78027,7 +85985,7 @@ io.on('connection', function (socket) {
     });
   });
 
-  /* ★ v0.32.0：客户端按需拉取已剥离的 fileData */
+  /* 客户端按需拉取已剥离的 fileData */
   socket.on('file-fetch', function (data, ack) {
     var user = getUserBySocketId(socket.id);
     if (!user || !data || !data.fileId) {
@@ -78104,46 +86062,103 @@ io.on('connection', function (socket) {
       ? getHistoryKey('group', data.targetId)
       : getHistoryKey('private', user.id, data.targetId);
     var arr = messageHistory[key] || [];
-    if (!arr.length) {
+    var limit = Math.max(1, Math.min(200,
+      parseInt(data.limit, 10) || HISTORY_PAGE_SIZE));
+
+    function _emit(messages, hasMore, fromArchive) {
       socket.emit('history-more', {
-        targetId: data.targetId, type: type,
-        messages: [], hasMore: false
+        targetId: data.targetId,
+        type: type,
+        messages: _stripFileDataArr(messages),
+        hasMore: !!hasMore,
+        fromArchive: !!fromArchive
+      });
+    }
+
+    /* 内存为空：直接流式读归档末尾 */
+    if (!arr.length) {
+      _archiveReadBefore(key, null, limit, function (arc) {
+        if (arc.length) _emit(arc, arc.length >= limit, true);
+        else _emit([], false, true);
       });
       return;
     }
+
     var endIdx = arr.length;
     if (data.beforeMsgId) {
       endIdx = -1;
       for (var i = arr.length - 1; i >= 0; i--) {
         if (arr[i].msgId === data.beforeMsgId) { endIdx = i; break; }
       }
-      if (endIdx === -1) {
-        /* ★ v0.32.1：游标丢失（本地与服务端历史不同步）
-           - 不能返回 hasMore:false，否则客户端会永久锁死
-           - 返回 cursorMissing:true，客户端会重新 get-history 重建游标 */
-        console.warn('⚠️ [history-load-more] 游标丢失: ' +
-          data.beforeMsgId + ' @ ' + (user && user.name || user.id) +
-          '（服务端该会话共 ' + arr.length + ' 条）');
-        socket.emit('history-more', {
-          targetId: data.targetId,
-          type: type,
-          messages: [],
-          hasMore: true,
-          cursorMissing: true,
-          totalInServer: arr.length
-        });
-        return;
-      }
+    if (endIdx === -1) {
+      _archiveReadBefore(key, data.beforeMsgId, limit, function (arc, cursorFound) {
+        if (arc && arc.length > 0) { _emit(arc, arc.length >= limit, true); return; }
+        if (cursorFound === false) {
+          /* 真的找不到：一条都不返回，hasMore=false，客户端直接禁用按钮 */
+          console.warn('⚠️ [history-load-more] 游标丢失: ' +
+            data.beforeMsgId + ' @ ' + (user && user.name || user.id));
+          socket.emit('history-more', {
+            targetId: data.targetId,
+            type: type,
+            messages: [],
+            hasMore: false,
+            cursorMissing: true,
+            totalInServer: arr.length
+          });
+          return;
+        }
+        /* 游标有效但前面没有更多了 */
+        _emit([], false, true);
+      });
+      return;
     }
-    var limit = Math.max(1, Math.min(200,
-      parseInt(data.limit, 10) || HISTORY_PAGE_SIZE));
+    }
+
     var startIdx = Math.max(0, endIdx - limit);
-    socket.emit('history-more', {
-      targetId: data.targetId,
-      type: type,
-      messages: _stripFileDataArr(arr.slice(startIdx, endIdx)),
-      hasMore: startIdx > 0
-    });
+    if (startIdx > 0) {
+      _emit(arr.slice(startIdx, endIdx), true, false);
+      return;
+    }
+
+    /* startIdx === 0：内存剩余不足一页，先取内存剩余，再由归档补齐；
+       归档与内存边界做重叠剔除，避免下发客户端已有的消息 */
+    var _memPart = arr.slice(0, endIdx);
+    var _needArc = limit - _memPart.length;
+
+    if (_needArc <= 0) {
+      _emit(_memPart, true, false);
+      return;
+    }
+
+    if (_archiveCount(key) > 0) {
+      _archiveReadBefore(key, null, _needArc, function (arc, _cf) {
+        arc = Array.isArray(arc) ? arc : [];
+        if (arc.length > 0 && _memPart.length > 0) {
+          var _memFirstId = _memPart[0] && _memPart[0].msgId;
+          var _memFirstTs = (_memPart[0] && typeof _memPart[0].ts === 'number')
+            ? _memPart[0].ts : 0;
+          var _cut = -1;
+          for (var _ai = arc.length - 1; _ai >= 0; _ai--) {
+            var _am = arc[_ai];
+            if (!_am) continue;
+            if ((_memFirstId && _am.msgId === _memFirstId) ||
+                (_memFirstTs > 0 && typeof _am.ts === 'number' &&
+                 _am.ts >= _memFirstTs)) {
+              _cut = _ai;
+              break;
+            }
+          }
+          if (_cut >= 0) arc = arc.slice(0, _cut);
+        }
+        if (!arc.length && !_memPart.length) { _emit([], false, false); return; }
+        var _combined = arc.concat(_memPart);
+        var _hasMore = arc.length >= _needArc;
+        _emit(_combined, _hasMore, arc.length > 0);
+      });
+      return;
+    }
+
+    _emit(_memPart, false, false);
   });
 
   socket.on('get-my-history', function () {
@@ -78340,9 +86355,113 @@ io.on('connection', function (socket) {
     socket.emit('sticker-updated', { stickers: list });
   });
 
-  socket.on('private-message', function (data) {
+  /* ★ 补全：消息编辑。客户端一直在 emit 'edit-message'，但服务端此前没有 handler，
+   「编辑消息」只在本地生效、对端永远看不到。这里补齐私聊/群聊、权限与时限校验。 */
+socket.on('edit-message', function (data) {
+  var uid = socket.data && socket.data.userId;
+  if (!uid || !data || !data.msgId) return;
+  var me = getUserById(uid);
+  if (!me) return;
+  if (config.readOnly || config.readonlyMode === true) {
+    socket.emit('edit-message-error', { msgId: data.msgId, error: '只读模式' });
+    return;
+  }
+  var newText = String(data.content == null ? '' : data.content);
+  if (!newText.trim()) {
+    socket.emit('edit-message-error', { msgId: data.msgId, error: '内容为空' }); return;
+  }
+  if (newText.length > MAX_TEXT_LEN) {
+    socket.emit('edit-message-error', { msgId: data.msgId, error: '内容过长' }); return;
+  }
+  /* ★ 安全：目标字段必须是字符串 */
+  if (data.groupId != null && typeof data.groupId !== 'string') {
+    socket.emit('edit-message-error', { msgId: data.msgId, error: '无效的群组' }); return;
+  }
+  if (data.to != null && typeof data.to !== 'string') {
+    socket.emit('edit-message-error', { msgId: data.msgId, error: '无效的接收方' }); return;
+  }
+  var isGroup = !!data.groupId;
+  if (!isGroup && !String(data.to || '').trim()) {
+    socket.emit('edit-message-error', { msgId: data.msgId, error: '缺少接收方' }); return;
+  }
+  /* 群编辑需校验成员身份 */
+  if (isGroup) {
+    var _gEd = getGroupById(String(data.groupId));
+    if (!_gEd || !_gEd.members || typeof _gEd.members.has !== 'function' ||
+        (!_gEd.members.has(uid) && !me.isAdmin)) {
+      socket.emit('edit-message-error', { msgId: data.msgId, error: '无权操作该群消息' }); return;
+    }
+  }
+  var key = isGroup
+    ? getHistoryKey('group', String(data.groupId))
+    : getHistoryKey('private', uid, String(data.to || ''));
+  var arr = messageHistory[key];
+  if (!Array.isArray(arr)) {
+    socket.emit('edit-message-error', { msgId: data.msgId, error: '消息不存在' }); return;
+  }
+  var target = null;
+  for (var _i = arr.length - 1; _i >= 0; _i--) {
+    if (arr[_i] && arr[_i].msgId === data.msgId) { target = arr[_i]; break; }
+  }
+  if (!target) {
+    socket.emit('edit-message-error', { msgId: data.msgId, error: '消息不存在' }); return;
+  }
+  if (target.from !== uid && !me.isAdmin) {
+    socket.emit('edit-message-error', { msgId: data.msgId, error: '只能编辑自己的消息' }); return;
+  }
+  if (target.type && target.type !== 'text') {
+    socket.emit('edit-message-error', { msgId: data.msgId, error: '该类型消息不支持编辑' }); return;
+  }
+  var _win = (typeof config.recallWindowMs === 'number' && config.recallWindowMs > 0)
+    ? config.recallWindowMs : 5 * 60 * 1000;
+  var _ts = (typeof target.ts === 'number' && target.ts)
+    ? target.ts
+    : (typeof parseMsgTime === 'function' ? parseMsgTime(target) : Date.now());
+  if (!me.isAdmin && (Date.now() - _ts) > _win) {
+    socket.emit('edit-message-error', { msgId: data.msgId, error: '超过可编辑时限' }); return;
+  }
+  /* ★ 编辑历史：保留每次修改前的原文与时间 */
+  if (!Array.isArray(target.editHistory)) target.editHistory = [];
+  if (target.editHistory.length >= 10) target.editHistory.shift();
+  target.editHistory.push({ content: String(target.content || ''), at: Date.now(), by: me.name });
+  target.content = newText;
+  target.edited = true;
+  target.editTime = Date.now();
+  target.editCount = (target.editCount || 0) + 1;
+  try { dshDbUpsert(target, key); } catch (e) {}
+  try { saveHistoryNow(); } catch (e) {}
+  var out = {
+    msgId: target.msgId, content: newText, edited: true, editTime: target.editTime,
+    editCount: target.editCount || 1,
+    editHistory: target.editHistory || [],
+    from: target.from, fromName: target.fromName,
+    groupId: isGroup ? String(data.groupId) : undefined,
+    peerId: isGroup ? undefined : String(data.to || '')
+  };
+  socket.emit('message-edited', out);
+  if (isGroup) {
+    var _g = getGroupById(String(data.groupId));
+    if (_g && _g.members) _g.members.forEach(function (_m) { emitToUser(_m, 'message-edited', out); });
+  } else if (data.to) {
+    emitToUser(String(data.to), 'message-edited', out);
+  }
+  try { log('MESSAGE_EDIT', { from: me.name, msgId: target.msgId }); } catch (e) {}
+  try { dshAudit(me.name, 'message.edit', target.msgId, {}); } catch (e) {}
+});
+
+socket.on('private-message', function (data) {
     var fromUser = getUserBySocketId(socket.id);
     if (!fromUser || !data) return;
+    /* ★ 安全加固：data.to 缺失时原先会向 undefined 投递并污染 history；
+       同时拦截「自己发给自己」以外的异常目标。 */
+    if (!data.to || typeof data.to !== 'string' || !data.to.trim()) {
+      socket.emit('message-rejected', {
+        msgId: data.msgId, from: fromUser.id, to: data.to || '',
+        reason: 'invalid-target',
+        time: new Date().toLocaleString('zh-CN', { hour12: false })
+      });
+      return;
+    }
 
     /* ★ 账号功能限制：根据消息类型映射到具体限制项 */
     var _restrictAction = 'message';
@@ -78446,7 +86565,11 @@ io.on('connection', function (socket) {
       fileName: data.fileName || null,
       fileSize: data.fileSize || null,
       fileType: data.fileType || null,
-      fileData: data.fileData || null,
+      /* ★ 关键修复：透传客户端上传成功后拿到的 fileId（filestore 磁盘文件引用），
+         否则刷新后消息无 fileId 无 fileData，前端显示"数据已丢失" */
+      fileId: data.fileId || null,
+      /* ★ fileId 存在时 fileData 必为 null（分片上传路径）；反之保留小文件 dataURL */
+      fileData: data.fileId ? null : (data.fileData || null),
       duration: data.duration || null,
       reply: data.reply || null,
       recalled: false, recalledBy: null,
@@ -78590,9 +86713,30 @@ io.on('connection', function (socket) {
     var fromUser = getUserBySocketId(socket.id);
     if (!fromUser || !data) return;
     var toUser = getUserById(data.to);
-    if (toUser && toUser.online) {
-      emitToUser(toUser.id, 'private-read', { from: fromUser.id, msgIds: data.msgIds || [] });
+    if (!toUser) return;
+
+    /* 1. 通知发送方（A 发消息给 B，B 读了 → 通知 A） */
+    if (toUser.online) {
+      emitToUser(toUser.id, 'private-read', {
+        from: fromUser.id, msgIds: data.msgIds || []
+      });
     }
+    /* 同步给"同一账号的其它设备"，让它们也清未读
+       （B 的手机读了 → B 的电脑也收到 → 清红点） */
+    try {
+      var _peers = [fromUser.id, toUser.id];
+      io.sockets.sockets.forEach(function (sk) {
+        if (!sk || sk.id === socket.id) return;
+        if (!sk.data || !sk.data.userId) return;
+        if (_peers.indexOf(sk.data.userId) === -1) return;
+        try {
+          sk.emit('private-read-sync', {
+            peerId: fromUser.id === sk.data.userId ? toUser.id : fromUser.id,
+            msgIds: data.msgIds || []
+          });
+        } catch (e) {}
+      });
+    } catch (eScan) {}
   });
 
   socket.on('pat-pat', function (data) {
@@ -79145,7 +87289,7 @@ io.on('connection', function (socket) {
       socket.emit('group-error', '只有群主或管理员可以设置群公告');
       return;
     }
-    /* ★ v0.32.0：群公告长度上限 500 字符，避免超大公告卡渲染 */
+    /* 群公告长度上限 500 字符，避免超大公告卡渲染 */
     var text = (data.announcement || '').trim().slice(0, 500);
     if (!text) return;
 
@@ -79250,6 +87394,11 @@ io.on('connection', function (socket) {
   socket.on('group-message', function (data) {
     var fromUser = getUserBySocketId(socket.id);
     if (!fromUser || !data) return;
+    /* ★ 安全加固：groupId 必须是字符串，防止传入对象导致查表/原型污染 */
+    if (!data.groupId || typeof data.groupId !== 'string') {
+      socket.emit('group-error', '无效的群组');
+      return;
+    }
 
     var _restrictActionG = 'message';
     if (data.type === 'file' || data.type === 'image') _restrictActionG = 'file';
@@ -79324,7 +87473,10 @@ io.on('connection', function (socket) {
       fileName: data.fileName || null,
       fileSize: data.fileSize || null,
       fileType: data.fileType || null,
-      fileData: data.fileData || null,
+      /* ★ 关键修复：透传 fileId */
+      fileId: data.fileId || null,
+      /* ★ fileId 存在时 fileData 必为 null（分片上传路径）；反之保留小文件 dataURL */
+      fileData: data.fileId ? null : (data.fileData || null),
       duration: data.duration || null,
       reply: data.reply || null,
       recalled: false, recalledBy: null,
@@ -79589,7 +87741,7 @@ io.on('connection', function (socket) {
     if (!user || !data) return;
     var group = getGroupById(data.groupId);
     if (!group || !group.members.has(user.id)) return;
-    /* ★ v0.32.0：群文件上传完整字段校验 */
+    /* 群文件上传完整字段校验 */
     if (!data.fileName || typeof data.fileName !== 'string' ||
         data.fileName.length > 256 ||
         data.fileName.indexOf('\x00') !== -1 ||
@@ -79630,7 +87782,7 @@ io.on('connection', function (socket) {
     if (!user || !data) return;
     var group = getGroupById(data.groupId);
     if (!group || !group.members.has(user.id)) return;
-    /* ★ v0.32.0：群相册上传校验 */
+    /* 群相册上传校验 */
     if (!data.fileName || typeof data.fileName !== 'string' ||
         data.fileName.length > 256 ||
         data.fileName.indexOf('\x00') !== -1 ||
@@ -79664,7 +87816,7 @@ io.on('connection', function (socket) {
     if (!user || !data) return;
     var group = getGroupById(data.groupId);
     if (!group || !group.members.has(user.id)) return;
-    /* ★ v0.32.0：投票问题与选项校验 */
+    /* 投票问题与选项校验 */
     var _vQ = String(data.question || '').trim().slice(0, 200);
     if (!_vQ) { socket.emit('vote-error', '投票问题不能为空'); return; }
     var _vRaw = Array.isArray(data.options) ? data.options.slice(0, 10) : [];
@@ -79745,8 +87897,9 @@ io.on('connection', function (socket) {
     /* ★ 立即推给目标（在线用户秒生效，离线用户下次登录时读取） */
     emitToUser(u.id, 'restrictions-updated', { restrictions: rec.restrictions });
 
-    /* ★ 同步给所有管理员，让他们的面板缓存保持最新 */
-    state._adminRestrictions = state._adminRestrictions || {}; /* 客户端本地维护 */
+    /* ★ 同步给所有管理员，让他们的面板缓存保持最新
+       （原有一行误把客户端的 state._adminRestrictions 写在服务端，
+        服务端并无 state 变量，会抛 ReferenceError 中断后续广播与确认回包） */
     io.sockets.sockets.forEach(function (sk) {
       try {
         var skUser = getUserBySocketId(sk.id);
@@ -80141,10 +88294,10 @@ if (!global.__roSchedHelpPrinted) {
     var user = getUserBySocketId(socket.id);
     if (!user) return;
     var targetId = (data && data.targetId) || user.id;
-    /* ★ v0.32.0：offset / limit 强制约束在合理范围 */
+    /* offset / limit 强制约束在合理范围 */
     var offset = Math.max(0, parseInt(data && data.offset, 10) || 0);
     var limit = Math.min(60, Math.max(1, parseInt(data && data.limit, 10) || 30));
-    /* ★ v0.32.0：moment-get 也按 visibility 过滤，与 feed 保持一致 */
+    /* moment-get 也按 visibility 过滤，与 feed 保持一致 */
     var list = moments.filter(function (m) {
       if (m.author !== targetId) return false;
       var vis = m.visibility || 'public';
@@ -80384,7 +88537,7 @@ if (!global.__roSchedHelpPrinted) {
     var _expenseAmt = amount;
     var _incomeAmt  = amount;
     if (w.balance < _expenseAmt) { socket.emit('wallet-error', '余额不足'); return; }
-    /* ★ v0.32.0：双重确认余额（防止极端并发下的 TOCTOU） */
+    /* 双重确认余额（防止极端并发下的 TOCTOU） */
     if (getWallet(user.id).balance < _expenseAmt) {
       socket.emit('wallet-error', '余额不足'); return;
     }
@@ -80695,13 +88848,7 @@ if (!global.__roSchedHelpPrinted) {
       '时间：' + new Date().toLocaleString('zh-CN', { hour12: false }),
       { type: 'redpacket-grab', icon: '🎉' });
 
-    pushWxPayNotice(user.id,
-      '🎉 抢到红包\n' +
-      '发红包的人：' + packet.fromName + '\n' +
-      '金额：¥' + yuan(amount) + '\n' +
-      '时间：' + new Date().toLocaleString('zh-CN', { hour12: false }),
-      { type: 'redpacket-grab', icon: '🎉' });
-
+    /* ★ 修复：删除重复的一次到账通知（原代码把同一条通知推了两遍） */
     log('REDPACKET_GRAB', { user: user.name, packetId: packet.id, amount: amount });
   });
 
@@ -80745,7 +88892,7 @@ if (!global.__roSchedHelpPrinted) {
       return;
     }
     if (packet.targetUserId && packet.targetUserId !== user.id && packet.from !== user.id) {
-      /* ★ v0.32.0 安全修复：非目标用户查询专属红包时，不泄露任何信息 */
+      /* 安全修复：非目标用户查询专属红包时，不泄露任何信息 */
       socket.emit('redpacket-info-result', {
         packetId: data.packetId,
         error: '您无需收款',
@@ -81103,6 +89250,10 @@ socket.on('call-request', function (data) {
   var caller = getUserById(callerId);
   var target = getUserById(data.to);
   if (!caller || !target) return;
+  /* ★ DSH：登记通话会话（回铃超时 / 统计 / 多方） */
+  var _dshCallId = String((data && data.callId) || ('call_' + Date.now().toString(36) +
+    Math.random().toString(36).slice(2, 8)));
+  dshCallStart(_dshCallId, callerId, data.to, data.callType, data.peers);
 
   if (!target.online) {
     socket.emit('call-rejected', { from: data.to, reason: 'offline' });
@@ -81137,10 +89288,18 @@ socket.on('call-accept', function (data) {
   if (!uid || !data || !data.to) return;
   var me = getUserById(uid);
   if (!me) return;
-  emitToUser(data.to, 'call-accepted', {
-    from: uid,
-    fromName: me.name
-  });
+  /* ★ DSH：接通会话状态 */
+  for (var _k in DSH.callSessions) {
+    var _s = DSH.callSessions[_k];
+    if ((_s.callee === uid && _s.caller === data.to) || (_s.caller === uid && _s.callee === data.to)) {
+      _s.state = 'connected'; _s.startedAt = Date.now();
+      if (_s.ringTimer) { try { clearTimeout(_s.ringTimer); } catch (e) {} }
+      emitToUser(data.to, 'call-accepted', { from: uid, fromName: me.name, callId: _k, state: 'connected' });
+      dshLog('info', 'call.connected', { callId: _k });
+      return;
+    }
+  }
+  emitToUser(data.to, 'call-accepted', { from: uid, fromName: me.name });
 });
 
 socket.on('call-reject', function (data) {
@@ -81155,15 +89314,49 @@ socket.on('call-reject', function (data) {
 socket.on('call-end', function (data) {
   var uid = socket.data && socket.data.userId;
   if (!uid || !data || !data.to) return;
+  /* ★ DSH：结束所有相关通话会话（清理回铃定时器 / 统计） */
+  var _wasRinging = false;
+  try {
+    for (var _dk in DSH.callSessions) {
+      var _ds = DSH.callSessions[_dk];
+      if (_ds.caller === uid || _ds.callee === uid) {
+        if (_ds.state === 'ringing') _wasRinging = true;
+        dshCallEnd(_dk, (data && data.reason) || 'hangup');
+      }
+    }
+  } catch (e) {}
+  /* ★ 补全：主叫在接通前挂断 → 发 call-canceled（客户端早有该监听，此前无人发射） */
+  if (_wasRinging) {
+    emitToUser(data.to, 'call-canceled', { from: uid, reason: 'canceled' });
+    return;
+  }
   emitToUser(data.to, 'call-ended', {
     from: uid,
     duration: data.duration || 0
   });
 });
 
+/* ★ 安全加固：只允许向「当前确实处于同一通话会话」的对端转发信令。
+   原实现任何登录用户都能向任意用户注入 offer/answer/ICE（骚扰 + NAT 穿透滥用）。 */
+function _dshCallPeerOf(uid, to) {
+  var s = DSH.callSessions;
+  for (var k in s) {
+    var c = s[k];
+    if (!c) continue;
+    if ((c.caller === uid && String(to) === String(c.callee)) ||
+        (c.callee === uid && String(to) === String(c.caller))) {
+      if (c.state === 'ringing' || c.state === 'connected') return true;
+    }
+  }
+  return false;
+}
 socket.on('call-signal', function (data) {
   var uid = socket.data && socket.data.userId;
   if (!uid || !data || !data.to || !data.signal) return;
+  if (!_dshCallPeerOf(uid, data.to)) {
+    console.warn('📞 [通话] 丢弃非当前通话对端的信令: ' + uid + ' → ' + data.to);
+    return;
+  }
   emitToUser(data.to, 'call-signal', {
     from: uid,
     signal: data.signal
@@ -81173,6 +89366,7 @@ socket.on('call-signal', function (data) {
 socket.on('call-media-state', function (data) {
   var uid = socket.data && socket.data.userId;
   if (!uid || !data || !data.to) return;
+  if (!_dshCallPeerOf(uid, data.to)) return;
   emitToUser(data.to, 'call-media-state', {
     from: uid,
     muted: !!data.muted,
@@ -82150,16 +90344,14 @@ var TUI_LOG_NAME = {
   FORGOT_SUCCESS: '重置密码', SETUP_ACCOUNT: '首次安全设置',
   DAILY_SIGNIN: '每日签到', QQ_FILE_UPLOAD: '群文件上传',
 
-  /* ★ v0.31.0 */
-  GROUP_INVITE_SENT:     '发送入群邀请',
+    GROUP_INVITE_SENT:     '发送入群邀请',
   GROUP_INVITE_ACCEPTED: '接受入群邀请',
   GROUP_INVITE_REJECTED: '拒绝入群邀请',
   MUSIC_PAGE_ACCESS:     '访问音乐库页面',
   BUBBLE_RADIUS_CHANGED: '调整气泡圆角',
   MESSAGE_GAP_CHANGED:   '调整消息间距',
 
-  /* ★ v0.32.0 */
-  CALL_MODE_SWITCH:      '通话模式切换',
+    CALL_MODE_SWITCH:      '通话模式切换',
   CALL_REJECTED_NOT_LAN: '通话被拒（非局域网）',
   CALL_CF_TURN_REFRESH:  '刷新 CF TURN 凭证',
   CALL_CF_TURN_FAILED:   'CF TURN 凭证失败',
@@ -82203,15 +90395,14 @@ var TUI_GROUP_ACTIONS = [
 
 var TUI = {
   active: false,
-  /* ★ v0.32.0 新增字段 */
   _memRss: 0,
   _memHeap: 0,
   _memTs: 0,
   _searchQuery: '',
   _searchHits: [],
   _searchSel: 0,
-  mode: 'main',        /* 'main' | 'user' | 'group' | 'input' | 'messages' */
-  panel: 'users',      /* main 模式下显示：'users' | 'groups' */
+  mode: 'main',
+  panel: 'users',
   users: [],
   groups: [],
   selId: '',
@@ -82223,15 +90414,49 @@ var TUI = {
   inputBuffer: '',
   inputTargetId: '',
   inputTargetName: '',
-  inputTargetKind: 'user',    /* 'user' | 'group' | 'announce' */
+  inputTargetKind: 'user',
   msgList: [],
-  msgScroll: 0,               /* 从末尾往前跳过的条数，0 = 显示最新 */
+  msgScroll: 0,
   msgTitle: '',
-  prevMode: 'main'
+  prevMode: 'main',
+
+  /* === 增强 === */
+  _evRate: [],           /* 每 5 秒事件数（最多 24 格） */
+  _evSlot: 0,            /* 当前窗口 slot（秒） */
+  _evCount: 0,           /* 当前窗口累计 */
+  _evTotal: 0,           /* 累计事件数 */
+  _evLastType: '',
+  _batchMode: false,     /* 批量选择 */
+  _batchSelected: {},    /* id → true */
+  _filterMode: '',       /* '' | '@'(在线) | '#'(管理员) | '!'(封禁) */
+  _showUserDetail: false,/* 用户详情浮层 */
+  _cmdInput: false,      /* 命令输入模式 */
+  _logFilter: '',
+  _helpOpen: false,
+  _lastIp: '',
+  _logDrawTimer: null
 };
 
 function tuiPushLog(type, data) {
   if (!TUI.logs) TUI.logs = [];
+
+  /* 事件速率窗口：每 5 秒一格，保留 24 格（2 分钟） */
+  var _now = Date.now();
+  var _slot = Math.floor(_now / 5000);
+  if (!TUI._evSlot) TUI._evSlot = _slot;
+  if (_slot !== TUI._evSlot) {
+    var _gap = Math.min(24, _slot - TUI._evSlot);
+    for (var _gi = 0; _gi < _gap; _gi++) {
+      TUI._evRate.push(_gi === 0 ? TUI._evCount : 0);
+    }
+    while (TUI._evRate.length > 24) TUI._evRate.shift();
+    TUI._evSlot = _slot;
+    TUI._evCount = 0;
+  }
+  TUI._evCount++;
+  TUI._evTotal = (TUI._evTotal || 0) + 1;
+  TUI._evLastType = type;
+
   var t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
   var label = TUI_LOG_NAME[type] || String(type);
   var extra = '';
@@ -82247,8 +90472,21 @@ function tuiPushLog(type, data) {
       if (data.reason) extra += ' (' + data.reason + ')';
     }
   } catch (e) { }
-  TUI.logs.unshift({ time: t, text: label + extra });
-  if (TUI.logs.length > 30) TUI.logs.length = 30;
+
+  /* 清理控制字符，防止日志污染布局 */
+  extra = String(extra).replace(/[\x00-\x1f\x7f]/g, ' ');
+
+  TUI.logs.unshift({ time: t, type: type, text: label + extra });
+  if (TUI.logs.length > 50) TUI.logs.length = 50;
+
+  /* main 模式 80ms 去抖重绘，避免密集事件刷屏 */
+  if (TUI.active && TUI.mode === 'main') {
+    if (TUI._logDrawTimer) clearTimeout(TUI._logDrawTimer);
+    TUI._logDrawTimer = setTimeout(function () {
+      TUI._logDrawTimer = null;
+      if (TUI.active && TUI.mode === 'main') tuiDraw();
+    }, 80);
+  }
 }
 
 function tuiRunSilent(cmd, note) {
@@ -82334,16 +90572,35 @@ function tuiOpenMessages(kind, id, name) {
   TUI.prevMode = (kind === 'group') ? 'group' : 'user';
   TUI.mode = 'messages';
   TUI.msgScroll = 0;
-  var key;
+
   if (kind === 'group') {
-    key = getHistoryKey('group', id);
+    var key = getHistoryKey('group', id);
     TUI.msgTitle = '群组：' + name;
-  } else {
-    key = getHistoryKey('private', 'SYSTEM', id);
-    TUI.msgTitle = '与 ' + name + ' 的对话（SYSTEM）';
+    TUI.msgList = (messageHistory[key] || []).slice();
+    tuiDraw();
+    return;
   }
-  var arr = messageHistory[key] || [];
-  TUI.msgList = arr.slice();
+
+  /* 用户私聊：合并该用户与所有人的私聊会话（管理员视角） */
+  var _merged = [];
+  for (var _hk in messageHistory) {
+    if (!messageHistory.hasOwnProperty(_hk)) continue;
+    if (_hk.indexOf('private_') !== 0) continue;
+    var _rest = _hk.substring(8);
+    var _idx = _rest.indexOf('_');
+    if (_idx === -1) continue;
+    var _a = _rest.substring(0, _idx);
+    var _b = _rest.substring(_idx + 1);
+    if (_a !== id && _b !== id) continue;
+    var _arr2 = messageHistory[_hk];
+    if (!Array.isArray(_arr2)) continue;
+    for (var _mi = 0; _mi < _arr2.length; _mi++) _merged.push(_arr2[_mi]);
+  }
+  _merged.sort(function (x, y) {
+    return String(x.time || '').localeCompare(String(y.time || ''));
+  });
+  TUI.msgList = _merged;
+  TUI.msgTitle = '与 ' + name + ' 的全部私聊';
   tuiDraw();
 }
 
@@ -82367,7 +90624,9 @@ function tuiCollectUsers() {
       muted: !!(live ? live.muted : r.muted),
       banned: !!r.banned,
       bannedUntil: Number(r.bannedUntil) || 0,
-      verified: (live ? live.verified : r.verified) || ''
+      verified: (live ? live.verified : r.verified) || '',
+      createdAt: Number(r.createdAt) || 0,
+      lastActive: Number(r.lastActive) || 0
     });
   }
   list.sort(function (a, b) {
@@ -82505,16 +90764,34 @@ function tuiDraw() {
     '   ' + A.gray + '会话' + A.reset + ' ' + sessTotal +
     '   ' + A.gray + '运行' + A.reset + ' ' + upStr +
     _roBadge + _pauseBadge);
-  out.push('   ' + A.gray + '通话' + A.reset + ' ' +
-    _cmColor + _cmDot + ' ' + _cmText + A.reset +
-    '   ' + A.gray + '内存' + A.reset + ' ' +
-    _memColor + TUI._memRss + 'MB' + A.reset +
-    A.gray + ' / Heap ' + TUI._memHeap + 'MB' + A.reset);
+  var _socketN = 0;
+  try { _socketN = io.sockets.sockets.size || 0; } catch (eSock) {}
+
+  /* 事件速率迷你图：24 格（每格 5 秒） */
+  var _rateBars = '';
+  var _rateMax = 1;
+  for (var _ri = 0; _ri < TUI._evRate.length; _ri++) {
+    if (TUI._evRate[_ri] > _rateMax) _rateMax = TUI._evRate[_ri];
+  }
+  var _levelChars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+  for (var _ri2 = 0; _ri2 < TUI._evRate.length; _ri2++) {
+    var _v = TUI._evRate[_ri2];
+    var _idx = _v === 0 ? 0 : Math.min(7, Math.floor(_v / _rateMax * 8));
+    var _col = _idx === 0 ? A.gray
+             : _idx <= 2 ? A.cyan
+             : _idx <= 4 ? A.yellow : A.red;
+    _rateBars += _col + _levelChars[_idx] + A.reset;
+  }
+  if (!_rateBars) _rateBars = A.gray + '—' + A.reset;
+
   out.push('   ' + A.gray + '通话' + A.reset + ' ' +
     _netColor + _netDot + ' ' + _netTxt + A.reset +
+    '   ' + A.gray + '连接' + A.reset + ' ' + _socketN +
     (typeof _serverPaused !== 'undefined' && _serverPaused
-      ? ('   ' + A.yellow + '⏸ 服务已暂停' + A.reset)
+      ? ('   ' + A.yellow + '⏸ 已暂停' + A.reset)
       : ''));
+  out.push('   ' + A.gray + '事件' + A.reset + ' ' +
+    (TUI._evTotal || 0) + '   ' + _rateBars);
   out.push('');
 
   if (TUI.mode === 'input') {
@@ -82581,56 +90858,37 @@ function tuiDraw() {
     out.push('');
   }
 
-  /* ★ v0.32.0：搜索模式 */
+  /* 搜索模式渲染 */
   if (TUI.mode === 'search') {
-    if (s === '\x1b') {
-      TUI.mode = 'main';
-      TUI.inputBuffer = '';
-      tuiDraw();
-      return;
-    }
-    if (s === '\x1b[A') {
-      if (TUI._searchHits.length > 0) {
-        TUI._searchSel = (TUI._searchSel - 1 + TUI._searchHits.length) %
-                        TUI._searchHits.length;
+    if (!TUI._searchHits) TUI._searchHits = [];
+    out.push(A.cyan + hr('─') + A.reset);
+    out.push(' ' + A.bold + '🔍 搜索' + A.reset +
+      A.gray + '   (↑↓ 选择，Enter 定位，Esc 取消)' + A.reset);
+    out.push('');
+    var _sbuf = String(TUI.inputBuffer || '');
+    out.push('   ' + A.green + '> ' + A.reset + _sbuf +
+      A.cyan + '█' + A.reset);
+    out.push('');
+    if (!TUI._searchHits.length) {
+      out.push('   ' + A.gray +
+        (_sbuf ? '(无匹配结果)' : '(输入关键词开始搜索)') + A.reset);
+    } else {
+      for (var _si = 0; _si < TUI._searchHits.length && _si < 12; _si++) {
+        var _h = TUI._searchHits[_si];
+        var _isSel = (_si === TUI._searchSel);
+        var _c = _isSel ? (A.cyan + ' ▸ ' + A.reset) : '   ';
+        var _icon = _h.kind === 'users' ? '👤' : '👥';
+        var _label = tuiPad(_h.name, 20);
+        if (_isSel) _label = A.bold + _label + A.reset;
+        out.push(_c + _icon + ' ' + _label +
+          A.gray + ' (' + _h.kind + ')' + A.reset);
       }
-      tuiDraw();
-      return;
-    }
-    if (s === '\x1b[B') {
-      if (TUI._searchHits.length > 0) {
-        TUI._searchSel = (TUI._searchSel + 1) % TUI._searchHits.length;
+      if (TUI._searchHits.length > 12) {
+        out.push('   ' + A.gray + '... 共 ' +
+          TUI._searchHits.length + ' 条匹配' + A.reset);
       }
-      tuiDraw();
-      return;
     }
-    if (s === '\r' || s === '\n') {
-      var _hit = TUI._searchHits[TUI._searchSel];
-      if (_hit) {
-        TUI.panel = _hit.kind;
-        if (_hit.kind === 'users') TUI.selId = _hit.id;
-        else TUI.selGroupId = _hit.id;
-        TUI.mode = 'main';
-        TUI.inputBuffer = '';
-      }
-      tuiDraw();
-      return;
-    }
-    if (s === '\x7f' || s === '\x08') {
-      if (TUI.inputBuffer) {
-        TUI.inputBuffer = TUI.inputBuffer.substring(0, TUI.inputBuffer.length - 1);
-      }
-      tuiRunSearch(TUI.inputBuffer);
-      tuiDraw();
-      return;
-    }
-    var _p = s.replace(/[\x00-\x1f\x7f]/g, '');
-    if (_p.length > 0) {
-      TUI.inputBuffer = (TUI.inputBuffer || '') + _p;
-      tuiRunSearch(TUI.inputBuffer);
-      tuiDraw();
-    }
-    return;
+    out.push('');
   }
 
   if (TUI.mode === 'messages') {
@@ -82724,25 +90982,49 @@ function tuiDraw() {
     } else {
       out.push(' ' + A.bold + '👤 用户' + A.reset +
         A.gray + '   (↑↓ 选择，Enter 打开操作，Tab 切换到群组)' + A.reset);
-      if (!TUI.users.length) {
-        out.push('   ' + A.gray + '(暂无用户)' + A.reset);
+      /* 筛选：@=在线 #=管理员 !=封禁 */
+      var _viewUsers = TUI.users;
+      var _filterLbl = '';
+      if (TUI._filterMode === '@') {
+        _viewUsers = _viewUsers.filter(function (x) { return x.online; });
+        _filterLbl = ' [在线]';
+      } else if (TUI._filterMode === '#') {
+        _viewUsers = _viewUsers.filter(function (x) { return x.isAdmin; });
+        _filterLbl = ' [管理员]';
+      } else if (TUI._filterMode === '!') {
+        _viewUsers = _viewUsers.filter(function (x) { return x.banned; });
+        _filterLbl = ' [封禁]';
+      }
+      if (TUI._batchMode) {
+        _filterLbl += ' [批量：已选 ' +
+          Object.keys(TUI._batchSelected).length + ' 人]';
+      }
+      if (_filterLbl) {
+        out.push('   ' + A.yellow + _filterLbl + A.reset);
+      }
+
+      if (!_viewUsers.length) {
+        out.push('   ' + A.gray + '(暂无用户' + _filterLbl + ')' + A.reset);
       } else {
         var MAX_ROWS = 12;
         var selIdx = 0;
-        for (var si = 0; si < TUI.users.length; si++) {
-          if (TUI.users[si].id === TUI.selId) { selIdx = si; break; }
+        for (var si = 0; si < _viewUsers.length; si++) {
+          if (_viewUsers[si].id === TUI.selId) { selIdx = si; break; }
         }
         var start = 0;
         if (selIdx >= MAX_ROWS) start = selIdx - MAX_ROWS + 1;
-        var end = Math.min(TUI.users.length, start + MAX_ROWS);
+        var end = Math.min(_viewUsers.length, start + MAX_ROWS);
 
         for (var ri = start; ri < end; ri++) {
-          var u = TUI.users[ri];
+          var u = _viewUsers[ri];
           var isSel = (ri === selIdx);
           var cursor = isSel ? (A.cyan + ' ▸ ' + A.reset) : '   ';
           var dot = u.online
             ? (A.green + '●' + A.reset)
             : (A.gray + '○' + A.reset);
+          var _bx = TUI._batchSelected[u.id]
+            ? (A.green + '[✓]' + A.reset + ' ')
+            : (TUI._batchMode ? (A.gray + '[ ]' + A.reset + ' ') : '');
 
           var nameCol = tuiPad(u.name, 16);
           var tags = [];
@@ -82762,13 +91044,47 @@ function tuiDraw() {
           if (u.verified) tags.push(A.cyan + '[✓' + u.verified + ']' + A.reset);
           if (!u.online) tags.push(A.gray + '(离线)' + A.reset);
 
-          out.push(cursor + dot + ' ' +
+          out.push(cursor + _bx + dot + ' ' +
             (isSel ? A.bold + nameCol + A.reset : nameCol) +
             ' ' + tags.join(' '));
         }
-        if (TUI.users.length > MAX_ROWS) {
-          out.push('   ' + A.gray + '... 共 ' + TUI.users.length +
+        if (_viewUsers.length > MAX_ROWS) {
+          out.push('   ' + A.gray + '... 共 ' + _viewUsers.length +
             ' 人，当前显示第 ' + (start + 1) + '-' + end + ' 行' + A.reset);
+        }
+      }
+
+      /* 用户详情浮层 */
+      if (TUI._showUserDetail && TUI.selId) {
+        var _du = null;
+        for (var _dui = 0; _dui < TUI.users.length; _dui++) {
+          if (TUI.users[_dui].id === TUI.selId) { _du = TUI.users[_dui]; break; }
+        }
+        if (_du) {
+          out.push('');
+          out.push(' ' + A.bold + '📇 用户详情' + A.reset +
+            A.gray + '   (V 关闭)' + A.reset);
+          out.push('   ' + A.cyan + 'ID       ' + A.reset + _du.id);
+          out.push('   ' + A.cyan + '昵称     ' + A.reset + _du.name);
+          out.push('   ' + A.cyan + '状态     ' + A.reset +
+            (_du.online ? (A.green + '在线' + A.reset)
+                        : (A.gray + '离线' + A.reset)));
+          out.push('   ' + A.cyan + '等级     ' + A.reset + 'LV' + _du.level +
+            (_du.vip ? ' 👑' : ''));
+          if (_du.isAdmin) out.push('   ' + A.cyan + '权限     ' + A.reset +
+            (A.blue + '管理员' + A.reset));
+          if (_du.muted) out.push('   ' + A.cyan + '禁言     ' + A.reset +
+            (A.yellow + '是' + A.reset));
+          if (_du.verified) out.push('   ' + A.cyan + '认证     ' + A.reset +
+            _du.verified);
+          if (_du.banned) {
+            var _btxt = (_du.bannedUntil > 0 && _du.bannedUntil > Date.now())
+              ? ('至 ' + new Date(_du.bannedUntil)
+                  .toLocaleString('zh-CN', { hour12: false }))
+              : '永久';
+            out.push('   ' + A.cyan + '封禁     ' + A.reset +
+              (A.red + _btxt + A.reset));
+          }
         }
       }
     }
@@ -82811,15 +91127,65 @@ function tuiDraw() {
     }
   }
 
+  /* 快捷键帮助浮层 */
+  if (TUI._helpOpen) {
+    out.push(A.cyan + hr('─') + A.reset);
+    out.push(' ' + A.bold + '⌨️  快捷键帮助' + A.reset +
+      A.gray + '   (按 ? 或 H 关闭)' + A.reset);
+    var _helps = [
+      ['↑↓ / j k', '上下移动'],
+      ['Tab', '切换用户 / 群组'],
+      ['Enter / 空格', '打开操作菜单 / 批量选中'],
+      ['Esc', '返回上层 / 退出'],
+      ['/', '搜索用户与群组'],
+      [':', '自由命令模式'],
+      ['X', '批量选择模式'],
+      ['V', '用户详情浮层'],
+      ['?', '显示 / 关闭本帮助'],
+      ['@ / # / !', '筛选：在线 / 管理员 / 封禁'],
+      ['R', '刷新数据'],
+      ['L', '切换只读'],
+      ['B', '广播全体在线'],
+      ['S', '立即落盘所有数据'],
+      ['G', '触发 V8 GC（需 --expose-gc）'],
+      ['F', '查看最近反馈'],
+      ['W', '导出 TUI 日志到 files/tui-logs/'],
+      ['P', '暂停 / 恢复服务器'],
+      ['Q', '退出控制台']
+    ];
+    for (var _hi = 0; _hi < _helps.length; _hi++) {
+      out.push('   ' + A.cyan + tuiPad(_helps[_hi][0], 16) + A.reset +
+        A.gray + _helps[_hi][1] + A.reset);
+    }
+    out.push('');
+  }
+
   out.push(A.cyan + hr('─') + A.reset);
-  out.push(' ' + A.bold + '📋 最近事件' + A.reset);
-  if (!TUI.logs.length) {
-    out.push('   ' + A.gray + '(暂无事件)' + A.reset);
+  var _logTitle = '📋 最近事件';
+  if (TUI._evTotal) _logTitle += '  (' + TUI._evTotal + ' 累计)';
+  if (TUI._logFilter) _logTitle += '  [过滤: ' + TUI._logFilter + ']';
+  out.push(' ' + A.bold + _logTitle + A.reset);
+
+  var _logsView = TUI.logs;
+  if (TUI._logFilter) {
+    _logsView = TUI.logs.filter(function (lg) {
+      return lg && lg.type &&
+        String(lg.type).indexOf(TUI._logFilter) !== -1;
+    });
+  }
+  if (!_logsView.length) {
+    out.push('   ' + A.gray +
+      (TUI._logFilter ? '(无匹配事件)' : '(暂无事件)') + A.reset);
   } else {
-    var MAX_LOGS = 6;
-    for (var li = 0; li < Math.min(TUI.logs.length, MAX_LOGS); li++) {
-      var lg = TUI.logs[li];
-      out.push('   ' + A.gray + lg.time + A.reset + '  ' + lg.text);
+    var MAX_LOGS = 8;
+    for (var li = 0; li < Math.min(_logsView.length, MAX_LOGS); li++) {
+      var lg = _logsView[li];
+      out.push('   ' + A.gray + (lg.time || '       ') + A.reset +
+        '  ' + lg.text);
+    }
+    if (_logsView.length > MAX_LOGS) {
+      out.push('   ' + A.gray + '... 还有 ' +
+        (_logsView.length - MAX_LOGS) + ' 条更早事件' + A.reset);
     }
   }
 
@@ -82834,8 +91200,8 @@ function tuiDraw() {
   } else if (TUI.mode === 'user' || TUI.mode === 'group') {
     hint = ' ↑↓ 选择   Enter 执行   Esc 返回   Q 返回 ';
   } else {
-    hint = ' ↑↓ 选择   Enter 操作   Tab 切换列表   / 搜索   F 反馈   ' +
-           'L 只读   B 广播   S 保存   G GC   R 刷新   P 暂停   Q 退出 ';
+    hint = ' ↑↓ 选择  Enter 操作  Tab 切换  / 搜索  : 命令  X 批量  V 详情  ' +
+           '? 帮助  F 反馈  L 只读  B 广播  S 保存  G GC  R 刷新  P 暂停  Q 退出 ';
   }
   out.push(A.gray + hint + A.reset);
 
@@ -82862,7 +91228,11 @@ function tuiEnter() {
   TUI.msgList = [];
   TUI.msgTitle = '';
   TUI.prevMode = 'main';
+  TUI._helpOpen = false;
+  TUI._logFilter = '';
   if (!TUI.logs) TUI.logs = [];
+  if (!TUI._evCount) TUI._evCount = {};
+  if (typeof TUI._evTotal !== 'number') TUI._evTotal = 0;
 
   try { rl.pause(); } catch (e) { }
   try { process.stdin.setRawMode(true); } catch (e) { }
@@ -82977,6 +91347,42 @@ function tuiConfirm() {
   if (TUI.mode === 'messages') return;
 
   if (TUI.mode === 'main') {
+    /* 批量模式：Enter 对已选用户执行批量踢出 */
+    if (TUI._batchMode && TUI.panel === 'users') {
+      if (!Object.keys(TUI._batchSelected).length && TUI.selId) {
+        TUI._batchSelected[TUI.selId] = true;
+      }
+      var _ids = Object.keys(TUI._batchSelected);
+      if (!_ids.length) return;
+
+      var _okN = 0, _failN = 0;
+      for (var _bi = 0; _bi < _ids.length; _bi++) {
+        var _bu = null;
+        for (var _bui = 0; _bui < TUI.users.length; _bui++) {
+          if (TUI.users[_bui].id === _ids[_bi]) { _bu = TUI.users[_bui]; break; }
+        }
+        if (!_bu) { _failN++; continue; }
+        /* 安全：含空格/特殊字符的用户名跳过，防命令注入 */
+        if (!/^[\u4e00-\u9fa5A-Za-z0-9_\-]+$/.test(String(_bu.name))) {
+          _failN++;
+          continue;
+        }
+        try {
+          tuiRunSilent('kick ' + _bu.name, '踢出 ' + _bu.name);
+          _okN++;
+        } catch (e) { _failN++; }
+      }
+      TUI._batchSelected = {};
+      TUI._batchMode = false;
+      TUI.logs.unshift({
+        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        text: '⚡ 批量踢出：成功 ' + _okN + ' / 失败 ' + _failN
+      });
+      if (TUI.logs.length > 50) TUI.logs.length = 50;
+      tuiDraw();
+      return;
+    }
+
     if (TUI.panel === 'groups') {
       if (!TUI.groups.length) return;
       TUI.mode = 'group';
@@ -83014,6 +91420,24 @@ function tuiConfirm() {
 
 function tuiExecAction(key) {
   var isGroupMode = (TUI.mode === 'group');
+
+  /* 安全：依赖命令拼接的动作，若目标名含空格/特殊字符则拒绝自动执行
+     （handleCommand 按空格分词，注入或歧义均会导致越权或错杀） */
+  if (!isGroupMode && key !== 'view' && key !== 'msg' && key !== 'ban') {
+    var _cu = null;
+    for (var _ci = 0; _ci < TUI.users.length; _ci++) {
+      if (TUI.users[_ci].id === TUI.selId) { _cu = TUI.users[_ci]; break; }
+    }
+    if (_cu && !/^[\u4e00-\u9fa5A-Za-z0-9_\-]+$/.test(String(_cu.name))) {
+      TUI.logs.unshift({
+        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        text: '⚠️  用户名含空格或特殊字符，请在命令行手动执行'
+      });
+      if (TUI.logs.length > 50) TUI.logs.length = 50;
+      tuiDraw();
+      return;
+    }
+  }
 
   if (key === 'view') {
     if (isGroupMode) {
@@ -83190,7 +91614,7 @@ function tuiSendMessage() {
   var tid = TUI.inputTargetId;
   var tname = TUI.inputTargetName;
 
-  /* ★ v0.32.0：广播分支 */
+  /* 广播：统一走 SYSTEM 身份，附带完整字段防客户端伪造 */
   if (kind === 'broadcast') {
     if (!text) {
       TUI.mode = 'main';
@@ -83199,24 +91623,46 @@ function tuiSendMessage() {
       tuiDraw();
       return;
     }
+    var _bLog;
     try {
-      io.emit('global-announce', { content: text, from: 'SYSTEM (TUI)' });
-      TUI.logs.unshift({
-        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
-        text: '📢 广播 → 全体在线：' +
-          (text.length > 40 ? text.substring(0, 40) + '…' : text)
+      io.emit('global-announce', {
+        content: text,
+        from: 'SYSTEM',
+        fromName: '系统',
+        fromVerified: '系统通知 官方账号',
+        fromLevel: 100,
+        fromVip: true,
+        ts: Date.now()
       });
+      _bLog = '📢 广播 → 全体在线：' +
+        (text.length > 40 ? text.substring(0, 40) + '…' : text);
     } catch (eB) {
-      TUI.logs.unshift({
-        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
-        text: '❌ 广播失败：' + (eB.message || '未知错误')
-      });
+      _bLog = '❌ 广播失败：' + (eB.message || '未知错误');
     }
-    if (TUI.logs.length > 30) TUI.logs.length = 30;
+    TUI.logs.unshift({
+      time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+      text: _bLog
+    });
+    if (TUI.logs.length > 50) TUI.logs.length = 50;
     TUI.mode = 'main';
     TUI.inputBuffer = '';
     TUI.inputTargetKind = 'user';
     tuiDraw();
+    return;
+  }
+
+  if (kind === 'cmd') {
+    TUI.inputBuffer = '';
+    TUI.inputTargetKind = 'user';
+    TUI._cmdInput = false;
+    if (!text) {
+      TUI.mode = 'main';
+      tuiDraw();
+      return;
+    }
+    /* 安全：过滤换行、控制字符与 shell 元字符，防止解析越界 */
+    text = String(text).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 500);
+    tuiRunSilent(text, '⌨️  ' + text);
     return;
   }
 
@@ -83349,7 +91795,7 @@ function tuiSendMessage() {
   tuiDraw();
 }
 
-/* ★ v0.32.0：TUI 搜索辅助 */
+/* TUI 搜索辅助 */
 function tuiRunSearch(q) {
   q = String(q || '').trim().toLowerCase();
   TUI._searchQuery = q;
@@ -83380,12 +91826,28 @@ function tuiOnKey(buf) {
 
   if (s === '\x03') { tuiExit(true); return; }
 
+  /* 安全：非 input/search 模式下只接受单字符与转义序列，
+     避免粘贴 "please pause" 误触发 P（暂停服务器）等危险快捷键 */
+  var _isCtrlSeq = (s.length > 1 && s.charAt(0) === '\x1b');
+  var _isPaste = (s.length > 1 && !_isCtrlSeq);
+  if (_isPaste && TUI.mode !== 'input' && TUI.mode !== 'search') {
+    return;
+  }
+
   if (TUI.mode === 'input') {
     if (s === '\x1b[A' || s === '\x1b[B' ||
       s === '\x1b[C' || s === '\x1b[D') {
       return;
     }
     if (s === '\x1b') {
+      if (TUI.inputTargetKind === 'cmd') {
+        TUI._cmdInput = false;
+        TUI.inputBuffer = '';
+        TUI.inputTargetKind = 'user';
+        TUI.mode = 'main';
+        tuiDraw();
+        return;
+      }
       TUI.mode = (TUI.inputTargetKind === 'user' ||
         TUI.inputTargetKind === 'ban') ? 'user' : 'group';
       TUI.inputBuffer = '';
@@ -83414,35 +91876,62 @@ function tuiOnKey(buf) {
     return;
   }
 
-    if (TUI.mode === 'search') {
-    out.push(A.cyan + hr('─') + A.reset);
-    out.push(' ' + A.bold + '🔍 搜索' + A.reset +
-      A.gray + '   (↑↓ 选择，Enter 定位，Esc 取消)' + A.reset);
-    out.push('');
-    var _sbuf = String(TUI.inputBuffer || '');
-    out.push('   ' + A.green + '> ' + A.reset + _sbuf +
-      A.cyan + '█' + A.reset);
-    out.push('');
-    if (!TUI._searchHits.length) {
-      out.push('   ' + A.gray +
-        (_sbuf ? '(无匹配结果)' : '(输入关键词开始搜索)') + A.reset);
-    } else {
-      for (var _si = 0; _si < TUI._searchHits.length && _si < 12; _si++) {
-        var _h = TUI._searchHits[_si];
-        var _isSel = (_si === TUI._searchSel);
-        var _c = _isSel ? (A.cyan + ' ▸ ' + A.reset) : '   ';
-        var _icon = _h.kind === 'users' ? '👤' : '👥';
-        var _label = tuiPad(_h.name, 20);
-        if (_isSel) _label = A.bold + _label + A.reset;
-        out.push(_c + _icon + ' ' + _label +
-          A.gray + ' (' + _h.kind + ')' + A.reset);
-      }
-      if (TUI._searchHits.length > 12) {
-        out.push('   ' + A.gray + '... 共 ' +
-          TUI._searchHits.length + ' 条匹配' + A.reset);
-      }
+  /* 搜索模式按键处理 */
+  if (TUI.mode === 'search') {
+    if (!TUI._searchHits) TUI._searchHits = [];
+    if (s === '\x1b') {
+      TUI.mode = 'main';
+      TUI.inputBuffer = '';
+      TUI._searchQuery = '';
+      TUI._searchHits = [];
+      TUI._searchSel = 0;
+      tuiDraw();
+      return;
     }
-    out.push('');
+    if (s === '\x1b[A') {
+      if (TUI._searchHits.length > 0) {
+        TUI._searchSel = (TUI._searchSel - 1 + TUI._searchHits.length) %
+                        TUI._searchHits.length;
+      }
+      tuiDraw();
+      return;
+    }
+    if (s === '\x1b[B') {
+      if (TUI._searchHits.length > 0) {
+        TUI._searchSel = (TUI._searchSel + 1) % TUI._searchHits.length;
+      }
+      tuiDraw();
+      return;
+    }
+    if (s === '\r' || s === '\n') {
+      var _hit = TUI._searchHits[TUI._searchSel];
+      if (_hit) {
+        TUI.panel = _hit.kind;
+        if (_hit.kind === 'users') TUI.selId = _hit.id;
+        else TUI.selGroupId = _hit.id;
+        TUI.mode = 'main';
+        TUI.inputBuffer = '';
+        TUI._searchQuery = '';
+        TUI._searchHits = [];
+      }
+      tuiDraw();
+      return;
+    }
+    if (s === '\x7f' || s === '\x08') {
+      if (TUI.inputBuffer) {
+        TUI.inputBuffer = TUI.inputBuffer.substring(0, TUI.inputBuffer.length - 1);
+      }
+      tuiRunSearch(TUI.inputBuffer);
+      tuiDraw();
+      return;
+    }
+    var _p = s.replace(/[\x00-\x1f\x7f]/g, '');
+    if (_p.length > 0) {
+      TUI.inputBuffer = (TUI.inputBuffer || '') + _p;
+      tuiRunSearch(TUI.inputBuffer);
+      tuiDraw();
+    }
+    return;
   }
 
   if (TUI.mode === 'messages') {
@@ -83486,7 +91975,18 @@ function tuiOnKey(buf) {
     return;
   }
 
-  if (s === '\r' || s === '\n' || s === ' ') { tuiConfirm(); return; }
+  if (s === ' ') {
+    /* 批量模式：空格切换当前光标用户的选中状态 */
+    if (TUI._batchMode && TUI.mode === 'main' && TUI.panel === 'users' && TUI.selId) {
+      if (TUI._batchSelected[TUI.selId]) delete TUI._batchSelected[TUI.selId];
+      else TUI._batchSelected[TUI.selId] = true;
+      tuiDraw();
+      return;
+    }
+    tuiConfirm();
+    return;
+  }
+  if (s === '\r' || s === '\n') { tuiConfirm(); return; }
 
   var low = s.toLowerCase();
 
@@ -83508,8 +92008,84 @@ function tuiOnKey(buf) {
     return;
   }
 
-  /* ★ v0.32.0：主界面新增快捷键（仅在 main 模式生效） */
+  /* 主界面新增快捷键（仅在 main 模式生效） */
   if (TUI.mode === 'main') {
+
+    /* 帮助浮层 */
+    if (s === '?' || s === 'h' || s === 'H') {
+      TUI._helpOpen = !TUI._helpOpen;
+      tuiDraw();
+      return;
+    }
+
+    /* 命令输入模式：直接执行 handleCommand */
+    if (s === ':') {
+      TUI._cmdInput = true;
+      TUI.inputBuffer = '';
+      TUI.inputTargetKind = 'cmd';
+      TUI.inputTargetName = '服务器命令';
+      TUI.mode = 'input';
+      tuiDraw();
+      return;
+    }
+
+    /* 批量选择模式 */
+    if (s === 'X' || s === 'x') {
+      TUI._batchMode = !TUI._batchMode;
+      TUI._batchSelected = {};
+      TUI.logs.unshift({
+        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        text: TUI._batchMode
+          ? '🔘 批量模式：空格选中 / 取消，Enter 批量踢出，Esc 退出'
+          : '批量模式已关闭'
+      });
+      if (TUI.logs.length > 50) TUI.logs.length = 50;
+      tuiDraw();
+      return;
+    }
+
+    /* 用户详情浮层 */
+    if ((s === 'V' || s === 'v') && TUI.panel === 'users') {
+      TUI._showUserDetail = !TUI._showUserDetail;
+      tuiDraw();
+      return;
+    }
+
+    /* 日志导出到 files/tui-logs/ */
+    if (s === 'W' || s === 'w') {
+      var _wLog;
+      try {
+        var _logDir = path.join(DATA_DIR_EARLY, 'tui-logs');
+        if (!fs.existsSync(_logDir)) fs.mkdirSync(_logDir, { recursive: true });
+        var _stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        var _out2 = [];
+        for (var _li = TUI.logs.length - 1; _li >= 0; _li--) {
+          var _lg = TUI.logs[_li];
+          _out2.push('[' + (_lg.time || '') + '] ' + String(_lg.text || '')
+            .replace(/\x1b\[[0-9;]*m/g, ''));
+        }
+        fs.writeFileSync(path.join(_logDir, 'tui_' + _stamp + '.log'),
+          _out2.join('\n'), 'utf8');
+        _wLog = '📁 已导出：files/tui-logs/tui_' + _stamp + '.log';
+      } catch (eW) {
+        _wLog = '❌ 日志导出失败：' + (eW.message || '?');
+      }
+      TUI.logs.unshift({
+        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        text: _wLog
+      });
+      if (TUI.logs.length > 50) TUI.logs.length = 50;
+      tuiDraw();
+      return;
+    }
+
+    /* 筛选前缀：@=在线 #=管理员 !=封禁（再按一次取消） */
+    if (s === '@' || s === '#' || s === '!') {
+      TUI._filterMode = (TUI._filterMode === s) ? '' : s;
+      tuiDraw();
+      return;
+    }
+
     if (low === 'l') {
       var _nowRO = (typeof config !== 'undefined' && config.readonlyMode === true);
       var _nextRO = !_nowRO;
@@ -83610,6 +92186,28 @@ function tuiOnKey(buf) {
       TUI.inputBuffer = '';
       TUI.mode = 'input';
       TUI.confirmPending = false;
+      tuiDraw();
+      return;
+    }
+
+    if (s === '?' || low === 'h') {
+      TUI._helpOpen = !TUI._helpOpen;
+      tuiDraw();
+      return;
+    }
+
+    if (s === 'e' || low === 'e') {
+      var _filters = ['', 'LOGIN', 'MESSAGE', 'ADMIN', 'CALL'];
+      var _idx = _filters.indexOf(TUI._logFilter || '');
+      TUI._logFilter = _filters[(_idx + 1) % _filters.length];
+      tuiDraw();
+      return;
+    }
+
+    if (s === 'c' || low === 'c') {
+      TUI._evCount = {};
+      TUI._evTotal = 0;
+      TUI.logs = [];
       tuiDraw();
       return;
     }
@@ -84426,6 +93024,320 @@ function handleExtraCommand(cmd) {
   return false;
 }
 
+
+/* ==================================================================
+   ★ DSH 通话修复 / P2 业务 / P3 发现
+   ================================================================== */
+
+/* ---- 通话 ICE 配置（局域网优先 + 可选 TURN）----
+   优先级：DSH_ICE_SERVERS(JSON 完整覆盖) > DSH_TURN_*(中继) > DSH_STUN_*(探测) > 局域网直连
+   局域网直连不需要任何 STUN/TURN，host candidate 即可互通。
+   跨网段/跨 NAT 时必须配置 TURN，否则必然失败。 */
+function dshIceServers() {
+  const out = [];
+  /* 1) 完整覆盖 */
+  const raw = String(process.env.DSH_ICE_SERVERS || '').trim();
+  if (raw) {
+    try {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr) && arr.length) return arr;
+    } catch (e) { dshLog('warn', 'ice.parse.failed', { error: e.message }); }
+  }
+  /* 2) TURN 中继（可多个，逗号分隔） */
+  const turnUrls = String(process.env.DSH_TURN_URL || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (turnUrls.length) {
+    for (const u of turnUrls) {
+      out.push({
+        urls: u,
+        username: String(process.env.DSH_TURN_USER || ''),
+        credential: String(process.env.DSH_TURN_CRED || '')
+      });
+    }
+  }
+  /* 3) STUN（仅用于发现公网地址，可选） */
+  const stunUrls = String(process.env.DSH_STUN_URL || '').split(',').map(s => s.trim()).filter(Boolean);
+  for (const u of stunUrls) out.push({ urls: u });
+  return out;
+}
+
+/* ---- P2 通话：局域网可用的 ICE 配置 ----
+   根因：原 CALL_ICE_SERVERS 只有公网 Google STUN；局域网无外网时
+   ICE 收集超时，通话永远连不上。这里改为「局域网优先」：
+   仅用 stun 做本机候选即可（同一网段 host candidate 直连），
+   并支持环境变量 DSH_TURN_URL / DSH_TURN_USER / DSH_TURN_CRED 注入中继。 */
+function dshIceConfig() {
+  const ice = dshIceServers();
+  const hasTurn = ice.some(function (s) {
+    const u = Array.isArray(s.urls) ? s.urls.join(',') : String(s.urls || '');
+    return /^turns?:/i.test(u);
+  });
+  return {
+    iceServers: ice,
+    iceTransportPolicy: dshT('callForceTurn') ? 'relay' : 'all',
+    bundlePolicy: 'max-bundle',
+    lanOnly: !hasTurn,
+    hasTurn: hasTurn,
+    mode: hasTurn ? 'turn-relay' : 'lan-host',
+    qualityIntervalMs: dshT('callQualityIntervalMs'),
+    reconnectAttempts: dshT('callReconnectAttempts'),
+    note: hasTurn
+      ? '已配置 TURN 中继，支持跨网段通话'
+      : '局域网直连模式。跨网段通话需配置 DSH_TURN_URL'
+  };
+}
+/* ---- P2 通话：服务端会话状态机（回铃超时、多方、屏幕共享、质量统计） ---- */
+function dshCallStart(callId, callerId, calleeId, type, peerIds) {
+  const s = {
+    id: callId, caller: callerId, callee: calleeId, type: type || 'voice',
+    startedAt: 0, endedAt: 0, peers: {},
+    screenSharing: false, quality: {}, state: 'ringing'
+  };
+  const list = [callerId, calleeId].concat(Array.isArray(peerIds) ? peerIds : []);
+  for (const p of list) if (p) s.peers[p] = { joined: false, muted: false, video: false, screen: false };
+  DSH.callSessions[callId] = s;
+  /* ★ 回铃超时：30s 无人接听自动结束，避免状态机死锁 */
+  s.ringTimer = setTimeout(function () {
+    const cur = DSH.callSessions[callId];
+    if (!cur || cur.state !== 'ringing') return;
+    try {
+      io.emit('call-timeout', { callId: callId, reason: 'no-answer' });
+      for (const p in cur.peers) emitToUser(p, 'call-ended', { callId: callId, reason: 'no-answer' });
+    } catch (e) {}
+    dshCallEnd(callId, 'no-answer');
+  }, dshT('callRingTimeoutMs'));
+  DSH.metrics.calls++;
+  DSH.metrics.callActive++;
+  dshLog('info', 'call.started', { callId: callId, type: type, peers: Object.keys(s.peers).length });
+  return s;
+}
+function dshCallEnd(callId, reason) {
+  const s = DSH.callSessions[callId];
+  if (!s) return;
+  /* ★ 写入服务端通话记录（跨端可查） */
+  try {
+    var _durSec = s.startedAt ? Math.max(0, Math.round((Date.now() - s.startedAt) / 1000)) : 0;
+    var _result = (reason === 'no-answer' || reason === 'hangup' && !s.startedAt) ? 'missed'
+      : (s.startedAt ? 'ended' : 'canceled');
+    dshCallLogAdd({
+      id: callId,
+      from: s.caller, to: s.callee,
+      peers: Object.keys(s.peers || {}),
+      type: s.type || 'voice',
+      result: _result,
+      reason: reason || '',
+      durationSec: _durSec,
+      screenSharing: !!s.screenSharing,
+      startedAt: s.startedAt || 0,
+      endedAt: Date.now(),
+      quality: s.quality || {}
+    });
+  } catch (e) {}
+  if (s.ringTimer) { try { clearTimeout(s.ringTimer); } catch (e) {} }
+  s.endedAt = Date.now();
+  s.state = 'ended';
+  s.endReason = reason || 'normal';
+  DSH.metrics.callActive = Math.max(0, DSH.metrics.callActive - 1);
+  dshLog('info', 'call.ended', { callId: callId, reason: s.endReason,
+    durationSec: s.startedAt ? Math.round((s.endedAt - s.startedAt) / 1000) : 0 });
+  delete DSH.callSessions[callId];
+}
+function dshCallStats() {
+  const out = { active: 0, total: DSH.metrics.calls, sessions: [] };
+  for (const k in DSH.callSessions) {
+    const s = DSH.callSessions[k];
+    out.active++;
+    out.sessions.push({ id: k, type: s.type, state: s.state,
+      peers: Object.keys(s.peers).length, screenSharing: s.screenSharing,
+      durationSec: s.startedAt ? Math.round((Date.now() - s.startedAt) / 1000) : 0 });
+  }
+  return out;
+}
+
+/* ---- 通话记录（服务端持久化，跨端可查） ---- */
+var F_CALL_LOG = path.join(DATA_DIR_EARLY, 'call_log.json');
+var DSH_CALL_LOG = [];
+try {
+  var _clObj = JSON.parse(fs.readFileSync(F_CALL_LOG, 'utf8'));
+  if (Array.isArray(_clObj)) DSH_CALL_LOG = _clObj;
+} catch (e) {}
+var _callLogDirty = false;
+function dshCallLogSave() {
+  if (!_callLogDirty) return;
+  try {
+    var tmp = F_CALL_LOG + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(DSH_CALL_LOG), 'utf8');
+    fs.renameSync(tmp, F_CALL_LOG);
+    _callLogDirty = false;
+  } catch (e) { dshLog('warn', 'calllog.save.failed', { error: e.message }); }
+}
+function dshCallLogAdd(rec) {
+  if (!rec) return;
+  DSH_CALL_LOG.unshift(rec);
+  if (DSH_CALL_LOG.length > 500) DSH_CALL_LOG.length = 500;
+  _callLogDirty = true;
+  setTimeout(dshCallLogSave, 2000);
+}
+function dshCallLogList(userId, limit) {
+  limit = Math.min(200, Number(limit) || 50);
+  var out = [];
+  for (var i = 0; i < DSH_CALL_LOG.length && out.length < limit; i++) {
+    var r = DSH_CALL_LOG[i];
+    if (!r) continue;
+    if (userId && r.from !== userId && r.to !== userId &&
+        !(Array.isArray(r.peers) && r.peers.indexOf(userId) !== -1)) continue;
+    out.push(r);
+  }
+  return out;
+}
+
+/* ---- P2 离线消息队列 ---- */
+function dshQueueOffline(userId, event, payload) {
+  if (!dshT('enableOfflineQueue')) return;
+  const q = DSH.offlineQueue[userId] || (DSH.offlineQueue[userId] = []);
+  q.push({ at: Date.now(), event: event, payload: payload });
+  if (q.length > 200) q.splice(0, q.length - 200);
+  DSH.metrics.offlineQueued++;
+  dshPersist('offlineQueue');
+}
+function dshFlushOffline(userId, socket) {
+  const q = DSH.offlineQueue[userId];
+  if (!q || !q.length) return 0;
+  let n = 0;
+  for (const item of q) {
+    try { socket.emit(item.event, item.payload); n++; } catch (e) {}
+  }
+  delete DSH.offlineQueue[userId];
+  dshPersist('offlineQueue');
+  dshLog('info', 'offline.flushed', { userId: userId, count: n });
+  return n;
+}
+
+/* ---- P2 群公告 / 待办 / @all ---- */
+function dshGroupMeta(groupId) {
+  return DSH.groupMeta[groupId] || (DSH.groupMeta[groupId] = {
+    announcements: [], todos: [], pinned: [], updatedAt: 0
+  });
+}
+function dshGroupBroadcast(groupId, event, data) {
+  try {
+    const g = getGroupById(groupId);
+    if (!g || !g.members) return;
+    g.members.forEach(function (uid) { emitToUser(uid, event, data); });
+  } catch (e) {}
+}
+
+/* ---- P2 多端同步 ---- */
+function dshSyncToUser(userId, event, data, excludeSocketId) {
+  if (!dshT('enableMultiDeviceSync')) return;
+  DSH.metrics.syncEvents++;
+  try {
+    io.sockets.sockets.forEach(function (sk) {
+      if (excludeSocketId && sk.id === excludeSocketId) return;
+      const u = getUserBySocketId(sk.id);
+      if (u && u.id === userId) sk.emit(event, data);
+    });
+  } catch (e) {}
+}
+
+/* ---- P1 登录防爆破（HTTP + socket 双通道） ---- */
+function dshLoginFailKey(ip, name) { return String(ip || '') + '|' + String(name || '').toLowerCase(); }
+function dshLoginBlocked(ip, name) {
+  const k = dshLoginFailKey(ip, name);
+  const rec = DSH.loginFails[k];
+  if (!rec) return { blocked: false, remainMs: 0 };
+  if (rec.lockUntil > Date.now()) {
+    return { blocked: true, remainMs: rec.lockUntil - Date.now(), fails: rec.n };
+  }
+  if (Date.now() - rec.last > dshT('loginWindowMs')) { delete DSH.loginFails[k]; return { blocked: false, remainMs: 0 }; }
+  return { blocked: false, remainMs: 0, fails: rec.n };
+}
+function dshLoginFailed(ip, name) {
+  const k = dshLoginFailKey(ip, name);
+  const rec = DSH.loginFails[k] || (DSH.loginFails[k] = { n: 0, last: 0, lockUntil: 0 });
+  if (Date.now() - rec.last > dshT('loginWindowMs')) rec.n = 0;
+  rec.n++; rec.last = Date.now();
+  if (rec.n >= dshT('loginMaxFails')) {
+    rec.lockUntil = Date.now() + dshT('loginLockMs');
+    dshLog('warn', 'login.locked', { ip: ip, name: name, fails: rec.n });
+    dshAudit('system', 'login.locked', String(name), { fails: rec.n }, ip);
+  }
+  return rec;
+}
+function dshLoginSuccess(ip, name) { delete DSH.loginFails[dshLoginFailKey(ip, name)]; }
+app.post('/api/auth/check-lock', DSH_JSON, function (req, res) {
+  const b = req.body || {};
+  const ip = _getRealIp(req);
+  res.json(Object.assign({ ok: true }, dshLoginBlocked(ip, b.name)));
+});
+
+/* ---- P3 Redis Adapter 抽象（可选，未安装依赖时安全降级） ---- */
+function dshInitRedisAdapter() {
+  if (!dshT('enableRedisAdapter')) {
+    dshLog('info', 'redis.adapter.skipped', { reason: 'disabled' });
+    return false;
+  }
+  try {
+    const { createAdapter } = require('@socket.io/redis-adapter');
+    const { createClient } = require('redis');
+    const url = String(process.env.DSH_REDIS_URL || 'redis://127.0.0.1:6379');
+    const pub = createClient({ url: url });
+    const sub = pub.duplicate();
+    Promise.all([pub.connect(), sub.connect()]).then(function () {
+      io.adapter(createAdapter(pub, sub));
+      dshLog('info', 'redis.adapter.ready', { url: url });
+      console.log('🔗 Socket.IO Redis Adapter 已启用（多实例广播）');
+    }).catch(function (e) { dshLog('warn', 'redis.adapter.failed', { error: e.message }); });
+    return true;
+  } catch (e) {
+    dshLog('info', 'redis.adapter.unavailable', { error: '依赖未安装，使用默认内存 adapter' });
+    return false;
+  }
+}
+
+/* ---- P3 mDNS 局域网发现（UDP 组播，纯 Node dgram，无新依赖） ---- */
+function dshInitDiscovery() {
+  if (!dshT('enableMdns')) return;
+  try {
+    const dgram = require('dgram');
+    const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    const PORT_MDNS = 5353, GROUP = '224.0.0.251';
+    const payload = function () {
+      return Buffer.from(JSON.stringify({ svc: 'dsh-lan-chat',
+        host: require('os').hostname(), port: (typeof PORT === 'number' ? PORT : 3000),
+        https: !!_useHttps, at: Date.now() }));
+    };
+    sock.on('error', function () {});
+    sock.bind(PORT_MDNS, function () {
+      try { sock.addMembership(GROUP); } catch (e) {}
+    });
+    sock.on('message', function (msg, rinfo) {
+      try {
+        const o = JSON.parse(msg.toString('utf8'));
+        if (o.svc !== 'dsh-lan-chat' || o.port === (typeof PORT === 'number' ? PORT : 3000)) return;
+        DSH.discoveredPeers[rinfo.address] = { host: rinfo.address, port: o.port,
+          https: !!o.https, at: Date.now(), name: o.host };
+      } catch (e) {}
+    });
+    const timer = setInterval(function () {
+      try { sock.send(payload(), PORT_MDNS, GROUP); } catch (e) {}
+    }, dshT('discoveryIntervalMs'));
+    DSH.timers.push(timer);
+    dshLog('info', 'mdns.started', { group: GROUP, port: PORT_MDNS });
+  } catch (e) { dshLog('warn', 'mdns.failed', { error: e.message }); }
+}
+
+/* ---- P2 收藏标签 / 配额展示 / 状态快照 ---- */
+function dshUserSnapshot(userId) {
+  const usage = userUploadQuota[userId] || 0;
+  return {
+    userId: userId,
+    quotaUsed: usage, quotaLimit: dshT('quotaPerUserBytes'),
+    quotaPercent: Math.min(100, Math.round(usage / dshT('quotaPerUserBytes') * 100)),
+    offlinePending: (DSH.offlineQueue[userId] || []).length,
+    syncedAt: (DSH.userState[userId] && DSH.userState[userId].updatedAt) || 0
+  };
+}
+
 function handleCommand(cmd) {
   try {
     if (typeof handleExtraCommand === 'function' &&
@@ -84438,9 +93350,120 @@ function handleCommand(cmd) {
   var args = cmd.trim().split(/\s+/);
   var main = (args[0] || '').toLowerCase();
 
+  /* ================= DSH 扩展命令 ================= */
+  if (main === 'dsh' || main === 'health' || main === 'config' ||
+      main === 'backup' || main === 'restore' || main === 'audit' ||
+      main === 'search' || main === 'certrenew' || main === 'logs' ||
+      main === 'metrics' || main === 'calls' || main === 'cleanup' || main === 'scan' ||
+      main === 'tunnel') {
+    var _sub = (args[1] || '').toLowerCase();
+    if (main === 'health') {
+      var _h = dshHealth();
+      console.log('🩺 健康度 ' + _h.score + '  ' + _h.status);
+      for (var _ci = 0; _ci < _h.checks.length; _ci++)
+        console.log('   ' + (_h.checks[_ci].ok ? '✅' : '❌') + ' ' + _h.checks[_ci].name + ' : ' + _h.checks[_ci].detail);
+      return;
+    }
+    if (main === 'config') {
+      if (!_sub || _sub === 'list') {
+        var _c = dshAllThresholds();
+        console.log('⚙️ 阈值配置（config <key> <value> 修改）：');
+        for (var _k in _c.values) console.log('   ' + _k.padEnd(30) + ' = ' + _c.values[_k]);
+      } else {
+        var _v = args[2];
+        if (_v === undefined) { console.log('用法: config <key> <value>'); return; }
+        var _num = (_v === 'true' || _v === 'false') ? (_v === 'true') : Number(_v);
+        if (dshSetThreshold(_sub, _num)) console.log('✅ 已设置 ' + _sub + ' = ' + _num);
+        else console.log('❌ 未知配置项: ' + _sub);
+      }
+      return;
+    }
+    if (main === 'backup') { var _b = dshBackup(_sub || 'cli'); console.log(_b.ok ? '✅ 备份完成: ' + _b.name : '❌ ' + _b.error); return; }
+    if (main === 'restore') {
+      if (!_sub) { var _all = dshBackupList(); console.log('可用备份:'); for (var _bi = 0; _bi < _all.length; _bi++) console.log('  ' + _all[_bi].name); return; }
+      var _r = dshRestore(_sub); console.log(_r.ok ? '✅ 已恢复 ' + _r.files + ' 个文件，执行 restart 生效' : '❌ ' + _r.error); return;
+    }
+    if (main === 'audit') {
+      var _al = dshAuditList(Math.min(200, parseInt(args[2], 10) || 30));
+      for (var _ai = 0; _ai < _al.length; _ai++) {
+        var _e = _al[_ai];
+        console.log('  [' + new Date(_e.ts).toLocaleString('zh-CN', {hour12:false}) + '] ' +
+          _e.actor + ' / ' + _e.action + ' / ' + _e.target);
+      }
+      return;
+    }
+    if (main === 'search') {
+      var _q = args.slice(1).join(' ');
+      if (!_q) { console.log('用法: search <关键词>'); return; }
+      var _s = dshSearch(_q, 20);
+      console.log('🔍 ' + (_s.engine || 'n/a') + ' 命中 ' + ((_s.results || []).length) + ' 条:');
+      for (var _si = 0; _si < (_s.results || []).length; _si++)
+        console.log('  [' + _s.results[_si].fromName + '] ' + String(_s.results[_si].content).slice(0, 80));
+      return;
+    }
+    if (main === 'certrenew') { var _cr = dshRenewCert(); console.log(_cr.ok ? '✅ 证书已重建，执行 restart 生效' : '❌ ' + _cr.error); return; }
+    if (main === 'logs') {
+      var _lg = dshReadLogs(Math.min(200, parseInt(args[2], 10) || 30), '');
+      for (var _li = 0; _li < _lg.length; _li++) console.log('  ' + JSON.stringify(_lg[_li]).slice(0, 220));
+      return;
+    }
+    if (main === 'metrics') { console.log(dshMetricsText()); return; }
+    if (main === 'tunnel') {
+      var _st = dshTunnelStatus();
+      if (_sub === 'on' || _sub === 'start') {
+        var _r = dshTunnelStart({ mode: (args[2] === 'named' ? 'named' : 'quick'), name: args[3] });
+        console.log(_r.ok ? '✅ ' + _r.message : '❌ ' + _r.error);
+        return;
+      }
+      if (_sub === 'off' || _sub === 'stop') {
+        var _r2 = dshTunnelStop();
+        console.log(_r2.ok ? '✅ 已停止' : '❌ ' + _r2.error);
+        return;
+      }
+      console.log('🌐 cloudflared 隧道');
+      console.log('   可用   : ' + (_st.available ? '✅ 是' : '❌ 未找到 cloudflared.exe'));
+      console.log('   运行中 : ' + (_st.running ? '✅ ' + (_st.url || '(获取中)') : '⛔ 否'));
+      if (_st.running) console.log('   已运行 : ' + _st.uptimeSec + ' 秒');
+      if (_st.lastError) console.log('   错误   : ' + _st.lastError);
+      console.log('');
+      console.log('用法: tunnel on            开启临时公网隧道（免登录）');
+      console.log('      tunnel on named <名> 使用已登录的命名隧道');
+      console.log('      tunnel off           关闭隧道');
+      return;
+    }
+    if (main === 'scan') {
+      var _scan = dshStaticScan({});
+      console.log('🔬 静态扫描 ' + _scan.file);
+      console.log('   ' + _scan.lines + ' 行 / ' + (_scan.bytes / 1048576).toFixed(2) + ' MB');
+      for (var _sc of _scan.checks) {
+        console.log('   ' + (_sc.ok ? '✅' : '❌') + ' ' + _sc.name + ' : ' +
+          (typeof _sc.detail === 'object' ? JSON.stringify(_sc.detail).slice(0, 300) : _sc.detail));
+      }
+      console.log(_scan.ok ? '✅ 静态扫描通过' : '❌ 静态扫描失败');
+      return;
+    }
+    if (main === 'calls') { console.log(JSON.stringify(dshCallStats(), null, 2)); return; }
+    if (main === 'cleanup') { console.log(JSON.stringify(dshFilestoreCleanup(), null, 2)); return; }
+    if (main === 'dsh') {
+      console.log('DSH 扩展命令: health | config [k v] | backup | restore <name> | audit [N] |');
+      console.log('              search <q> | certrenew | logs [N] | metrics | calls | cleanup | scan');
+      console.log('              tunnel [on|off]  cloudflared 公网隧道');
+      return;
+    }
+  }
+
   switch (main) {
+    case 'lang':
+      if (args[1] === 'en' || args[1] === 'eng') {
+        SERVER_LANG = 'en';
+        sysLog('info', '✅ 服务器日志已切换为 [英文]', '✅ Server logs switched to [English]');
+      } else {
+        SERVER_LANG = 'zh';
+        sysLog('info', '✅ 服务器日志已切换为 [中文]', '✅ Server logs switched to [Chinese]');
+      }
+      break;
     case 'list': {
-      console.log('=== 在线用户 ===');
+      sysLog('info', '=== 在线用户 ===', '=== Online Users ===');
       var cnt = 0;
       userMap.forEach(function (u) {
         if (u.online) {
@@ -85991,6 +95014,22 @@ function handleCommand(cmd) {
       }
       break;
     }
+
+    case 'crash':
+      console.log('⚠️ 正在测试致命崩溃...');
+      _triggerFatalError('命令行手动测试');
+      break;
+    case 'ddos':
+      console.log('⚠️ 正在测试 DDoS 防护...');
+      _triggerDdosShutdown(9999);
+      break;
+
+    case 'ui':
+    case 'menu':
+    case 'dashboard':
+    case 'console':
+      tuiEnter();
+      break;
     case 'ui':
     case 'menu':
     case 'dashboard':
@@ -86130,6 +95169,7 @@ function handleCommand(cmd) {
         '  broadcast <文本>          - 广播全局公告（等同 announce，兼容别名）',
         '',
         '【服务器】',
+        '  lang zh / lang en          - 切换服务器终端日志的中英文显示',
         '  stream                    - 查看界面流式分段状态',
         '  ui / menu / dashboard / console - 打开命令行控制台（类图形界面）',
         '  pause                     - 暂停服务器（断开连接、释放端口、拒绝新访问）',
@@ -86141,6 +95181,8 @@ function handleCommand(cmd) {
         '  diag                      - 诊断信息（内存/连接/运行时长）',
         '  restart                   - 保存并重启（自重启，会重新读取 server.js）',
         '  exit                      - 关闭服务器（不重启）',
+        '  crash                     - 测试致命错误（模拟服务器崩溃，3分钟后重启）',
+        '  ddos                      - 测试 DDoS 防护（模拟攻击，5秒后自动关闭服务器）',
         '  help                      - 显示本帮助',
         '  help+                     - 显示本帮助 + 全部扩展命令（含本文档所有区块）',
         ''
@@ -86588,21 +95630,8 @@ if (isNaN(PORT) || PORT < 1 || PORT > 65535) {
   PORT = 3000;
 }
 
-process.on('uncaughtException', function (err) {
-  var _s = err && err.stack ? err.stack : String(err || '');
-  console.error('');
-  console.error('═══════════════════════════════════════════');
-  console.error('❌ 未捕获的异常');
-  console.error('═══════════════════════════════════════════');
-  console.error(_s);
-  console.error('═══════════════════════════════════════════');
-  console.error('💡 服务器保持运行，可继续处理其它请求');
-  console.error('');
-  try {
-    var _cf = path.join(__dirname, 'files', 'crash.log');
-    fs.appendFileSync(_cf, '\n[' + new Date().toLocaleString('zh-CN', {hour12:false}) + '] [uncaughtException]\n' + _s + '\n', 'utf8');
-  } catch (e) {}
-});
+/* ★ P0：重复的 uncaughtException 处理器已移除。
+   统一由文件顶部（BOOT 区）的处理器负责：sysLog + 结构化日志 + 致命重启倒计时。 */
 
 function crashLog(title, err, hint) {
   var _s = err && err.stack ? err.stack : String(err || '');
@@ -86659,6 +95688,46 @@ try { restoreBurnTimers(); } catch (e) {
   console.error('⚠️ 恢复阅后即焚定时器失败:', e.message);
 }
 
+var os = require('os');
+
+function pickLocalIp() {
+  var ifaces = os.networkInterfaces();
+  var names = Object.keys(ifaces);
+
+  // 虚拟网卡 / VPN 关键字（小写匹配接口名）
+  var VIRTUAL = /(radmin|tailscale|zerotier|hamachi|vpn|docker|wsl|vethernet|vmware|virtualbox|vbox|hyper-v|tap|tun|utun|loopback|npcap)/i;
+
+  var candidates = [];
+  names.forEach(function (name) {
+    (ifaces[name] || []).forEach(function (it) {
+      var isV4 = (it.family === 'IPv4' || it.family === 4);
+      if (!isV4 || it.internal) return;
+      candidates.push({ name: name, ip: it.address });
+    });
+  });
+
+  if (!candidates.length) return '127.0.0.1';
+
+  // 打分：私网段优先，物理网卡加分，虚拟网卡减分
+  function score(c) {
+    var s = 0;
+    if (/^192\.168\./.test(c.ip)) s += 100;
+    else if (/^10\./.test(c.ip)) s += 80;
+    else if (/^172\.(1[6-9]|2\d|3[01])\./.test(c.ip)) s += 60;
+    else s += 10;                       // 公网/其他段
+
+    if (/(wi-?fi|wlan|无线|以太网|ethernet|en\d|eth\d)/i.test(c.name)) s += 50;
+    if (VIRTUAL.test(c.name)) s -= 200; // 虚拟网卡大幅降权
+
+    return s;
+  }
+
+  candidates.sort(function (a, b) { return score(b) - score(a); });
+  return candidates[0].ip;
+}
+
+var localIp = pickLocalIp();
+
 var HTTP_DL_PORT = 0;
 var _httpDlServer = null;
 if (_useHttps) {
@@ -86687,6 +95756,23 @@ if (_useHttps) {
 }
 
 server.listen(PORT, '0.0.0.0', function () {
+  /* ★ DSH：全部依赖就绪后初始化扩展能力 */
+  try { dshInit(); } catch (e) { console.warn('⚠️ [DSH] 初始化异常:', e && e.message); }
+  try { dshStartupReport(); } catch (e) {}
+  try { dshInitRedisAdapter(); } catch (e) {}
+  try { dshInitDiscovery(); } catch (e) {}
+  try { dshIndexHistory(); } catch (e) {}
+  /* ★ P0-C：启动时执行一次静态扫描，把结果写入结构化日志 */
+  try {
+    const _scan = dshStaticScan({});
+    const _bad = _scan.checks.filter(function (c) { return !c.ok; });
+    dshLog(_bad.length ? 'warn' : 'info', 'static.scan', {
+      ok: _scan.ok, lines: _scan.lines,
+      failed: _bad.map(function (c) { return c.name; }),
+      undefinedVars: (_scan.undefinedVars || []).length
+    });
+    if (_bad.length) console.warn('🔬 静态扫描发现问题: ' + _bad.map(function (c) { return c.name; }).join(', '));
+  } catch (e) {}
   try {
     if (String(process.env.BEHIND_CLOUDFLARE || '').toLowerCase() === 'true') {
       console.log('🌐 已开启 Cloudflare Tunnel 模式（BEHIND_CLOUDFLARE=true）');
@@ -86695,16 +95781,16 @@ server.listen(PORT, '0.0.0.0', function () {
       console.log('🌐 受信代理: ' + process.env.TRUSTED_PROXIES);
     }
   } catch (e) {}
-  var _proto = _useHttps ? 'https' : 'http';
-  console.log('🚀 服务端运行在 ' + _proto + '://localhost:' + PORT);
-  console.log('📡 局域网访问：' + _proto + '://<本机IP>:' + PORT);
+var _proto = _useHttps ? 'https' : 'http';
+console.log('🚀 服务端运行在 ' + _proto + '://localhost:' + PORT);
+console.log('🌐 局域网访问: ' + _proto + '://' + localIp + ':' + PORT);
 
-  if (HTTP_DL_PORT > 0 && _httpDlServer) {
-    _httpDlServer.listen(HTTP_DL_PORT, '0.0.0.0', function () {
-      console.log('📥 HTTP 下载辅助端口：http://<本机IP>:' + HTTP_DL_PORT);
-      console.log('   专供下载器（IDM / 迅雷等）使用，仅暴露 /dl/* 路由');
-    });
-  }
+if (HTTP_DL_PORT > 0 && _httpDlServer) {
+  _httpDlServer.listen(HTTP_DL_PORT, '0.0.0.0', function () {
+    console.log('🚀 下载服务运行在 http://localhost:' + HTTP_DL_PORT);
+    console.log('🌐 局域网访问: http://' + localIp + ':' + HTTP_DL_PORT);
+  });
+}
   if (_useHttps) {
     console.log('🔒 HTTPS 已启用（自签名证书，浏览器会提示"不安全"，点继续访问即可）');
   } else {
